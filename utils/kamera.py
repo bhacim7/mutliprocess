@@ -1,4 +1,7 @@
-import pyzed.sl as sl
+try:
+    import pyzed.sl as sl
+except ImportError:
+    sl = None
 
 
 class TimestampHandler:
@@ -55,7 +58,7 @@ def initialize_positional_tracking(zed):
         exit()
 
 
-def temiz_kapat(cam: sl.Camera):
+def temiz_kapat(cam):
     """Açık modüller varsa sessizce kapatıp kamerayı devreden çıkarır."""
     for fn in ("disable_recording", "disable_spatial_mapping", "disable_positional_tracking"):
         try:

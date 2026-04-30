@@ -1,4 +1,8 @@
-import Jetson.GPIO as GPIO
+try:
+    import Jetson.GPIO as GPIO
+except ImportError:
+    GPIO = None
+    print("[HARDWARE] Jetson.GPIO not found, running in mock mode.")
 import time
 import atexit
 import config as cfg
@@ -11,6 +15,8 @@ class SingleMotorRelay:
 
     def _setup(self):
         """GPIO kurulumunu yapar."""
+        if GPIO is None:
+            return
         try:
             mode = GPIO.getmode()
             if mode is None:
@@ -27,6 +33,8 @@ class SingleMotorRelay:
 
     def power_on(self):
         """Röleyi açar (Motorlara güç gider)."""
+        if GPIO is None:
+            return
         try:
             GPIO.output(self.pin, GPIO.HIGH)
             # print("[GUC] Motorlar AKTIF.")
@@ -35,6 +43,8 @@ class SingleMotorRelay:
 
     def power_off(self):
         """Röleyi kapatır (Güç kesilir)."""
+        if GPIO is None:
+            return
         try:
             GPIO.output(self.pin, GPIO.LOW)
             print(f"[GUC] Motorlar KAPATILDI.")
@@ -43,6 +53,8 @@ class SingleMotorRelay:
 
     def cleanup(self):
         self.power_off()
+        if GPIO is None:
+            return
         try:
             GPIO.cleanup(self.pin)
         except:
