@@ -7,6 +7,7 @@ import signal
 from core.nav_process import nav_worker
 from core.telem_process import telem_worker
 from core.camera_process import camera_worker
+from core.lidar_process import lidar_worker
 
 def signal_handler(sig, frame):
     """İşletim sisteminden gelen kill (sonlandırma) sinyallerini yakalar."""
@@ -34,7 +35,12 @@ def main():
         'manual_mode': False,  # Yer istasyonu kontrolü
         'motor_pwm_left': 1500,  # Anlık sol motor gücü
         'motor_pwm_right': 1500,  # Anlık sağ motor gücü
-        'shutdown': False  # Global acil durdurma ve çıkış bayrağı
+        'shutdown': False,  # Global acil durdurma ve çıkış bayrağı
+        'lidar_map': [], # Sıkıştırılmış lidar verisi (IPC için güvenli)
+        'lidar_emergency': False, # Lidar acil kaçış durumu
+        'acoustic_interrupt': False, # Akustik sinyal kesmesi
+        'camera_objects': [], # Görülen objelerin GPS, Class ve Açıları
+        'camera_virtual_obstacles': [] # Lidar'ın görmediği A* için sanal engeller (Local Frame dx, dy)
     })
 
     # 2. KUYRUKLAR (QUEUES) OLUŞTURMA
@@ -50,13 +56,27 @@ def main():
     p_telem = mp.Process(target=telem_worker, args=(shared_state, command_queue), name="TelemProcess")
     p_cam = mp.Process(target=camera_worker, args=(shared_state,), name="CameraProcess")
 
-    processes.extend([p_nav, p_telem, p_cam])
+    p_lidar = mp.Process(target=lidar_worker, args=(shared_state,), name="LidarProcess")
+    processes.extend([p_nav, p_telem, p_cam, p_lidar])
 
     # 4. PROSESLERİ AYAĞA KALDIRMA
     print("[YÖNETİCİ] Prosesler ayağa kaldırılıyor...")
     for p in processes:
         p.start()
         print(f"[YÖNETİCİ] Başlatıldı: {p.name} (PID: {p.pid})")
+
+    # 4.5. AKUSTİK/SİNYAL DİNLEYİCİ THREAD
+    import threading
+    def acoustic_listener(state):
+        print("[AKUSTİK] Dinleyici thread başlatıldı.")
+        # Burada gerçek bir mikrofon veya hydrophone'dan veri okunabilir
+        while not state['shutdown']:
+            # Mock signal detection
+            time.sleep(1)
+            # state['acoustic_interrupt'] = True # Eğer tetiklenirse
+
+    t_acoustic = threading.Thread(target=acoustic_listener, args=(shared_state,), daemon=True)
+    t_acoustic.start()
 
     # 5. WATCHDOG (İZLEYİCİ) DÖNGÜSÜ
     # Ana thread burada bekler ve alt proseslerin çöküp çökmediğini kontrol eder.
