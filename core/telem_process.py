@@ -1,104 +1,77 @@
 import time
-import sys
-import os
 import datetime
-import queue
-
-# Proje ana dizininden modülleri çekebilmek için
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import config as cfg
-# Senin orijinal telem.py dosyanı utils klasörüne taşıdığımızı varsayıyoruz
-from utils.telem import TelemetrySender, CommandReceiver
-
+import utils.telem as telem
 
 def telem_worker(shared_state, command_queue):
     """
-    Yer İstasyonu Haberleşme Prosesi.
-    GCS'den gelen komutları dinler ve anlık robot durumunu (GPS, Görev, PWM) paketleyip gönderir.
+    Independent process handling GCS communication.
+    Broadcasts real-time telemetry from shared_state and listens for incoming commands.
     """
-    print("[TELEM_PROCESS] Başlatılıyor...")
+    print("[TELEM_PROCESS] Starting Telemetry/Comm Worker...")
 
-    # 1. HABERLEŞME SINIFLARINI BAŞLAT
-    sender = TelemetrySender(cfg.TELEM_PORT, cfg.TELEM_BAUD)
+    # 1. Initialization
+    port = getattr(cfg, 'SERIAL_PORT', '/dev/ttyUSB0')
+    baud = getattr(cfg, 'SERIAL_BAUD', 57600)
 
-    # Yerel dinleyici kuyruğu (CommandReceiver thread'i buraya yazacak)
-    local_cmd_queue = queue.Queue()
-    receiver = CommandReceiver(sender, local_cmd_queue)
-    receiver.start()
+    telemetry_sender = telem.TelemetrySender(port, baud)
+    tx = telem.TelemetryTx(telemetry_sender, max_hz=10)
 
-    print("[TELEM_PROCESS] Haberleşme döngüsü başlıyor (10 Hz)...")
+    # For a real system, the receiver might push to a local queue,
+    # which we then forward to the multiprocess command_queue.
+    # Here we simulate the setup:
+    cmd_rx = telem.CommandReceiver(telemetry_sender, command_queue)
+    cmd_rx.start()
 
-    # Yayın hızı (Hz)
-    hz = 10
-    period = 1.0 / hz
-    my_id = 1  # İDA kimlik numarası
+    my_id = 1
 
-    # 2. ANA TELEMETRİ DÖNGÜSÜ
-    while not shared_state['shutdown']:
-        start_time = time.time()
+    # 2. Main Loop
+    try:
+        while not shared_state['shutdown']:
+            start_time = time.time()
 
-        # A. YER İSTASYONUNDAN GELEN KOMUTLARI İŞLE
-        try:
-            while True:
-                # Kuyruktaki tüm komutları beklemeden çek (Non-blocking)
-                cmd = local_cmd_queue.get_nowait()
-                command_str = cmd.get("cmd")
+            # Extract data from shared_state without blocking others
+            current_lat = shared_state.get('gps_lat', 0.0)
+            current_lon = shared_state.get('gps_lon', 0.0)
+            heading = shared_state.get('magnetic_heading', 0.0)
+            mevcut_gorev = shared_state.get('current_task', 'TASK_UNKNOWN')
+            pwm_l = shared_state.get('motor_pwm_left', 1500)
+            pwm_r = shared_state.get('motor_pwm_right', 1500)
+            objects = shared_state.get('vision_detected_objects', [])
+            manual_mode = shared_state.get('manual_mode', False)
 
-                # Acil Durdurma (Yazılımsal E-Stop)
-                if command_str == "emergency_stop":
-                    print("\n[TELEM_PROCESS] 🚨 YER İSTASYONUNDAN ACİL DURDURMA ALINDI! 🚨")
-                    shared_state['shutdown'] = True
+            # In a real scenario, incoming commands from GCS (set_gps, emergency_stop, set_task)
+            # would be read by the serial thread and pushed into command_queue for NavProcess to handle.
 
-                # Otonomdan Manuel Moda Geçiş
-                elif command_str == "set_manual":
-                    val = bool(cmd.get("value"))
-                    shared_state['manual_mode'] = val
-                    print(f"[TELEM_PROCESS] Manuel Mod -> {val}")
+            # --- TELEMETRY BROADCAST ---
+            # Periodically report status (or respond to 'report_status' commands from queue)
+            # For this structure, we'll auto-broadcast at ~2 Hz as an example.
 
-                # Manuel Sürüş (Joystick) Komutları
-                elif command_str == "manual_pwm":
-                    if shared_state['manual_mode']:
-                        # Nav_process bu değerleri okuyup OrangeCube'a basacak
-                        shared_state['motor_pwm_left'] = int(cmd.get("left", 1500))
-                        shared_state['motor_pwm_right'] = int(cmd.get("right", 1500))
-
-                # Yeni GPS Noktası Ayarlama (Bunu orkestratör veya nav_process işlesin diye ana kuyruğa atıyoruz)
-                elif command_str == "set_gps":
-                    command_queue.put(cmd)
-                    print(f"[TELEM_PROCESS] Yeni GPS komutu alındı, ana kuyruğa iletildi.")
-
-        except queue.Empty:
-            pass
-
-        # B. YER İSTASYONUNA DURUM RAPORU (TELEMETRİ) GÖNDER
-        # Paylaşımlı bellekten (shared_state) her zaman EN GÜNCEL veriyi okuruz.
-        # Nav_process veya Camera_process ne kadar hızlı güncellerse güncellesin,
-        # biz burada saniyede 10 kez o anki son durumu çekip yollarız.
-        payload = {
-            "id": my_id,
-            "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
-            "pwm_L": shared_state['motor_pwm_left'],
-            "pwm_R": shared_state['motor_pwm_right'],
-            "hdg": round(shared_state['magnetic_heading'], 1),
-            "task": shared_state['current_task'],
-            "mod": shared_state['manual_mode'],
-            "MEVCUT_KONUM": {
-                "lat": round(shared_state['gps_lat'], 6),
-                "lon": round(shared_state['gps_lon'], 6)
+            payload = {
+                "id": my_id,
+                "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
+                "pwm_L": pwm_l,
+                "pwm_R": pwm_r,
+                "hdg": f"{heading:.0f}" if heading is not None else "0",
+                "task": mevcut_gorev,
+                "objects": objects, # Lightweight dicts, safe to serialize
+                "MEVCUT_KONUM": {"lat": current_lat, "lon": current_lon},
+                "mod": bool(manual_mode),
             }
-        }
 
-        # İleride tespit edilen objeler (Şamandıra vs.) eklendiğinde payload'a "objects" listesi eklenecek.
-        sender.send(payload)
+            tx.send(payload)
 
-        # C. DÖNGÜ ZAMANLAMASI
-        elapsed = time.time() - start_time
-        sleep_time = max(0.001, period - elapsed)
-        time.sleep(sleep_time)
+            # Sleep to maintain frequency (~2Hz loop)
+            elapsed = time.time() - start_time
+            if elapsed < 0.5:
+                time.sleep(0.5 - elapsed)
 
-    # GÜVENLİ KAPANIŞ
-    print("[TELEM_PROCESS] Kapanış sinyali alındı. Portlar ve threadler kapatılıyor...")
-    receiver.stop()
-    sender.close()
-    print("[TELEM_PROCESS] Kapandı.")
+    except Exception as e:
+        print(f"[TELEM_PROCESS][ERROR] Loop crashed: {e}")
+    finally:
+        print("[TELEM_PROCESS] Shutting down...")
+        try:
+            cmd_rx.stop()
+            telemetry_sender.close()
+        except:
+            pass

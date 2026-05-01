@@ -1,81 +1,98 @@
-import os
+# ==========================================
+# CONFIGURATION FILE
+# ==========================================
 
-# =============================================================================
-# 1. DONANIM VE HABERLEŞME AYARLARI
-# =============================================================================
-# OrangeCube (Pixhawk) Bağlantı Ayarları
-ORANGE_PORT = os.getenv("ORANGE_PORT", "/dev/ttyACM0")
-ORANGE_BAUD = int(os.getenv("ORANGE_BAUD", "57600"))
+# --- SYSTEM SETTINGS ---
+NAV_MODE = "GPS"
+STREAM = False
+RECORD_VIDEO = True
+SHOW_LOCAL_WINDOW = False
 
-# Yer İstasyonu (Telemetri) Bağlantı Ayarları
-TELEM_PORT = os.getenv("TELEM_PORT", "/dev/ttyUSB0")
-TELEM_BAUD = int(os.getenv("TELEM_BAUD", "57600"))
+# --- HARDWARE SPECS ---
+ROBOT_RADIUS_M = 0.25
+INFLATION_MARGIN_M = 0.60 # Legacy value
+MAX_TILT_ANGLE = 5.0
 
-# OrangeCube / Pixhawk Servo Çıkış Pinleri
+# --- PINS / CHANNELS ---
 SOL_MOTOR = 1
 SAG_MOTOR = 3
+BASE_PWM = 1500
+CRUISE_PWM = 80
+T3_SPEED_PWM = 100
 
-# Röle ve Güç Yönetimi
-MOTOR_RELAY_PIN = 15
-ESC_INIT_DELAY = 3.0  # ESC'lerin dıt-dıt sesini bitirmesi için bekleme süresi
+# --- SENSORS ---
+SERIAL_PORT = "/dev/ttyUSB0"
+SERIAL_BAUD = 57600
+HEADING_SOURCE = 'ZED'
 
-# =============================================================================
-# 2. MOTOR VE SÜRÜŞ (PWM) AYARLARI
-# =============================================================================
-# T200 vb. thrusterlar için standart PWM aralıkları
-BASE_PWM = 1500        # Motorlar duruyor
-MIN_PWM_LIMIT = 1100   # Maksimum geri
-MAX_PWM_LIMIT = 1900   # Maksimum ileri
+LIDAR_PORT_NAME = "/dev/ttyUSB1"
+LIDAR_BAUDRATE = 1000000
+LIDAR_MAX_DIST = 10.0
+LIDAR_ACIL_DURMA_M = 1.5
+LIDAR_FREE_GAIN = 25
+LIDAR_OCCUPIED_GAIN = 80
+LIDAR_KORIDOR_KP = 30.0
+MAP_DECAY_AMOUNT = 1
 
-# İleri Sürüş Hızları (1500 + CRUISE_PWM olarak uygulanır)
-CRUISE_PWM = 100       # Standart seyir hızı (1600 PWM)
+CAM_RES = 2
+CAM_FPS = 30
+CAM_HFOV = 110.0
+YOLO_CONFIDENCE = 0.50
+MODEL_PATH = "/home/yarkin/roboboatIDA/roboboat/weights/TNA.engine"
+Kp_PIXEL = 0.3
+Kd_PIXEL = 0.1
 
-# Navigasyon Dönüş Katsayıları (P-Kontrolcü için)
-Kp_HEADING = 1.5       # Hedef açıyla aramızdaki farkı PWM'e çeviren katsayı
-MAX_TURN_PWM = 150     # Dönüşlerde uygulanacak maksimum eksi/artı PWM farkı
+# --- NAVIGATION CONTROL ---
+SPOT_TURN_THRESHOLD = 45.0
+SPOT_TURN_PWM = 200
+ESCAPE_PWM = 300
+MAX_PWM_CHANGE = 60
+HYBRID_STEP_DIST = 2.0
+HYBRID_HEADING_THRESHOLD = 30.0
 
-# Görev Geçiş Toleransı
-WAYPOINT_TOLERANCE_M = 2.0  # Hedefe kaç metre kala "Görev Tamamlandı" sayılacak?
+# --- PURE PURSUIT (A* PATH FOLLOWING) ---
+PURE_PURSUIT_MIN_LOOKAHEAD = 1.0
+PURE_PURSUIT_MAX_LOOKAHEAD = 3.0
+PURE_PURSUIT_K_SPEED = 0.5
+PURE_PURSUIT_KP = 2.0
+PURE_PURSUIT_KD = 0.5
+A_STAR_HEURISTIC_WEIGHT = 2.5
+COSTMAP_RES_M_PER_PX = 0.10
 
-# =============================================================================
-# 3. GÖREV (WAYPOINT) KOORDİNATLARI
-# =============================================================================
-# RoboBoat 2026 parkuru için 6 ardışık hedef noktası.
-# State Machine sırayla bu noktalara gidecek.
+# --- TASK 2 SPECIFIC ---
+TASK2_SEARCH_DIAMETER = 2.0
 
-# GÖREV 1: Giriş Kapısı
-T1_LAT = 40.8630501
-T1_LON = 29.2599517
+# --- TASK WAYPOINTS (Legacy values from IDA1) ---
+T1_GATE_ENTER_LAT = 40.8630501
+T1_GATE_ENTER_LON = 29.9328229
+T1_GATE_MID_LAT = 40.8630501
+T1_GATE_MID_LON = 29.9328229
+T1_GATE_EXIT_LAT = 40.8630501
+T1_GATE_EXIT_LON = 29.9328229
 
-# GÖREV 2: Kapı Ortası
-T2_LAT = 40.8630000  # Örnek ara nokta
-T2_LON = 29.2599300
+T2_ZONE_ENTRY_LAT = 40.8630501
+T2_ZONE_ENTRY_LON = 29.9328229
+T2_ZONE_MID_LAT = 40.8630501
+T2_ZONE_MID_LON = 29.9328229
+T2_ZONE_MID1_LAT = 40.8630501
+T2_ZONE_MID1_LON = 29.9328229
+T2_ZONE_END_LAT = 40.8630501
+T2_ZONE_END_LON = 29.9328229
 
-# GÖREV 3: Çıkış Kapısı
-T3_LAT = 40.8629223
-T3_LON = 29.2599123
+ENABLE_TASK3 = True
+T3_START_LAT = 40.8630501
+T3_START_LON = 29.9328229
+T3_MID_LAT = 40.8630501
+T3_MID_LON = 29.9328229
+T3_RIGHT_LAT = 40.8630501
+T3_RIGHT_LON = 29.9328229
+T3_END_LAT = 40.8630501
+T3_END_LON = 29.9328229
+T3_END1_LAT = 40.8630501
+T3_END1_LON = 29.9328229
+T3_LEFT_LAT = 40.8630501
+T3_LEFT_LON = 29.9328229
 
-# GÖREV 4: Engel Sahası (Debris) Girişi
-T4_LAT = 40.8091600
-T4_LON = 29.2619150
-
-# GÖREV 5: Engel Sahası Ortası
-T5_LAT = 40.8090500  # Örnek ara nokta
-T5_LON = 29.2619200
-
-# GÖREV 6: Engel Sahası Bitişi
-T6_LAT = 40.8089552
-T6_LON = 29.2619292
-
-# =============================================================================
-# 4. GÖREV DURUM MAKİNESİ (STATE MACHINE) HARİTASI
-# =============================================================================
-# nav_process.py bu sözlüğü kullanarak hangi görevde hangi hedefe gideceğini bilecek.
-TASK_WAYPOINTS = {
-    'TASK_1': (T1_LAT, T1_LON),
-    'TASK_2': (T2_LAT, T2_LON),
-    'TASK_3': (T3_LAT, T3_LON),
-    'TASK_4': (T4_LAT, T4_LON),
-    'TASK_5': (T5_LAT, T5_LON),
-    'TASK_6': (T6_LAT, T6_LON)
-}
+T5_DOCK_APPROACH_LAT = 40.8630501
+T5_DOCK_APPROACH_LON = 29.9328229
+MEVCUT_GOREV = "TASK1_APPROACH"
