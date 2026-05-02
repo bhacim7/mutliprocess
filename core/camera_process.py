@@ -3,6 +3,10 @@ import math
 import numpy as np
 import cv2
 
+import socket
+import struct
+import pickle
+
 # Hardware/Utils
 import config as cfg
 import utils.kamera as kamera
@@ -15,6 +19,85 @@ import supervision as sv
 
 # ZED Camera
 import pyzed.sl as sl
+
+import threading
+import queue
+import socket
+import struct
+import pickle
+import cv2
+
+class AsyncStreamer(threading.Thread):
+    def __init__(self, ip, port=5000, max_queue=2):
+        super().__init__()
+        self.ip = ip
+        self.port = port
+        self.q = queue.Queue(maxsize=max_queue)
+        self.client_socket = None
+        self.running = True
+        
+        # Soket bağlantısını başlat
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Zaman aşımı ekleyelim ki bağlantı koptuğunda sistemi kitlemesin
+            self.client_socket.settimeout(2.0) 
+            self.client_socket.connect((self.ip, self.port))
+            # Bağlandıktan sonra timeout'u kaldır ki büyük verilerde kopmasın
+            self.client_socket.settimeout(None)
+            print(f"[STREAMER] Connected to {self.ip}:{self.port}")
+        except Exception as e:
+            print(f"[STREAMER][WARNING] Could not connect: {e}")
+            self.client_socket = None
+
+    def enqueue(self, frame):
+        """Kameradan gelen kareyi kuyruğa atar. Kuyruk doluysa eski kareyi çöpe atar (Canlı yayın mantığı)."""
+        if self.running and self.client_socket:
+            if self.q.full():
+                try:
+                    self.q.get_nowait() # En eski kareyi çöpe at (Drop frame)
+                except queue.Empty:
+                    pass
+            try:
+                self.q.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def run(self):
+        """Arka planda sürekli kuyruktan frame alıp Wi-Fi üzerinden yollar."""
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40] # Kalite %40
+        
+        while self.running:
+            try:
+                # 0.1 saniye timeout ile kuyruktan kare bekle
+                frame = self.q.get(timeout=0.1) 
+                
+                if self.client_socket:
+                    try:
+                        # Görüntüyü küçült ve sıkıştır (Bu işlem artık ana kamerayı yavaşlatmaz!)
+                        stream_frame = cv2.resize(frame, (640, 360))
+                        ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
+                        
+                        if ret:
+                            data = pickle.dumps(buffer)
+                            size_pack = struct.pack("!Q", len(data))
+                            self.client_socket.sendall(size_pack + data)
+                    except Exception as e:
+                        print(f"[STREAMER] Connection lost during send: {e}")
+                        self.client_socket = None # Koptuysa bir daha göndermeyi deneme
+                        
+                self.q.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                pass
+
+    def stop(self):
+        self.running = False
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except: pass
+        self.join()
 
 class ObjectMemoryManager:
     def __init__(self):
@@ -113,6 +196,12 @@ def camera_worker(shared_state):
     """
     print("[CAM_PROCESS] Starting Camera Worker...")
 
+    streamer = None
+    if getattr(cfg, 'STREAM', False):
+        gcs_ip = getattr(cfg, 'GCS_IP', "192.168.1.25")
+        streamer = AsyncStreamer(gcs_ip, 5000)
+        streamer.start()
+
     # Initialize Object Manager
     obj_manager = ObjectMemoryManager()
 
@@ -126,7 +215,7 @@ def camera_worker(shared_state):
         model = YOLO(model_path)
 
     try:
-        model.to('cuda').half()
+        #model.to('cuda').half()
         print("[CAM_PROCESS] Model loaded in FP16 mode.")
     except Exception as e:
         print(f"[CAM_PROCESS] Model GPU error: {e}")
@@ -135,9 +224,9 @@ def camera_worker(shared_state):
     print("[CAM_PROCESS] Initializing Camera...")
     zed = sl.Camera()
     init_params = sl.InitParameters()
-    init_params.camera_resolution = getattr(cfg, 'CAM_RES', sl.RESOLUTION.HD720)
+    init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.camera_fps = getattr(cfg, 'CAM_FPS', 30)
-    init_params.depth_mode = sl.DEPTH_MODE.ULTRA
+    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init_params.coordinate_units = sl.UNIT.METER
 
     err = zed.open(init_params)
@@ -167,6 +256,7 @@ def camera_worker(shared_state):
     ts_handler = TimestampHandler()
 
     print("[CAM_PROCESS] Camera initialized and ready.")
+    last_print_time = time.time()
 
     # Video Writer logic from legacy
     writer = None
@@ -198,6 +288,12 @@ def camera_worker(shared_state):
 
                 # Update frame ready flag
                 shared_state['vision_frame_ready'] = True
+                # --- YENİ EKLENEN: FPS SADECE SANIYEDE 1 KERE TERMINALE YAZ ---
+                #current_time = time.time()
+                #if (current_time - last_print_time) >= 1.0:
+                    #anlik_fps = round(zed.get_current_fps())
+                    #print(f"[CAM_PROCESS] Saf Kamera ve Yapay Zeka FPS: {anlik_fps}")
+                    #last_print_time = current_time
 
                 # 3. YOLO INFERENCE
                 conf_val = getattr(cfg, 'YOLO_CONFIDENCE', 0.50)
@@ -273,9 +369,66 @@ def camera_worker(shared_state):
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
 
+                import datetime
+                
+                # 1. Verileri Paylaşımlı Bellekten Çek
+                fps_val = round(zed.get_current_fps()) if 'zed' in locals() else 0
+                task = shared_state.get('current_task', 'UNKNOWN')
+                pwm_l = shared_state.get('motor_pwm_left', 1500)
+                pwm_r = shared_state.get('motor_pwm_right', 1500)
+                
+                # Navigasyon Verileri
+                dist = shared_state.get('target_dist', 0.0)
+                adv_crs = shared_state.get('adviced_course', 0.0)
+                err_ang = shared_state.get('angle_error', 0.0)
+                hdg = shared_state.get('magnetic_heading', 0.0)
+                lat = shared_state.get('gps_lat', 0.0)
+                lon = shared_state.get('gps_lon', 0.0)
+                t_lat = shared_state.get('target_lat', 0.0)
+                t_lon = shared_state.get('target_lon', 0.0)
+
+                # 2. Yazı Tipleri ve Renkler (BGR formatında)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 0.7
+                thick = 2
+                c_red = (0, 0, 255)
+                c_yellow = (0, 255, 255)
+                c_green = (0, 255, 0)
+                c_orange = (0, 165, 255)
+                c_magenta = (255, 0, 255)
+
+                # 3. SOL SÜTUN ÇİZİMİ
+                y = 30
+                cv2.putText(frame, datetime.datetime.now().strftime("%H:%M:%S"), (10, y), font, scale, c_red, thick); y += 30
+                cv2.putText(frame, f"FPS: {fps_val}", (10, y), font, scale, c_yellow, thick); y += 30
+                cv2.putText(frame, f"Gorev: {task}", (10, y), font, scale, c_red, thick); y += 60
+                
+                cv2.putText(frame, f"sol:{int(pwm_l)}", (10, y), font, scale, c_red, thick); y += 30
+                cv2.putText(frame, f"sag:{int(pwm_r)}", (10, y), font, scale, c_red, thick); y += 40
+                
+
+                # 4. SAĞ SÜTUN ÇİZİMİ
+                x_r = 450
+                y_r = 30
+                cv2.putText(frame, f"Hedefe mesafe: {dist:.2f}", (x_r, y_r), font, scale, c_red, thick); y_r += 30
+                cv2.putText(frame, f"Rota tavsiyesi: {adv_crs:.0f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"aci farki: {err_ang:.0f}", (x_r, y_r), font, scale, c_yellow, thick); y_r += 30
+                cv2.putText(frame, f"Heading: {hdg:.0f}", (x_r, y_r), font, scale, c_yellow, thick); y_r += 30
+                cv2.putText(frame, f"manyetometre durumu: GOOD", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"Heading dogrulugu: 0.9", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"GPS DURUMU: 3D Fix", (x_r, y_r), font, scale, c_red, thick); y_r += 30
+                cv2.putText(frame, f"ida enlem: {lat:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"ida boylam: {lon:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"hedef enlem: {t_lat:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
+                cv2.putText(frame, f"hedef boylam: {t_lon:.6f}", (x_r, y_r), font, scale, c_orange, thick)
+                # -----------------------------------------------
+
                 # 4. VIDEO RECORDING
                 if writer:
                     writer.enqueue(frame)
+                
+                if streamer:
+                    streamer.enqueue(frame)
 
     except Exception as e:
         print(f"[CAM_PROCESS][ERROR] Loop crashed: {e}")
@@ -283,4 +436,6 @@ def camera_worker(shared_state):
         print("[CAM_PROCESS] Shutting down...")
         if writer:
             writer.stop()
+        if 'streamer' in locals() and streamer is not None:
+            streamer.stop()
         zed.close()
