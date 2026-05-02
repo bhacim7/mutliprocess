@@ -4,8 +4,9 @@
 
 # --- SYSTEM SETTINGS ---
 NAV_MODE = "GPS"
-STREAM = False
-RECORD_VIDEO = True
+STREAM = True
+GCS_IP = "192.168.1.11"
+RECORD_VIDEO = False
 SHOW_LOCAL_WINDOW = False
 
 # --- HARDWARE SPECS ---
@@ -21,9 +22,12 @@ CRUISE_PWM = 80
 T3_SPEED_PWM = 100
 
 # --- SENSORS ---
-SERIAL_PORT = "/dev/ttyUSB0"
+SERIAL_PORT = "/dev/ttyACM0"
 SERIAL_BAUD = 57600
 HEADING_SOURCE = 'ZED'
+
+FC_PORT = "/dev/ttyACM0"  # OrangeCube Uçuş Kontrolcüsü Portu
+FC_BAUD = 57600
 
 LIDAR_PORT_NAME = "/dev/ttyUSB1"
 LIDAR_BAUDRATE = 1000000
