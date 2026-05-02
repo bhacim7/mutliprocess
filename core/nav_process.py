@@ -19,7 +19,11 @@ def nav_worker(shared_state, command_queue):
 
     # 1. Hardware Initialization
     try:
-        controller = USVController(getattr(cfg, "SERIAL_PORT", "/dev/ttyACM0"), baud=getattr(cfg, "SERIAL_BAUD", 57600))
+        # Eski Hali: controller = USVController("/dev/ttyACM0", baud=57600)
+        fc_port = getattr(cfg, 'FC_PORT', '/dev/ttyACM0')
+        fc_baud = getattr(cfg, 'FC_BAUD', 57600)
+        controller = USVController(fc_port, baud=fc_baud)
+        
         controller.set_mode("MANUAL")
         print("[NAV_PROCESS] USV Controller Initialized.")
     except Exception as e:
@@ -364,6 +368,11 @@ def nav_worker(shared_state, command_queue):
 
                 adviced_course = nav.calculate_bearing(ida_enlem, ida_boylam, target_lat, target_lon)
                 aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
+                shared_state['angle_error'] = float(aci_farki)
+                shared_state['adviced_course'] = float(adviced_course)
+                shared_state['target_dist'] = float(hedefe_mesafe) if 'hedefe_mesafe' in locals() else 0.0
+                shared_state['target_lat'] = float(target_lat)
+                shared_state['target_lon'] = float(target_lon)
 
             # Hybrid targeting setup
             tx_world, ty_world = None, None
