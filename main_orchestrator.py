@@ -29,6 +29,12 @@ def main():
         'mission_started': True,
         'manual_mode': False,
         'current_task': 'TASK_1',
+        
+        'target_dist': 0.0,
+        'adviced_course': 0.0,
+        'angle_error': 0.0,
+        'target_lat': 0.0,
+        'target_lon': 0.0,
 
         # Sensors & Tracking
         'gps_lat': 0.0,
@@ -54,6 +60,8 @@ def main():
         # Acoustic / Interrupt State
         'interrupt_request': None,
         'detected_freq': 0
+
+        
     })
 
     # 2. QUEUES FOR IPC
