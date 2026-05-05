@@ -99,6 +99,10 @@ def nav_worker(shared_state, command_queue):
             shared_state['gps_lat'] = ida_enlem
             shared_state['gps_lon'] = ida_boylam
 
+            fc_hdg = controller.get_heading()
+            if fc_hdg is not None:
+                shared_state['fc_heading'] = fc_hdg
+
 
             # --- B. PROCESS INCOMING COMMANDS ---
             try:
@@ -107,6 +111,8 @@ def nav_worker(shared_state, command_queue):
                     if cmd.get("cmd") == "emergency_stop":
                         print("[NAV_PROCESS] Emergency Stop Received!")
                         shared_state['shutdown'] = True
+                    elif cmd.get("cmd") == "report_status":
+                        shared_state['send_telemetry'] = True
             except: pass
 
             interrupt = shared_state.get('interrupt_request')
@@ -125,16 +131,10 @@ def nav_worker(shared_state, command_queue):
             manual_mode = shared_state.get('manual_mode', False)
             mission_started = shared_state.get('mission_started', True)
 
-            # Local Odometry Simulation / Integration
-            dt = time.time() - last_pos_time
-            last_pos_time = time.time()
-            if not manual_mode and mission_started:
-                speed = controller.get_horizontal_speed()
-                if speed is None: speed = 0.0
-                robot_x += speed * math.cos(robot_yaw) * dt
-                robot_y += speed * math.sin(robot_yaw) * dt
-                robot_yaw = math.radians(magnetic_heading)
-
+            # ZED Odometry / Integration
+            robot_x = shared_state.get('zed_x', 0.0)
+            robot_y = shared_state.get('zed_y', 0.0)
+            robot_yaw = math.radians(magnetic_heading)
 
             center_danger = shared_state.get('lidar_center_blocked', False)
             left_d = shared_state.get('lidar_left_dist', float('inf'))
@@ -171,10 +171,13 @@ def nav_worker(shared_state, command_queue):
                 for obj in vision_objects:
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
-                        # Estimate global position using compass
-                        obj_bearing = (magnetic_heading + math.degrees(math.atan2(obj.get('cx', 1280//2) - 1280/2, 1280))) % 360 # Rough
-                        obj_world_x = robot_x + (dist_m * math.cos(math.radians(obj_bearing)))
-                        obj_world_y = robot_y + (dist_m * math.sin(math.radians(obj_bearing)))
+                        pixel_offset = (obj.get('cx', 1280/2) - (1280 / 2)) / 1280.0
+                        angle_offset = -pixel_offset * math.radians(getattr(cfg, 'CAM_HFOV', 110.0))
+                        obj_global_angle = robot_yaw + angle_offset
+
+                        obj_world_x = robot_x + (dist_m * math.cos(obj_global_angle))
+                        obj_world_y = robot_y + (dist_m * math.sin(obj_global_angle))
+
                         p_virtual = world_to_pixel(obj_world_x, obj_world_y)
                         if p_virtual:
                             cv2.circle(costmap_img, p_virtual, 6, 0, -1)
@@ -377,9 +380,29 @@ def nav_worker(shared_state, command_queue):
             # Hybrid targeting setup
             tx_world, ty_world = None, None
             if costmap_ready and target_lat is not None:
-                gps_lookahead = 1.5
-                tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
-                ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
+                if mevcut_gorev in ["TASK5_ENTER"]:
+                    need_new_target = True
+                    if hybrid_local_target:
+                        d_local = math.sqrt((hybrid_local_target[0] - robot_x) ** 2 + (hybrid_local_target[1] - robot_y) ** 2)
+                        if d_local > 0.5:
+                            need_new_target = False  # Hala gidiyoruz
+
+                    if need_new_target and 'aci_farki' in locals() and aci_farki is not None:
+                        step_dist = getattr(cfg, 'HYBRID_STEP_DIST', 2.0)
+                        h_tx, h_ty = nav.get_hybrid_point(robot_x, robot_y, robot_yaw, aci_farki, step_dist)
+                        hybrid_local_target = (h_tx, h_ty)
+
+                    if hybrid_local_target:
+                        tx_world, ty_world = hybrid_local_target
+                    else:
+                        gps_lookahead = 1.5
+                        tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
+                        ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
+                else:
+                    hybrid_local_target = None  # Reset
+                    gps_lookahead = 1.5
+                    tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
+                    ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
 
             # --- G. CONTROL LOGIC & MOTORS ---
             if manual_mode or not mission_started:
@@ -389,17 +412,24 @@ def nav_worker(shared_state, command_queue):
                 # 1. Reactive Avoidance
                 if center_danger and mevcut_gorev not in ["TASK5_ENTER", "TASK5_DOCK", "TASK5_EXIT"]:
                     if not acil_durum_aktif_mi:
-                        controller.set_servo(cfg.SOL_MOTOR, 1250)
-                        controller.set_servo(cfg.SAG_MOTOR, 1250)
+                        shock_brake_pwm = cfg.BASE_PWM - getattr(cfg, 'shock_pwm', 250)
+                        controller.set_servo(cfg.SOL_MOTOR, shock_brake_pwm)
+                        controller.set_servo(cfg.SAG_MOTOR, shock_brake_pwm)
                         time.sleep(0.1)
                         acil_durum_aktif_mi = True
 
-                    controller.set_servo(cfg.SOL_MOTOR, 1200)
-                    controller.set_servo(cfg.SAG_MOTOR, 1200)
+                    escape_pwm = cfg.BASE_PWM - getattr(cfg, 'ESCAPE_PWM', 300)
+                    controller.set_servo(cfg.SOL_MOTOR, escape_pwm)
+                    controller.set_servo(cfg.SAG_MOTOR, escape_pwm)
                     time.sleep(0.4)
 
-                    if left_d > right_d: controller.set_servo(cfg.SOL_MOTOR, 1300); controller.set_servo(cfg.SAG_MOTOR, 1700)
-                    else: controller.set_servo(cfg.SOL_MOTOR, 1700); controller.set_servo(cfg.SAG_MOTOR, 1300)
+                    spot_turn_val = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                    if left_d > right_d:
+                        controller.set_servo(cfg.SOL_MOTOR, cfg.BASE_PWM - spot_turn_val)
+                        controller.set_servo(cfg.SAG_MOTOR, cfg.BASE_PWM + spot_turn_val)
+                    else:
+                        controller.set_servo(cfg.SOL_MOTOR, cfg.BASE_PWM + spot_turn_val)
+                        controller.set_servo(cfg.SAG_MOTOR, cfg.BASE_PWM - spot_turn_val)
                     time.sleep(0.3)
                     current_path = None # Force replan
                     continue
@@ -492,12 +522,40 @@ def nav_worker(shared_state, command_queue):
                                 current_path = pruned_path
                                 prev_heading_error = current_error
 
+                                failsafe_active = False
+                                path_lost_time = None
+
                                 controller.set_servo(cfg.SOL_MOTOR, pp_sol)
                                 controller.set_servo(cfg.SAG_MOTOR, pp_sag)
                             else:
-                                # Stop if no path
-                                controller.set_servo(cfg.SOL_MOTOR, 1500)
-                                controller.set_servo(cfg.SAG_MOTOR, 1500)
+                                if target_lat is not None and target_lon is not None:
+                                    if path_lost_time is None:
+                                        path_lost_time = time.time()
+
+                                    if time.time() - path_lost_time < 5.0:
+                                        # Direct Drive Grace Period
+                                        failsafe_active = True
+                                        base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'CRUISE_PWM', 80)
+                                        # P controller for direct steering based on aci_farki
+                                        kp = 1.5
+                                        steering_correction = aci_farki * kp
+
+                                        pp_sol = base_pwm + steering_correction
+                                        pp_sag = base_pwm - steering_correction
+
+                                        # Clamp values
+                                        pp_sol = max(1100, min(1900, pp_sol))
+                                        pp_sag = max(1100, min(1900, pp_sag))
+
+                                        controller.set_servo(cfg.SOL_MOTOR, int(pp_sol))
+                                        controller.set_servo(cfg.SAG_MOTOR, int(pp_sag))
+                                    else:
+                                        # Stop if grace period exceeded and still no path
+                                        controller.set_servo(cfg.SOL_MOTOR, 1500)
+                                        controller.set_servo(cfg.SAG_MOTOR, 1500)
+                                else:
+                                    controller.set_servo(cfg.SOL_MOTOR, 1500)
+                                    controller.set_servo(cfg.SAG_MOTOR, 1500)
 
             # Record final PWMs
             # Note: We rely on the USVController object stub tracking state,
