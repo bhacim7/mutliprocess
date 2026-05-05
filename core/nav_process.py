@@ -108,22 +108,38 @@ def nav_worker(shared_state, command_queue):
             try:
                 while not command_queue.empty():
                     cmd = command_queue.get_nowait()
-                    if cmd.get("cmd") == "emergency_stop":
+                    cmd_str = cmd.get("cmd")
+
+                    if cmd_str == "emergency_stop":
                         print("[NAV_PROCESS] Emergency Stop Received!")
                         shared_state['shutdown'] = True
-                    elif cmd.get("cmd") == "report_status":
+                    elif cmd_str == "report_status":
                         shared_state['send_telemetry'] = True
+                    elif cmd_str == "set_gps":
+                        idx = cmd.get("index")
+                        lat = cmd.get("lat")
+                        lon = cmd.get("lon")
+                        if idx == 1: cfg.T1_GATE_ENTER_LAT = lat; cfg.T1_GATE_ENTER_LON = lon
+                        elif idx == 2: cfg.T1_GATE_MID_LAT = lat; cfg.T1_GATE_MID_LON = lon
+                        elif idx == 3: cfg.T1_GATE_EXIT_LAT = lat; cfg.T1_GATE_EXIT_LON = lon
+                        elif idx == 4: cfg.T2_ZONE_ENTRY_LAT = lat; cfg.T2_ZONE_ENTRY_LON = lon
+                        elif idx == 5: cfg.T2_ZONE_MID_LAT = lat; cfg.T2_ZONE_MID_LON = lon
+                        elif idx == 6: cfg.T2_ZONE_MID1_LAT = lat; cfg.T2_ZONE_MID1_LON = lon
+                        elif idx == 7: cfg.T2_ZONE_END_LAT = lat; cfg.T2_ZONE_END_LON = lon
+                        elif idx == 8: cfg.T3_START_LAT = lat; cfg.T3_START_LON = lon
+                        elif idx == 9: cfg.T3_MID_LAT = lat; cfg.T3_MID_LON = lon
+                        elif idx == 10: cfg.T3_RIGHT_LAT = lat; cfg.T3_RIGHT_LON = lon
+                        elif idx == 11: cfg.T3_END_LAT = lat; cfg.T3_END_LON = lon
+                        elif idx == 12: cfg.T3_END1_LAT = lat; cfg.T3_END1_LON = lon
+                        elif idx == 13: cfg.T3_LEFT_LAT = lat; cfg.T3_LEFT_LON = lon
+                        elif idx == 14: cfg.T5_DOCK_APPROACH_LAT = lat; cfg.T5_DOCK_APPROACH_LON = lon
+                        print(f"[NAV_PROCESS] Updated GPS Point {idx}")
+                    elif cmd_str == "set_task":
+                        new_task = cmd.get("task_name")
+                        if new_task:
+                            shared_state['current_task'] = new_task
+                            print(f"[NAV_PROCESS] Task updated to {new_task}")
             except: pass
-
-            interrupt = shared_state.get('interrupt_request')
-            if interrupt is not None:
-                detected_task = interrupt
-                if detected_task == 3: shared_state['current_task'] = "TASK6_SPEED"
-                elif detected_task == 5: shared_state['current_task'] = "TASK6_DOCK"
-                current_path = []
-                shared_state['interrupt_request'] = None
-                time.sleep(0.1)
-                continue
 
             # --- C. SYNC WITH SHARED STATE ---
             magnetic_heading = shared_state.get('magnetic_heading', 0.0)
@@ -535,20 +551,34 @@ def nav_worker(shared_state, command_queue):
                                     if time.time() - path_lost_time < 5.0:
                                         # Direct Drive Grace Period
                                         failsafe_active = True
-                                        base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'CRUISE_PWM', 80)
-                                        # P controller for direct steering based on aci_farki
-                                        kp = 1.5
-                                        steering_correction = aci_farki * kp
 
-                                        pp_sol = base_pwm + steering_correction
-                                        pp_sag = base_pwm - steering_correction
+                                        # --- FIX: Reintroduce spot turn if heading is severely off ---
+                                        threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
 
-                                        # Clamp values
-                                        pp_sol = max(1100, min(1900, pp_sol))
-                                        pp_sag = max(1100, min(1900, pp_sag))
+                                        if abs(aci_farki) > threshold:
+                                            spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                                            extra = 50
+                                            if aci_farki > 0:  # Target Right
+                                                controller.set_servo(cfg.SOL_MOTOR, 1500 + spot_pwm)
+                                                controller.set_servo(cfg.SAG_MOTOR, 1500 - spot_pwm - extra)
+                                            else:  # Target Left
+                                                controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra)
+                                                controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
+                                        else:
+                                            base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'CRUISE_PWM', 80)
+                                            # P controller for direct steering based on aci_farki
+                                            kp = 1.5
+                                            steering_correction = aci_farki * kp
 
-                                        controller.set_servo(cfg.SOL_MOTOR, int(pp_sol))
-                                        controller.set_servo(cfg.SAG_MOTOR, int(pp_sag))
+                                            pp_sol = base_pwm + steering_correction
+                                            pp_sag = base_pwm - steering_correction
+
+                                            # Clamp values
+                                            pp_sol = max(1100, min(1900, pp_sol))
+                                            pp_sag = max(1100, min(1900, pp_sag))
+
+                                            controller.set_servo(cfg.SOL_MOTOR, int(pp_sol))
+                                            controller.set_servo(cfg.SAG_MOTOR, int(pp_sag))
                                     else:
                                         # Stop if grace period exceeded and still no path
                                         controller.set_servo(cfg.SOL_MOTOR, 1500)

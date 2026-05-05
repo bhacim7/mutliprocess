@@ -44,22 +44,44 @@ def telem_worker(shared_state, command_queue):
             # would be read by the serial thread and pushed into command_queue for NavProcess to handle.
 
             # --- TELEMETRY BROADCAST ---
-            # Periodically report status (or respond to 'report_status' commands from queue)
-            # For this structure, we'll auto-broadcast at ~2 Hz as an example.
-
-            payload = {
-                "id": my_id,
-                "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
-                "pwm_L": pwm_l,
-                "pwm_R": pwm_r,
-                "hdg": f"{heading:.0f}" if heading is not None else "0",
-                "task": mevcut_gorev,
-                "objects": objects, # Lightweight dicts, safe to serialize
-                "MEVCUT_KONUM": {"lat": current_lat, "lon": current_lon},
-                "mod": bool(manual_mode),
-            }
 
             if shared_state.get('send_telemetry', False):
+                gps_points = {
+                    "id": my_id,
+                    "GPS1": {"lat": float(getattr(cfg, "T1_GATE_ENTER_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_ENTER_LON", 0.0))},
+                    "GPS2": {"lat": float(getattr(cfg, "T1_GATE_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_MID_LON", 0.0))},
+                    "GPS3": {"lat": float(getattr(cfg, "T1_GATE_EXIT_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_EXIT_LON", 0.0))},
+                    "GPS4": {"lat": float(getattr(cfg, "T2_ZONE_ENTRY_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_ENTRY_LON", 0.0))},
+                    "GPS5": {"lat": float(getattr(cfg, "T2_ZONE_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_MID_LON", 0.0))},
+                    "GPS6": {"lat": float(getattr(cfg, "T2_ZONE_MID1_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_MID1_LON", 0.0))},
+                    "GPS7": {"lat": float(getattr(cfg, "T2_ZONE_END_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_END_LON", 0.0))},
+                    "GPS8": {"lat": float(getattr(cfg, "T3_START_LAT", 0.0)), "lon": float(getattr(cfg, "T3_START_LON", 0.0))},
+                    "GPS9": {"lat": float(getattr(cfg, "T3_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T3_MID_LON", 0.0))},
+                    "GPS10": {"lat": float(getattr(cfg, "T3_RIGHT_LAT", 0.0)), "lon": float(getattr(cfg, "T3_RIGHT_LON", 0.0))},
+                    "GPS11": {"lat": float(getattr(cfg, "T3_END_LAT", 0.0)), "lon": float(getattr(cfg, "T3_END_LON", 0.0))},
+                    "GPS12": {"lat": float(getattr(cfg, "T3_END1_LAT", 0.0)), "lon": float(getattr(cfg, "T3_END1_LON", 0.0))},
+                    "GPS13": {"lat": float(getattr(cfg, "T3_LEFT_LAT", 0.0)), "lon": float(getattr(cfg, "T3_LEFT_LON", 0.0))},
+                    "GPS14": {"lat": float(getattr(cfg, "T5_DOCK_APPROACH_LAT", 0.0)), "lon": float(getattr(cfg, "T5_DOCK_APPROACH_LON", 0.0))},
+                }
+
+                payload = {
+                    "id": my_id,
+                    "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
+                    "pwm_L": pwm_l,
+                    "pwm_R": pwm_r,
+                    "spd": shared_state.get('horizontal_speed', 0.0),
+                    "hdg": f"{heading:.0f}" if heading is not None else "0",
+                    "trg_hdg": shared_state.get('adviced_course', 0.0),
+                    "hlth": "GOOD", # Simplified for now, or read from shared state
+                    "task": mevcut_gorev,
+                    "objects": objects, # Lightweight dicts, safe to serialize
+                    "MEVCUT_KONUM": {"lat": current_lat, "lon": current_lon},
+                    "dist": shared_state.get('target_dist', 0.0),
+                    "mod": bool(manual_mode),
+                    "FPS": shared_state.get('camera_fps', 0),
+                    "GÖREV_NOKTALARI": gps_points
+                }
+
                 tx.send(payload)
                 shared_state['send_telemetry'] = False
 

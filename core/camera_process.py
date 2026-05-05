@@ -389,7 +389,11 @@ def camera_worker(shared_state):
                         # 2. Calculate Position
                         x1, y1, x2, y2 = map(int, coords[i])
                         cx = int((x1 + x2) / 2)
-                        cy = int((y2 + y1) / 2)
+
+                        # --- FIX: Measure depth at bottom 15% ---
+                        box_h = y2 - y1
+                        target_cy = int(y2 - (box_h * 0.15))
+                        cy = max(0, min(target_cy, height - 1))
 
                         err, dist_m = depth.get_value(cx, cy)
 
