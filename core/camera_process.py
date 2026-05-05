@@ -12,6 +12,8 @@ import config as cfg
 import utils.kamera as kamera
 from utils.kamera import TimestampHandler
 from utils.navigasyon import calculate_obj_gps
+import utils.navigasyon as nav
+from utils.headingFilter import KalmanFilter
 
 # YOLO / Supervision
 from ultralytics import YOLO
@@ -254,6 +256,9 @@ def camera_worker(shared_state):
     depth = sl.Mat()
     sensors_data = sl.SensorsData()
     ts_handler = TimestampHandler()
+    zed_pose = sl.Pose()
+
+    magnetic_filter = KalmanFilter(process_variance=1e-3, measurement_variance=1e-1)
 
     print("[CAM_PROCESS] Camera initialized and ready.")
     last_print_time = time.time()
@@ -278,8 +283,56 @@ def camera_worker(shared_state):
                 if zed.get_sensors_data(sensors_data, sl.TIME_REFERENCE.CURRENT):
                     if ts_handler.is_new(sensors_data.get_imu_data()):
                         raw_heading = sensors_data.get_magnetometer_data().magnetic_heading
+                        zed_heading = magnetic_filter.update(raw_heading)
+                        zed_heading = (zed_heading - 6) % 360
+
+                        fc_heading = shared_state.get('fc_heading', None)
+                        heading_source = getattr(cfg, 'HEADING_SOURCE', 'ZED')
+
+                        if heading_source == 'FC' and fc_heading is not None:
+                            magnetic_heading = fc_heading
+                        elif heading_source == 'FUSED' and fc_heading is not None:
+                            diff = nav.signed_angle_difference(zed_heading, fc_heading)
+                            magnetic_heading = (zed_heading + (diff * 0.5)) % 360
+                        else:
+                            magnetic_heading = zed_heading
+
                         # Push heading to shared state
-                        shared_state['magnetic_heading'] = (raw_heading - 6) % 360
+                        shared_state['magnetic_heading'] = magnetic_heading
+
+                # 1.5 READ POSE (Pitch/Roll Stability & Odometry)
+                state = zed.get_position(zed_pose, sl.REFERENCE_FRAME.WORLD)
+                if state == sl.POSITIONAL_TRACKING_STATE.OK:
+                    t_vec = zed_pose.get_translation().get()
+                    # Axis Swap for Costmap
+                    shared_state['zed_x'] = float(t_vec[1])
+                    shared_state['zed_y'] = float(-t_vec[0])
+
+                    ox = zed_pose.get_orientation().get()[0]
+                    oy = zed_pose.get_orientation().get()[1]
+                    oz = zed_pose.get_orientation().get()[2]
+                    ow = zed_pose.get_orientation().get()[3]
+
+                    # 1. Roll
+                    sinr_cosp = 2 * (ow * ox + oy * oz)
+                    cosr_cosp = 1 - 2 * (ox * ox + oy * oy)
+                    robot_roll = math.atan2(sinr_cosp, cosr_cosp)
+                    robot_roll_deg = math.degrees(robot_roll)
+
+                    # 2. Pitch
+                    sinp = 2 * (ow * oy - oz * ox)
+                    if abs(sinp) >= 1:
+                        robot_pitch = math.copysign(math.pi / 2, sinp)
+                    else:
+                        robot_pitch = math.asin(sinp)
+                    robot_pitch_deg = math.degrees(robot_pitch)
+
+                    # 3. Stability Check
+                    max_tilt = getattr(cfg, 'MAX_TILT_ANGLE', 5.0)
+                    if abs(robot_roll_deg) > max_tilt or abs(robot_pitch_deg) > max_tilt:
+                        shared_state['lidar_wave_stable'] = False
+                    else:
+                        shared_state['lidar_wave_stable'] = True
 
                 # 2. READ FRAME & DEPTH
                 zed.retrieve_image(image, sl.VIEW.LEFT)

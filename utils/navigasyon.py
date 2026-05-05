@@ -17,6 +17,12 @@ def calculate_obj_gps(lat1, lon1, dist_m, bearing_deg):
 
     return math.degrees(lat2_rad), math.degrees(lon2_rad)
 
+def get_hybrid_point(robot_x, robot_y, robot_yaw, aci_farki, step_dist=2.0):
+    target_angle = robot_yaw - math.radians(aci_farki)
+    tx = robot_x + (step_dist * math.cos(target_angle))
+    ty = robot_y + (step_dist * math.sin(target_angle))
+    return tx, ty
+
 def haversine(lat1, lon1, lat2, lon2):
     """Calculate the great circle distance between two points on the earth."""
     # Stub for future nav process, just implemented here for completeness

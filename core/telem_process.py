@@ -59,12 +59,14 @@ def telem_worker(shared_state, command_queue):
                 "mod": bool(manual_mode),
             }
 
-            tx.send(payload)
+            if shared_state.get('send_telemetry', False):
+                tx.send(payload)
+                shared_state['send_telemetry'] = False
 
-            # Sleep to maintain frequency (~2Hz loop)
+            # Sleep to maintain frequency (~20Hz loop for polling responsiveness)
             elapsed = time.time() - start_time
-            if elapsed < 0.5:
-                time.sleep(0.5 - elapsed)
+            if elapsed < 0.05:
+                time.sleep(0.05 - elapsed)
 
     except Exception as e:
         print(f"[TELEM_PROCESS][ERROR] Loop crashed: {e}")
