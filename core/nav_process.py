@@ -103,6 +103,20 @@ def nav_worker(shared_state, command_queue):
             if fc_hdg is not None:
                 shared_state['fc_heading'] = fc_hdg
 
+            # Compute actual magnetic_heading based on HEADING_SOURCE
+            zed_heading = shared_state.get('zed_heading', 0.0)
+            heading_source = getattr(cfg, 'HEADING_SOURCE', 'ZED')
+
+            if heading_source == 'FC' and fc_hdg is not None:
+                magnetic_heading = fc_hdg
+            elif heading_source == 'FUSED' and fc_hdg is not None:
+                diff = nav.signed_angle_difference(zed_heading, fc_hdg)
+                magnetic_heading = (zed_heading + (diff * 0.5)) % 360
+            else:
+                magnetic_heading = zed_heading
+
+            shared_state['magnetic_heading'] = magnetic_heading
+
 
             # --- B. PROCESS INCOMING COMMANDS ---
             try:

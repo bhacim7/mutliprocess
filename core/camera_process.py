@@ -286,19 +286,9 @@ def camera_worker(shared_state):
                         zed_heading = magnetic_filter.update(raw_heading)
                         zed_heading = (zed_heading - 6) % 360
 
-                        fc_heading = shared_state.get('fc_heading', None)
-                        heading_source = getattr(cfg, 'HEADING_SOURCE', 'ZED')
-
-                        if heading_source == 'FC' and fc_heading is not None:
-                            magnetic_heading = fc_heading
-                        elif heading_source == 'FUSED' and fc_heading is not None:
-                            diff = nav.signed_angle_difference(zed_heading, fc_heading)
-                            magnetic_heading = (zed_heading + (diff * 0.5)) % 360
-                        else:
-                            magnetic_heading = zed_heading
-
-                        # Push heading to shared state
-                        shared_state['magnetic_heading'] = magnetic_heading
+                        # Push raw zed heading to shared state.
+                        # nav_process will determine final magnetic_heading
+                        shared_state['zed_heading'] = zed_heading
 
                 # 1.5 READ POSE (Pitch/Roll Stability & Odometry)
                 state = zed.get_position(zed_pose, sl.REFERENCE_FRAME.WORLD)
