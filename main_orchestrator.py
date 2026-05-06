@@ -40,6 +40,10 @@ def main():
         'gps_lat': 0.0,
         'gps_lon': 0.0,
         'magnetic_heading': 0.0,
+        'fc_heading': 0.0,
+        'zed_x': 0.0,
+        'zed_y': 0.0,
+        'send_telemetry': False,
 
         # Lidar Process Output (Emergency Distances)
         'lidar_center_blocked': False,
