@@ -380,12 +380,27 @@ def camera_worker(shared_state):
                         x1, y1, x2, y2 = map(int, coords[i])
                         cx = int((x1 + x2) / 2)
 
-                        # --- FIX: Measure depth at bottom 15% ---
+                        # --- FIX: Measure depth at bottom 15% with ROI Median Filter ---
                         box_h = y2 - y1
                         target_cy = int(y2 - (box_h * 0.15))
                         cy = max(0, min(target_cy, height - 1))
 
-                        err, dist_m = depth.get_value(cx, cy)
+                        # Extract a 5x5 ROI around the target pixel to filter out water reflection noise
+                        roi_size = 2
+                        depth_values = []
+                        for dy in range(-roi_size, roi_size + 1):
+                            for dx in range(-roi_size, roi_size + 1):
+                                sample_x = max(0, min(cx + dx, width - 1))
+                                sample_y = max(0, min(cy + dy, height - 1))
+                                err, d_val = depth.get_value(sample_x, sample_y)
+                                if not np.isnan(d_val) and not np.isinf(d_val) and d_val > 0.1:
+                                    depth_values.append(d_val)
+
+                        if depth_values:
+                            # Use the median depth to reject extreme outliers (like NaN or Inf points)
+                            dist_m = float(np.median(depth_values))
+                        else:
+                            dist_m = float('inf') # Invalid depth
 
                         if not np.isnan(dist_m) and not np.isinf(dist_m) and 0.5 < dist_m < 15.0:
                             pixel_offset = (cx - (width / 2)) / width

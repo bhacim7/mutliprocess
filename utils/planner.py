@@ -70,7 +70,36 @@ def check_line_of_sight(start, end, nav_map, center_m, res, size_px):
 
 # --- A* PATH PLANNING ---
 def heuristic(a, b, weight=1.0):
-    return weight * math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+    # Using Octile distance (Chebyshev variant) instead of Euclidean for much faster grid computation
+    dx = abs(b[0] - a[0])
+    dy = abs(b[1] - a[1])
+    return weight * (dx + dy + (1.414 - 2) * min(dx, dy))
+
+def string_pulling(path, nav_map, center_m, res, size_px):
+    """
+    Smoothens the jagged A* grid path by drawing straight lines between furthest
+    visible nodes, reducing zigzagging significantly.
+    """
+    if not path or len(path) <= 2:
+        return path
+
+    smoothed_path = [path[0]]
+    current_idx = 0
+
+    while current_idx < len(path) - 1:
+        furthest_visible = current_idx + 1
+        # Try to find the furthest node we can draw a straight line to without hitting an obstacle
+        for test_idx in range(current_idx + 2, len(path)):
+            if check_line_of_sight(path[current_idx], path[test_idx], nav_map, center_m, res, size_px):
+                furthest_visible = test_idx
+            else:
+                # Visibility broken, keep the last visible
+                break
+
+        smoothed_path.append(path[furthest_visible])
+        current_idx = furthest_visible
+
+    return smoothed_path
 
 def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_to_goal_line=0.0, heuristic_weight=2.5, cone_deg=180.0):
     """
@@ -133,7 +162,8 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
                 current = came_from[current]
             path.append(p2w(start[0], start[1]))
             path.reverse()
-            return path
+            # Apply path smoothing post-processing
+            return string_pulling(path, nav_map, center_m, res, size_px)
 
         for dx, dy in neighbors:
             neighbor = (current[0] + dx, current[1] + dy)

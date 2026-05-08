@@ -94,6 +94,33 @@ def main():
             if shared_state['shutdown']:
                 print("[ORCHESTRATOR] Shutdown command detected!")
                 break
+
+            # Watchdog: Check if all processes are alive, restart if necessary
+            for i, p in enumerate(processes):
+                if not p.is_alive():
+                    print(f"[ORCHESTRATOR][WARNING] Process {p.name} (PID: {p.pid}) has died unexpectedly!")
+                    # Identify the correct target and args based on the name
+                    if p.name == "NavProcess":
+                        target = nav_worker
+                        args = (shared_state, command_queue)
+                    elif p.name == "TelemProcess":
+                        target = telem_worker
+                        args = (shared_state, command_queue)
+                    elif p.name == "CameraProcess":
+                        target = camera_worker
+                        args = (shared_state,)
+                    elif p.name == "LidarProcess":
+                        target = lidar_worker
+                        args = (shared_state,)
+                    else:
+                        continue
+
+                    print(f"[ORCHESTRATOR] Restarting {p.name}...")
+                    new_p = mp.Process(target=target, args=args, name=p.name)
+                    new_p.start()
+                    processes[i] = new_p
+                    print(f"[ORCHESTRATOR] {p.name} restarted successfully with new PID: {new_p.pid}")
+
             time.sleep(1.0)
     except SystemExit:
         shared_state['shutdown'] = True
