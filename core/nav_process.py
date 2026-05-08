@@ -37,6 +37,10 @@ def nav_worker(shared_state, command_queue):
     costmap_center_m = (0, 0)
     costmap_ready = True
 
+    # Temporal Point Cloud Buffer for Map Decay
+    temporal_lidar_buffer = []  # List of dicts: {'time': t, 'points': lidar_points}
+    last_lidar_points_id = id(None)
+
     def world_to_pixel(world_x, world_y):
         cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
         dx_m = world_x - costmap_center_m[0]
@@ -51,6 +55,10 @@ def nav_worker(shared_state, command_queue):
     # 3. State Machine Variables
     task5_dock_timer = 0
     task5_dock_side = "RIGHT"
+
+    # PID Control Variables for Direct Drive
+    direct_drive_integral = 0.0
+    direct_drive_prev_error = 0.0
 
     task2_green_verify_count = 0
     task2_circle_center_lat = None
@@ -174,28 +182,56 @@ def nav_worker(shared_state, command_queue):
 
             vision_objects = shared_state.get('vision_detected_objects', [])
 
-            # --- D. UPDATE LOCAL COSTMAP ---
-            decay_amount = getattr(cfg, 'MAP_DECAY_AMOUNT', 0)
-            if decay_amount > 0 and costmap_ready:
-                costmap_img = cv2.add(costmap_img, (decay_amount,))
+            # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
+            if costmap_ready:
+                # 1. Update temporal buffer ONLY with fresh points to prevent N^2 bloat
+                current_time = time.time()
+                if lidar_points and id(lidar_points) != last_lidar_points_id:
+                    temporal_lidar_buffer.append({'time': current_time, 'points': lidar_points, 'rx': robot_x, 'ry': robot_y, 'ryaw': robot_yaw})
+                    last_lidar_points_id = id(lidar_points)
 
-            if lidar_points and costmap_ready:
-                empty_mask = np.zeros_like(costmap_img)
-                occupied_mask = np.zeros_like(costmap_img)
-                p_robot = world_to_pixel(robot_x, robot_y)
-                if p_robot:
-                    for quality, angle_deg, dist_mm in lidar_points:
+                # 2. Prune old points from buffer (keep only the last 3 seconds of data to prevent lag)
+                retention_time = 3.0
+                temporal_lidar_buffer = [b for b in temporal_lidar_buffer if (current_time - b['time']) <= retention_time]
+
+                # 3. Clear the costmap to base value
+                costmap_img.fill(127)
+
+                # 4. Accumulate probabilities correctly
+                # We use 32-bit floats to accumulate weights without clipping at 255/0 midway
+                accumulation_map = np.zeros(COSTMAP_SIZE_PX, dtype=np.float32)
+
+                free_gain = float(getattr(cfg, 'LIDAR_FREE_GAIN', 25))
+                occ_gain = float(getattr(cfg, 'LIDAR_OCCUPIED_GAIN', 80))
+
+                for buf_entry in temporal_lidar_buffer:
+                    rx, ry, ryaw = buf_entry['rx'], buf_entry['ry'], buf_entry['ryaw']
+                    p_robot = world_to_pixel(rx, ry)
+                    if not p_robot: continue
+
+                    # Create temporary masks for this specific scan
+                    temp_empty = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
+                    temp_occ = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
+
+                    for quality, angle_deg, dist_mm in buf_entry['points']:
                         dist_m = dist_mm / 1000.0
                         angle_rad = math.radians(angle_deg)
-                        global_angle = robot_yaw - angle_rad
-                        obs_x = robot_x + (dist_m * math.cos(global_angle))
-                        obs_y = robot_y + (dist_m * math.sin(global_angle))
+                        global_angle = ryaw - angle_rad
+                        obs_x = rx + (dist_m * math.cos(global_angle))
+                        obs_y = ry + (dist_m * math.sin(global_angle))
                         p_obs = world_to_pixel(obs_x, obs_y)
+
                         if p_obs:
-                            cv2.line(empty_mask, p_robot, p_obs, getattr(cfg, 'LIDAR_FREE_GAIN', 25), 1)
-                            cv2.circle(occupied_mask, p_obs, 2, getattr(cfg, 'LIDAR_OCCUPIED_GAIN', 80), -1)
-                    costmap_img = cv2.add(costmap_img, empty_mask)
-                    costmap_img = cv2.subtract(costmap_img, occupied_mask)
+                            cv2.line(temp_empty, p_robot, p_obs, 1, 1)
+                            cv2.circle(temp_occ, p_obs, 2, 1, -1)
+
+                    # Accumulate: Free space adds positive probability, occupied subtracts
+                    accumulation_map += (temp_empty.astype(np.float32) * free_gain)
+                    accumulation_map -= (temp_occ.astype(np.float32) * occ_gain)
+
+                # 5. Apply the accumulated probabilties to the base map and clip
+                final_map = 127.0 + accumulation_map
+                costmap_img = np.clip(final_map, 0, 255).astype(np.uint8)
 
             if vision_objects and costmap_ready:
                 for obj in vision_objects:
@@ -580,9 +616,24 @@ def nav_worker(shared_state, command_queue):
                                                 controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
                                         else:
                                             base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'CRUISE_PWM', 80)
-                                            # P controller for direct steering based on aci_farki
+
+                                            # Full PID controller for direct steering
                                             kp = 1.5
-                                            steering_correction = aci_farki * kp
+                                            ki = 0.05
+                                            kd = 0.5
+
+                                            # Calculate terms
+                                            error = aci_farki
+                                            direct_drive_integral += error
+
+                                            # Integral windup limit
+                                            windup_limit = 500.0
+                                            direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
+
+                                            derivative = error - direct_drive_prev_error
+                                            direct_drive_prev_error = error
+
+                                            steering_correction = (error * kp) + (direct_drive_integral * ki) + (derivative * kd)
 
                                             pp_sol = base_pwm + steering_correction
                                             pp_sag = base_pwm - steering_correction
