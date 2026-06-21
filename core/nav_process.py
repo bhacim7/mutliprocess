@@ -10,7 +10,7 @@ import utils.navigasyon as nav
 import utils.planner as planner
 from utils.navigasyon import calculate_obj_gps
 
-def nav_worker(shared_state, command_queue):
+def nav_worker(shared_state, command_queue, hf_data):
     """
     Independent process handling the autonomous state machine,
     A* path planning, local costmap generation, and PID motor control.
@@ -104,8 +104,8 @@ def nav_worker(shared_state, command_queue):
 
             # --- A. READ SENSORS FROM HARDWARE ---
             ida_enlem, ida_boylam = controller.get_current_position()
-            shared_state['gps_lat'] = ida_enlem
-            shared_state['gps_lon'] = ida_boylam
+            hf_data['gps_lat'].value = ida_enlem
+            hf_data['gps_lon'].value = ida_boylam
 
             fc_hdg = controller.get_heading()
             if fc_hdg is not None:
@@ -123,7 +123,7 @@ def nav_worker(shared_state, command_queue):
             else:
                 magnetic_heading = zed_heading
 
-            shared_state['magnetic_heading'] = magnetic_heading
+            hf_data['magnetic_heading'].value = magnetic_heading
 
 
             # --- B. PROCESS INCOMING COMMANDS ---
@@ -164,7 +164,7 @@ def nav_worker(shared_state, command_queue):
             except: pass
 
             # --- C. SYNC WITH SHARED STATE ---
-            magnetic_heading = shared_state.get('magnetic_heading', 0.0)
+            magnetic_heading = hf_data['magnetic_heading'].value
             mevcut_gorev = shared_state.get('current_task', 'TASK_1')
             manual_mode = shared_state.get('manual_mode', False)
             mission_started = shared_state.get('mission_started', True)
