@@ -3,7 +3,7 @@ import datetime
 import config as cfg
 import utils.telem as telem
 
-def telem_worker(shared_state, command_queue, hf_data):
+def telem_worker(shared_state, command_queue):
     """
     Independent process handling GCS communication.
     Broadcasts real-time telemetry from shared_state and listens for incoming commands.
@@ -31,9 +31,9 @@ def telem_worker(shared_state, command_queue, hf_data):
             start_time = time.time()
 
             # Extract data from shared_state without blocking others
-            current_lat = hf_data['gps_lat'].value
-            current_lon = hf_data['gps_lon'].value
-            heading = hf_data['magnetic_heading'].value
+            current_lat = shared_state.get('gps_lat', 0.0)
+            current_lon = shared_state.get('gps_lon', 0.0)
+            heading = shared_state.get('magnetic_heading', 0.0)
             mevcut_gorev = shared_state.get('current_task', 'TASK_UNKNOWN')
             pwm_l = shared_state.get('motor_pwm_left', 1500)
             pwm_r = shared_state.get('motor_pwm_right', 1500)

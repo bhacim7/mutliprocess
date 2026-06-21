@@ -3,8 +3,6 @@ import time
 import sys
 import signal
 
-import config as cfg
-
 # Import worker processes
 from core.camera_process import camera_worker
 from core.lidar_process import lidar_worker
@@ -16,39 +14,6 @@ def signal_handler(sig, frame):
     print("\n[ORCHESTRATOR] Kill signal received. Securing system...")
     sys.exit(0)
 
-def pre_flight_check(shared_state, hf_data):
-    """Blocks execution until critical sensors come online in the worker processes."""
-    print("\n" + "=" * 60)
-    print("[PRE-FLIGHT CHECK] System Diagnostics Started...")
-    print("Waiting for sensors to populate data...")
-    print("=" * 60)
-
-    # We need to verify that Nav, Camera, and Lidar are writing real values to shared_state
-    # instead of their default zeros.
-    sensors_ready = False
-
-    while not sensors_ready and not shared_state['shutdown']:
-        lat = hf_data['gps_lat'].value
-        heading = hf_data['magnetic_heading'].value
-
-        gps_ok = (lat != 0.0)
-        hdg_ok = (heading != 0.0)
-
-        # In a real scenario, you can expand these to check Lidar points or ZED positional state
-        if gps_ok and hdg_ok:
-            sensors_ready = True
-            print("   ✅ GPS: ONLINE & Locked")
-            print("   ✅ Compass/Heading: ONLINE")
-            print("   ✅ Sensor Data Validated!")
-        else:
-            time.sleep(1.0)
-
-    if sensors_ready:
-        print("=" * 60)
-        print("✅ SYSTEM READY FOR MISSION! ARMING...")
-        print("=" * 60)
-        shared_state['mission_started'] = True
-
 def main():
     print("=" * 50)
     print("🚀 RoboBoat 2026 - IDA System Orchestrator Starting...")
@@ -56,20 +21,12 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # 1. HIGH-FREQUENCY MEMORY (Avoids dictionary lock contention)
-    # Using 'd' for double precision floats
-    hf_data = {
-        'gps_lat': mp.Value('d', 0.0),
-        'gps_lon': mp.Value('d', 0.0),
-        'magnetic_heading': mp.Value('d', 0.0)
-    }
-
-    # 2. SHARED MEMORY DICTIONARY (For metadata and low-frequency states)
+    # 1. SHARED MEMORY DICTIONARY
     manager = mp.Manager()
     shared_state = manager.dict({
         # Global Control Flags
         'shutdown': False,
-        'mission_started': False, # <--- Starts False, blocks motors until pre-flight passes
+        'mission_started': True,
         'manual_mode': False,
         'current_task': 'TASK_1',
         
@@ -80,6 +37,9 @@ def main():
         'target_lon': 0.0,
 
         # Sensors & Tracking
+        'gps_lat': 0.0,
+        'gps_lon': 0.0,
+        'magnetic_heading': 0.0,
         'fc_heading': 0.0,
         'zed_x': 0.0,
         'zed_y': 0.0,
@@ -108,56 +68,27 @@ def main():
         
     })
 
-    # --- 1.5. CONDITIONAL TERMINAL UI (TASK SELECTION) ---
-    if shared_state['manual_mode']:
-        print("\n[ORCHESTRATOR] Manual Mode Active. Select Starting Task:")
-        print("  1: Task 1 (Gate)")
-        print("  2: Task 2 (Debris)")
-        print("  3: Task 3 (Speed)")
-        print("  5: Task 5 (Docking)")
-        choice = input("Enter number (1, 2, 3, 5): ").strip()
-
-        task_map = {
-            "1": "TASK1_STATE_ENTER",
-            "2": "TASK2_START",
-            "3": "T3_START",
-            "5": "TASK5_APPROACH"
-        }
-
-        selected_task = task_map.get(choice, "TASK1_STATE_ENTER") # Default fallback
-        shared_state['current_task'] = selected_task
-        print(f"[ORCHESTRATOR] Assigned User Selected Task: {selected_task}\n")
-    else:
-        # Auto Mode: Read directly from config
-        default_task = getattr(cfg, 'MEVCUT_GOREV', 'TASK1_STATE_ENTER')
-        shared_state['current_task'] = default_task
-        print(f"[ORCHESTRATOR] Auto Mode Active. Loaded default task from config: {default_task}\n")
-
-    # 3. QUEUES FOR IPC
+    # 2. QUEUES FOR IPC
     command_queue = mp.Queue()
 
-    # 4. DEFINE PROCESSES
+    # 3. DEFINE PROCESSES
     processes = []
 
     # Process initialization
-    p_nav = mp.Process(target=nav_worker, args=(shared_state, command_queue, hf_data), name="NavProcess")
-    p_telem = mp.Process(target=telem_worker, args=(shared_state, command_queue, hf_data), name="TelemProcess")
-    p_cam = mp.Process(target=camera_worker, args=(shared_state, hf_data), name="CameraProcess")
+    p_nav = mp.Process(target=nav_worker, args=(shared_state, command_queue), name="NavProcess")
+    p_telem = mp.Process(target=telem_worker, args=(shared_state, command_queue), name="TelemProcess")
+    p_cam = mp.Process(target=camera_worker, args=(shared_state,), name="CameraProcess")
     p_lidar = mp.Process(target=lidar_worker, args=(shared_state,), name="LidarProcess")
 
     processes.extend([p_nav, p_telem, p_cam, p_lidar])
 
-    # 5. START PROCESSES
+    # 4. START PROCESSES
     print("[ORCHESTRATOR] Launching processes...")
     for p in processes:
         p.start()
         print(f"[ORCHESTRATOR] Started: {p.name} (PID: {p.pid})")
 
-    # --- 5.5 RUN PRE FLIGHT CHECKS ---
-    # Blocks here while the worker processes boot up their hardware drivers
-    pre_flight_check(shared_state, hf_data)
-
-    # 6. WATCHDOG LOOP
+    # 5. WATCHDOG LOOP
     try:
         while True:
             if shared_state['shutdown']:
@@ -171,13 +102,13 @@ def main():
                     # Identify the correct target and args based on the name
                     if p.name == "NavProcess":
                         target = nav_worker
-                        args = (shared_state, command_queue, hf_data)
+                        args = (shared_state, command_queue)
                     elif p.name == "TelemProcess":
                         target = telem_worker
-                        args = (shared_state, command_queue, hf_data)
+                        args = (shared_state, command_queue)
                     elif p.name == "CameraProcess":
                         target = camera_worker
-                        args = (shared_state, hf_data)
+                        args = (shared_state,)
                     elif p.name == "LidarProcess":
                         target = lidar_worker
                         args = (shared_state,)

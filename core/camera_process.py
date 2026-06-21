@@ -191,7 +191,7 @@ TASK_CONTEXT_MAP = {
     "TASK6_DOCK": ProtoEnum.TASK_SOUND_SIGNAL
 }
 
-def camera_worker(shared_state, hf_data):
+def camera_worker(shared_state):
     """
     Independent process handling ZED Camera operations, YOLO Inference,
     and Object tracking. Updates the shared_state dictionary with lightweight metadata.
@@ -331,14 +331,12 @@ def camera_worker(shared_state, hf_data):
 
                 # Update frame ready flag
                 shared_state['vision_frame_ready'] = True
-
-                # --- THROTTLED TERMINAL HEARTBEAT (FPS & STATUS) ---
-                current_time = time.time()
-                if (current_time - last_print_time) >= 1.0:
-                    anlik_fps = round(zed.get_current_fps())
-                    mevcut_gorev = shared_state.get('current_task', 'UNKNOWN')
-                    print(f"[CAM_PROCESS] Status: {mevcut_gorev} | System FPS: {anlik_fps}")
-                    last_print_time = current_time
+                # --- YENİ EKLENEN: FPS SADECE SANIYEDE 1 KERE TERMINALE YAZ ---
+                #current_time = time.time()
+                #if (current_time - last_print_time) >= 1.0:
+                    #anlik_fps = round(zed.get_current_fps())
+                    #print(f"[CAM_PROCESS] Saf Kamera ve Yapay Zeka FPS: {anlik_fps}")
+                    #last_print_time = current_time
 
                 # 3. YOLO INFERENCE
                 conf_val = getattr(cfg, 'YOLO_CONFIDENCE', 0.50)
@@ -346,9 +344,9 @@ def camera_worker(shared_state, hf_data):
                 detections = sv.Detections.from_ultralytics(results)
 
                 # Fetch necessary shared state vars for calculation
-                ida_enlem = hf_data['gps_lat'].value
-                ida_boylam = hf_data['gps_lon'].value
-                magnetic_heading = hf_data['magnetic_heading'].value
+                ida_enlem = shared_state.get('gps_lat', 0.0)
+                ida_boylam = shared_state.get('gps_lon', 0.0)
+                magnetic_heading = shared_state.get('magnetic_heading', 0.0)
                 mevcut_gorev = shared_state.get('current_task', 'TASK_UNKNOWN')
 
                 current_frame_objects = []
@@ -445,9 +443,9 @@ def camera_worker(shared_state, hf_data):
                 dist = shared_state.get('target_dist', 0.0)
                 adv_crs = shared_state.get('adviced_course', 0.0)
                 err_ang = shared_state.get('angle_error', 0.0)
-                hdg = hf_data['magnetic_heading'].value
-                lat = hf_data['gps_lat'].value
-                lon = hf_data['gps_lon'].value
+                hdg = shared_state.get('magnetic_heading', 0.0)
+                lat = shared_state.get('gps_lat', 0.0)
+                lon = shared_state.get('gps_lon', 0.0)
                 t_lat = shared_state.get('target_lat', 0.0)
                 t_lon = shared_state.get('target_lon', 0.0)
 

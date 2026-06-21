@@ -10,7 +10,7 @@ import utils.navigasyon as nav
 import utils.planner as planner
 from utils.navigasyon import calculate_obj_gps
 
-def nav_worker(shared_state, command_queue, hf_data):
+def nav_worker(shared_state, command_queue):
     """
     Independent process handling the autonomous state machine,
     A* path planning, local costmap generation, and PID motor control.
@@ -39,7 +39,7 @@ def nav_worker(shared_state, command_queue, hf_data):
 
     # Temporal Point Cloud Buffer for Map Decay
     temporal_lidar_buffer = []  # List of dicts: {'time': t, 'points': lidar_points}
-    last_lidar_points_ts = 0.0
+    last_lidar_points_id = id(None)
 
     def world_to_pixel(world_x, world_y):
         cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
@@ -104,8 +104,8 @@ def nav_worker(shared_state, command_queue, hf_data):
 
             # --- A. READ SENSORS FROM HARDWARE ---
             ida_enlem, ida_boylam = controller.get_current_position()
-            hf_data['gps_lat'].value = ida_enlem
-            hf_data['gps_lon'].value = ida_boylam
+            shared_state['gps_lat'] = ida_enlem
+            shared_state['gps_lon'] = ida_boylam
 
             fc_hdg = controller.get_heading()
             if fc_hdg is not None:
@@ -123,7 +123,7 @@ def nav_worker(shared_state, command_queue, hf_data):
             else:
                 magnetic_heading = zed_heading
 
-            hf_data['magnetic_heading'].value = magnetic_heading
+            shared_state['magnetic_heading'] = magnetic_heading
 
 
             # --- B. PROCESS INCOMING COMMANDS ---
@@ -164,7 +164,7 @@ def nav_worker(shared_state, command_queue, hf_data):
             except: pass
 
             # --- C. SYNC WITH SHARED STATE ---
-            magnetic_heading = hf_data['magnetic_heading'].value
+            magnetic_heading = shared_state.get('magnetic_heading', 0.0)
             mevcut_gorev = shared_state.get('current_task', 'TASK_1')
             manual_mode = shared_state.get('manual_mode', False)
             mission_started = shared_state.get('mission_started', True)
@@ -178,13 +178,7 @@ def nav_worker(shared_state, command_queue, hf_data):
             left_d = shared_state.get('lidar_left_dist', float('inf'))
             center_d = shared_state.get('lidar_center_dist', float('inf'))
             right_d = shared_state.get('lidar_right_dist', float('inf'))
-            lidar_data = shared_state.get('lidar_points', (0.0, []))
-
-            # Unpack the tuple (timestamp, points)
-            if isinstance(lidar_data, tuple) and len(lidar_data) == 2:
-                lidar_ts, lidar_points = lidar_data
-            else:
-                lidar_ts, lidar_points = 0.0, lidar_data # Fallback
+            lidar_points = shared_state.get('lidar_points', [])
 
             vision_objects = shared_state.get('vision_detected_objects', [])
 
@@ -192,9 +186,9 @@ def nav_worker(shared_state, command_queue, hf_data):
             if costmap_ready:
                 # 1. Update temporal buffer ONLY with fresh points to prevent N^2 bloat
                 current_time = time.time()
-                if lidar_points and lidar_ts > last_lidar_points_ts:
+                if lidar_points and id(lidar_points) != last_lidar_points_id:
                     temporal_lidar_buffer.append({'time': current_time, 'points': lidar_points, 'rx': robot_x, 'ry': robot_y, 'ryaw': robot_yaw})
-                    last_lidar_points_ts = lidar_ts
+                    last_lidar_points_id = id(lidar_points)
 
                 # 2. Prune old points from buffer (keep only the last 3 seconds of data to prevent lag)
                 retention_time = 3.0

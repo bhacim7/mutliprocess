@@ -119,10 +119,9 @@ def lidar_worker(shared_state):
                             dist_m = p[2] / 1000.0
                             if dist_m > 5.0 or (i % 3 == 0):
                                 downsampled.append(p)
-                        # Bundle with a timestamp so nav_process can uniquely identify new frames over IPC
-                        shared_state['lidar_points'] = (time.time(), downsampled)
+                        shared_state['lidar_points'] = downsampled
                     else:
-                        shared_state['lidar_points'] = (time.time(), [])
+                        shared_state['lidar_points'] = []
 
         except Exception as e:
             print(f"[LIDAR_PROCESS][ERROR] Connection lost or data corrupt: {e}")
