@@ -3,6 +3,8 @@ import time
 import sys
 import signal
 
+import config as cfg
+
 # Import worker processes
 from core.camera_process import camera_worker
 from core.lidar_process import lidar_worker
@@ -67,6 +69,31 @@ def main():
 
         
     })
+
+    # --- 1.5. CONDITIONAL TERMINAL UI (TASK SELECTION) ---
+    if shared_state['manual_mode']:
+        print("\n[ORCHESTRATOR] Manual Mode Active. Select Starting Task:")
+        print("  1: Task 1 (Gate)")
+        print("  2: Task 2 (Debris)")
+        print("  3: Task 3 (Speed)")
+        print("  5: Task 5 (Docking)")
+        choice = input("Enter number (1, 2, 3, 5): ").strip()
+
+        task_map = {
+            "1": "TASK1_STATE_ENTER",
+            "2": "TASK2_START",
+            "3": "T3_START",
+            "5": "TASK5_APPROACH"
+        }
+
+        selected_task = task_map.get(choice, "TASK1_STATE_ENTER") # Default fallback
+        shared_state['current_task'] = selected_task
+        print(f"[ORCHESTRATOR] Assigned User Selected Task: {selected_task}\n")
+    else:
+        # Auto Mode: Read directly from config
+        default_task = getattr(cfg, 'MEVCUT_GOREV', 'TASK1_STATE_ENTER')
+        shared_state['current_task'] = default_task
+        print(f"[ORCHESTRATOR] Auto Mode Active. Loaded default task from config: {default_task}\n")
 
     # 2. QUEUES FOR IPC
     command_queue = mp.Queue()
