@@ -103,29 +103,46 @@ class AsyncStreamer(threading.Thread):
 
 class ObjectMemoryManager:
     def __init__(self):
-        # Format: [{'id': 1, 'lat': 0.0, 'lon': 0.0, 'type': 0, 'color': 0, 'last_seen': 0.0}]
+        # Format: [{'id': 1, 'lat': 0.0, 'lon': 0.0, 'type': 0, 'color': 0, 'last_seen': 0.0, 'v_lat': 0.0, 'v_lon': 0.0}]
         self.memory = []
         self.id_counter = 1
-        self.MERGE_DISTANCE = 2.0  # 2 meters merge distance
+        self.MERGE_DISTANCE = 2.5  # 2.5 meters merge distance
 
     def update_and_get_id(self, lat, lon, obj_type, color):
         current_time = time.time()
         best_match = None
         min_dist = float('inf')
 
+        # Clean up old objects (not seen in 5 seconds)
+        self.memory = [obj for obj in self.memory if (current_time - obj['last_seen']) < 5.0]
+
         for obj in self.memory:
-            dy = (obj['lat'] - lat) * 111139
-            dx = (obj['lon'] - lon) * 85000
+            # Predict current position based on velocity
+            dt = current_time - obj['last_seen']
+            pred_lat = obj['lat'] + (obj['v_lat'] * dt)
+            pred_lon = obj['lon'] + (obj['v_lon'] * dt)
+
+            # Calculate distance to predicted position
+            dy = (pred_lat - lat) * 111139
+            dx = (pred_lon - lon) * 85000
             dist = math.sqrt(dx * dx + dy * dy)
 
-            if dist < self.MERGE_DISTANCE:
+            # Also check color and type for stricter matching
+            if dist < self.MERGE_DISTANCE and obj['type'] == obj_type and obj['color'] == color:
                 if dist < min_dist:
                     min_dist = dist
                     best_match = obj
 
         if best_match:
-            best_match['lat'] = best_match['lat'] * 0.9 + lat * 0.1
-            best_match['lon'] = best_match['lon'] * 0.9 + lon * 0.1
+            # Update velocity
+            dt = current_time - best_match['last_seen']
+            if dt > 0:
+                best_match['v_lat'] = best_match['v_lat'] * 0.8 + ((lat - best_match['lat']) / dt) * 0.2
+                best_match['v_lon'] = best_match['v_lon'] * 0.8 + ((lon - best_match['lon']) / dt) * 0.2
+
+            # Smooth position (Alpha filter)
+            best_match['lat'] = best_match['lat'] * 0.8 + lat * 0.2
+            best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
             best_match['last_seen'] = current_time
             return best_match['id'], best_match['lat'], best_match['lon']
         else:
@@ -137,7 +154,9 @@ class ObjectMemoryManager:
                 'lon': lon,
                 'type': obj_type,
                 'color': color,
-                'last_seen': current_time
+                'last_seen': current_time,
+                'v_lat': 0.0,
+                'v_lon': 0.0
             })
             return new_id, lat, lon
 

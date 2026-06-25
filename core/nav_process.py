@@ -10,7 +10,9 @@ import utils.navigasyon as nav
 import utils.planner as planner
 from utils.navigasyon import calculate_obj_gps
 
-def nav_worker(shared_state, command_queue, hf_data):
+import queue
+
+def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     """
     Independent process handling the autonomous state machine,
     A* path planning, local costmap generation, and PID motor control.
@@ -36,10 +38,6 @@ def nav_worker(shared_state, command_queue, hf_data):
     costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
     costmap_center_m = (0, 0)
     costmap_ready = True
-
-    # Temporal Point Cloud Buffer for Map Decay
-    temporal_lidar_buffer = []  # List of dicts: {'time': t, 'points': lidar_points}
-    last_lidar_points_ts = 0.0
 
     def world_to_pixel(world_x, world_y):
         cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
@@ -178,68 +176,36 @@ def nav_worker(shared_state, command_queue, hf_data):
             left_d = shared_state.get('lidar_left_dist', float('inf'))
             center_d = shared_state.get('lidar_center_dist', float('inf'))
             right_d = shared_state.get('lidar_right_dist', float('inf'))
-            lidar_data = shared_state.get('lidar_points', (0.0, []))
 
-            # Unpack the tuple (timestamp, points)
-            if isinstance(lidar_data, tuple) and len(lidar_data) == 2:
-                lidar_ts, lidar_points = lidar_data
+            # --- 4-A UPDATE: Pull from Queue instead of shared_state ---
+            lidar_data = None
+            try:
+                # Empty the queue, only keeping the absolute newest frame
+                while True:
+                    lidar_data = lidar_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            if lidar_data and isinstance(lidar_data, tuple) and len(lidar_data) == 2:
+                lidar_ts, costmap_payload = lidar_data
+                # Ensure the payload is a numpy array (it should be)
+                if isinstance(costmap_payload, np.ndarray):
+                    costmap_img = costmap_payload
             else:
-                lidar_ts, lidar_points = 0.0, lidar_data # Fallback
+                lidar_ts = 0.0 # Fallback
+            # -----------------------------------------------------------
 
             vision_objects = shared_state.get('vision_detected_objects', [])
 
             # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
-            if costmap_ready:
-                # 1. Update temporal buffer ONLY with fresh points to prevent N^2 bloat
-                current_time = time.time()
-                if lidar_points and lidar_ts > last_lidar_points_ts:
-                    temporal_lidar_buffer.append({'time': current_time, 'points': lidar_points, 'rx': robot_x, 'ry': robot_y, 'ryaw': robot_yaw})
-                    last_lidar_points_ts = lidar_ts
+            # Most logic has been moved to lidar_process (4-B Update)
 
-                # 2. Prune old points from buffer (keep only the last 3 seconds of data to prevent lag)
-                retention_time = 3.0
-                temporal_lidar_buffer = [b for b in temporal_lidar_buffer if (current_time - b['time']) <= retention_time]
-
-                # 3. Clear the costmap to base value
+            # If lidar is completely disabled or dead, we still need a blank map to draw vision objects on
+            if not getattr(cfg, 'ENABLE_LIDAR', True):
                 costmap_img.fill(127)
 
-                # 4. Accumulate probabilities correctly
-                # We use 32-bit floats to accumulate weights without clipping at 255/0 midway
-                accumulation_map = np.zeros(COSTMAP_SIZE_PX, dtype=np.float32)
-
-                free_gain = float(getattr(cfg, 'LIDAR_FREE_GAIN', 25))
-                occ_gain = float(getattr(cfg, 'LIDAR_OCCUPIED_GAIN', 80))
-
-                for buf_entry in temporal_lidar_buffer:
-                    rx, ry, ryaw = buf_entry['rx'], buf_entry['ry'], buf_entry['ryaw']
-                    p_robot = world_to_pixel(rx, ry)
-                    if not p_robot: continue
-
-                    # Create temporary masks for this specific scan
-                    temp_empty = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
-                    temp_occ = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
-
-                    for quality, angle_deg, dist_mm in buf_entry['points']:
-                        dist_m = dist_mm / 1000.0
-                        angle_rad = math.radians(angle_deg)
-                        global_angle = ryaw - angle_rad
-                        obs_x = rx + (dist_m * math.cos(global_angle))
-                        obs_y = ry + (dist_m * math.sin(global_angle))
-                        p_obs = world_to_pixel(obs_x, obs_y)
-
-                        if p_obs:
-                            cv2.line(temp_empty, p_robot, p_obs, 1, 1)
-                            cv2.circle(temp_occ, p_obs, 2, 1, -1)
-
-                    # Accumulate: Free space adds positive probability, occupied subtracts
-                    accumulation_map += (temp_empty.astype(np.float32) * free_gain)
-                    accumulation_map -= (temp_occ.astype(np.float32) * occ_gain)
-
-                # 5. Apply the accumulated probabilties to the base map and clip
-                final_map = 127.0 + accumulation_map
-                costmap_img = np.clip(final_map, 0, 255).astype(np.uint8)
-
             if vision_objects and costmap_ready:
+                # If we are using vision-only or fused, draw vision objects on whatever map we have
                 for obj in vision_objects:
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
@@ -255,178 +221,108 @@ def nav_worker(shared_state, command_queue, hf_data):
                             cv2.circle(costmap_img, p_virtual, 6, 0, -1)
 
             # --- E. FULL STATE MACHINE ---
+            # 3-A UPDATE: Refactored modular state machine
+
+            # Helper to execute task routing logic
+            def execute_task1(task_state, lat, lon, returning):
+                if task_state == "TASK1_APPROACH": return "TASK1_STATE_ENTER", None, None, returning
+
+                targets = {
+                    "TASK1_STATE_ENTER": (getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0)),
+                    "TASK1_STATE_MID": (getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)),
+                    "TASK1_STATE_EXIT": (getattr(cfg, 'T1_GATE_EXIT_LAT', 0), getattr(cfg, 'T1_GATE_EXIT_LON', 0)),
+                    "TASK1_RETURN_MID": (getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)),
+                    "TASK1_RETURN_ENTER": (getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0))
+                }
+
+                t_lat, t_lon = targets.get(task_state, (None, None))
+                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                    if task_state == "TASK1_STATE_ENTER": task_state = "TASK1_STATE_MID"
+                    elif task_state == "TASK1_STATE_MID": task_state = "TASK1_STATE_EXIT"
+                    elif task_state == "TASK1_STATE_EXIT": task_state = "TASK1_RETURN_MID" if returning else "TASK2_START"
+                    elif task_state == "TASK1_RETURN_MID": task_state = "TASK1_RETURN_ENTER"
+                    elif task_state == "TASK1_RETURN_ENTER": task_state = "FINISHED"
+                return task_state, t_lat, t_lon, returning
+
+            def execute_task2(task_state, lat, lon):
+                targets = {
+                    "TASK2_START": (getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0), "TASK2_GO_TO_MID"),
+                    "TASK2_GO_TO_MID": (getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0), "TASK2_GO_TO_END"),
+                    "TASK2_GO_TO_END": (getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0), "TASK3_APPROACH"),
+                }
+
+                if task_state in targets:
+                    t_lat, t_lon, next_state = targets[task_state]
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                        task_state = next_state
+                    return task_state, t_lat, t_lon
+
+                return task_state, None, None
+
+            def execute_task3(task_state, lat, lon):
+                if task_state == "TASK3_APPROACH": return "T3_START", None, None
+
+                targets = {
+                    "T3_START": (getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0), "T3_MID" if getattr(cfg, 'ENABLE_TASK3', True) else "FINISHED"),
+                    "T3_MID": (getattr(cfg, 'T3_MID_LAT', 0), getattr(cfg, 'T3_MID_LON', 0), "TASK3_SEARCH_KAMIKAZE")
+                }
+
+                if task_state in targets:
+                    t_lat, t_lon, next_state = targets[task_state]
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                        task_state = next_state
+                    return task_state, t_lat, t_lon
+
+                return task_state, None, None
+
+            # Main State Router
             target_lat = None
             target_lon = None
 
-            # --- TASK 6 ---
-            if mevcut_gorev == "TASK6_SPEED":
-                target_lat, target_lon = getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_START"
-            elif mevcut_gorev == "TASK6_DOCK":
-                target_lat, target_lon = getattr(cfg, 'T5_DOCK_APPROACH_LAT', 0), getattr(cfg, 'T5_DOCK_APPROACH_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK5_APPROACH"
-
-            # --- TASK 1 ---
-            elif mevcut_gorev == "TASK1_APPROACH": mevcut_gorev = "TASK1_STATE_ENTER"
-            elif mevcut_gorev in ["TASK1_STATE_ENTER", "TASK1_STATE_MID", "TASK1_STATE_EXIT"]:
-                if mevcut_gorev == "TASK1_STATE_ENTER": target_lat, target_lon = getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0)
-                elif mevcut_gorev == "TASK1_STATE_MID": target_lat, target_lon = getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)
-                else: target_lat, target_lon = getattr(cfg, 'T1_GATE_EXIT_LAT', 0), getattr(cfg, 'T1_GATE_EXIT_LON', 0)
-
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
-                    print(f"[TASK1] Reached {mevcut_gorev}")
-                    if mevcut_gorev == "TASK1_STATE_ENTER": mevcut_gorev = "TASK1_STATE_MID"
-                    elif mevcut_gorev == "TASK1_STATE_MID": mevcut_gorev = "TASK1_STATE_EXIT"
-                    else:
-                        if returning_home: mevcut_gorev = "TASK1_RETURN_MID"
-                        else: mevcut_gorev = "TASK2_START"
-
-            elif mevcut_gorev in ["TASK1_RETURN_MID", "TASK1_RETURN_ENTER"]:
-                if mevcut_gorev == "TASK1_RETURN_MID":
-                    target_lat, target_lon = getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK1_RETURN_ENTER"
-                elif mevcut_gorev == "TASK1_RETURN_ENTER":
-                    target_lat, target_lon = getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "FINISHED"
-
-            elif mevcut_gorev == "FINISHED":
-                if not finished_printed:
-                    print("[TASK1] MISSION COMPLETE")
-                    finished_printed = True
-                controller.set_servo(cfg.SOL_MOTOR, 1500)
-                controller.set_servo(cfg.SAG_MOTOR, 1500)
-
-            # --- TASK 2 ---
-            elif mevcut_gorev == "TASK2_START":
-                target_lat, target_lon = getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_GO_TO_MID"
-            elif mevcut_gorev == "TASK2_GO_TO_MID":
-                target_lat, target_lon = getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_GO_TO_MID1"
-            elif mevcut_gorev == "TASK2_GO_TO_MID1":
-                target_lat, target_lon = getattr(cfg, 'T2_ZONE_MID1_LAT', 0), getattr(cfg, 'T2_ZONE_MID1_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_GO_TO_END"
-            elif mevcut_gorev == "TASK2_GO_TO_END":
-                target_lat, target_lon = getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
-                    mevcut_gorev = "TASK2_SEARCH_PATTERN"
-                    task2_search_accumulated_yaw = 0.0
-                    task2_search_prev_yaw = magnetic_heading
-                    task2_search_start_yaw = magnetic_heading
-
-            elif mevcut_gorev == "TASK2_SEARCH_PATTERN":
-                found_green_live = False
-                for obj in vision_objects:
-                    if obj.get('cid') == 4 and obj.get('dist', 10) < 5.0: # Green Marker
-                        found_green_live = True
-                        found_green_dist = obj['dist']
-                        pixel_offset = (obj['cx'] - (1280 / 2)) / 1280 # Stub width
-                        found_green_angle_offset = pixel_offset * getattr(cfg, 'CAM_HFOV', 110.0)
-                        break
-
-                if found_green_live:
-                    task2_green_verify_count += 1
-                    if task2_green_verify_count >= 5:
-                        print("[TASK2] GREEN MARKER CONFIRMED! CALCULATING ORBIT")
-                        mevcut_gorev = "TASK2_GREEN_MARKER_FOUND"
-                        obj_bearing = (magnetic_heading + found_green_angle_offset) % 360
-                        task2_circle_center_lat, task2_circle_center_lon = calculate_obj_gps(ida_enlem, ida_boylam, found_green_dist, obj_bearing)
-                        bearing_to_robot = nav.calculate_bearing(task2_circle_center_lat, task2_circle_center_lon, ida_enlem, ida_boylam)
-                        task2_search_phase = (int(round(bearing_to_robot / 45.0)) % 8) + 1
-                        task2_circle_target_phase = task2_search_phase + 8
-                        task2_green_verify_count = 0
+            if "TASK1" in mevcut_gorev or mevcut_gorev == "FINISHED":
+                if mevcut_gorev == "FINISHED":
+                    if not finished_printed:
+                        print("[TASK1] MISSION COMPLETE")
+                        finished_printed = True
+                    controller.set_servo(cfg.SOL_MOTOR, 1500)
+                    controller.set_servo(cfg.SAG_MOTOR, 1500)
                 else:
-                    task2_green_verify_count = 0
-                    current_yaw = magnetic_heading
-                    if task2_search_prev_yaw is not None and current_yaw is not None:
-                        diff = nav.signed_angle_difference(task2_search_prev_yaw, current_yaw)
-                        task2_search_accumulated_yaw += abs(diff)
-                        task2_search_prev_yaw = current_yaw
-                    if task2_search_start_yaw is not None and current_yaw is not None:
-                        heading_diff = abs(nav.signed_angle_difference(task2_search_start_yaw, current_yaw))
-                        if task2_search_accumulated_yaw > 320.0 and heading_diff < 15.0:
-                            print("[TASK2] 360 ROTATION COMPLETE -> RETURN HOME")
-                            mevcut_gorev = "TASK2_RETURN_HOME"
+                    mevcut_gorev, target_lat, target_lon, returning_home = execute_task1(mevcut_gorev, ida_enlem, ida_boylam, returning_home)
 
-            elif mevcut_gorev == "TASK2_GREEN_MARKER_FOUND":
-                R = getattr(cfg, 'TASK2_SEARCH_DIAMETER', 2.0) / 2.0
-                if task2_search_phase >= task2_circle_target_phase:
-                    mevcut_gorev = "TASK2_RETURN_HOME"
+            elif "TASK2" in mevcut_gorev:
+                mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
+
+            elif "T3" in mevcut_gorev or mevcut_gorev == "TASK3_APPROACH":
+                if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
+                    found_target = False
+                    for obj in vision_objects:
+                        # Assuming CIDs: 3=Red, 4=Green, 10=Black (Adjust as per dataset)
+                        if obj.get('cid') in [3, 4, 10]:
+                            found_target = True
+                            dist_m = obj.get('dist', 10.0)
+
+                            # Calculate the global GPS of the buoy to set as target
+                            pixel_offset = (obj['cx'] - (1280 / 2)) / 1280.0
+                            angle_offset_deg = pixel_offset * getattr(cfg, 'CAM_HFOV', 110.0)
+                            obj_bearing = (magnetic_heading + angle_offset_deg) % 360
+                            target_lat, target_lon = calculate_obj_gps(ida_enlem, ida_boylam, dist_m, obj_bearing)
+
+                            # Check collision condition
+                            if dist_m < 1.0 or obj.get('area', 0) > 300000: # Bounding box fills screen or very close
+                                print("[TASK3] KAMIKAZE COLLISION CONFIRMED! RETURNING HOME.")
+                                returning_home = True
+                                mevcut_gorev = "TASK1_STATE_EXIT" # Triggers return sequence
+                            break
+
+                    if not found_target:
+                        # Spin slowly to search
+                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 150)
+                        controller.set_servo(cfg.SOL_MOTOR, 1500 + spot_pwm)
+                        controller.set_servo(cfg.SAG_MOTOR, 1500 - spot_pwm - extra)
+                        # Ensure we don't drop into A* or PID below while spinning
+                        target_lat, target_lon = None, None
                 else:
-                    target_angle_deg = (task2_search_phase % 8) * 45.0
-                    if task2_circle_center_lat is not None:
-                        target_lat, target_lon = calculate_obj_gps(task2_circle_center_lat, task2_circle_center_lon, R, target_angle_deg)
-                    dist_to_wp = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
-
-                    if task2_stall_check_time is None:
-                        task2_stall_check_time = time.time()
-                        task2_last_dist_to_wp = dist_to_wp
-                    if (time.time() - task2_stall_check_time) > 1.0:
-                        if abs(dist_to_wp - task2_last_dist_to_wp) < 0.1:
-                            if task2_stall_start_time is None: task2_stall_start_time = task2_stall_check_time
-                        else: task2_stall_start_time = None
-                        task2_stall_check_time = time.time()
-                        task2_last_dist_to_wp = dist_to_wp
-
-                    if task2_stall_start_time and (time.time() - task2_stall_start_time) > 5.0:
-                        print("[TASK2] STALL DETECTED -> ABORTING CIRCLING")
-                        mevcut_gorev = "TASK2_RETURN_HOME"
-
-                    if dist_to_wp < 1.5:
-                        task2_search_phase += 1
-                        task2_stall_start_time = None
-                        task2_stall_check_time = None
-
-            elif mevcut_gorev == "TASK2_RETURN_HOME": mevcut_gorev = "TASK2_RETURN_END"
-            elif mevcut_gorev in ["TASK2_RETURN_END", "TASK2_RETURN_MID", "TASK2_RETURN_MID1", "TASK2_RETURN_ENTRY"]:
-                if mevcut_gorev == "TASK2_RETURN_END":
-                    target_lat, target_lon = getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_RETURN_MID1"
-                elif mevcut_gorev == "TASK2_RETURN_MID1":
-                    target_lat, target_lon = getattr(cfg, 'T2_ZONE_MID1_LAT', 0), getattr(cfg, 'T2_ZONE_MID1_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_RETURN_MID"
-                elif mevcut_gorev == "TASK2_RETURN_MID":
-                    target_lat, target_lon = getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK2_RETURN_ENTRY"
-                elif mevcut_gorev == "TASK2_RETURN_ENTRY":
-                    target_lat, target_lon = getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0)
-                    if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK3_APPROACH"
-
-            # --- TASK 3 ---
-            elif mevcut_gorev == "TASK3_APPROACH": mevcut_gorev = "T3_START"
-            elif mevcut_gorev == "T3_START":
-                target_lat, target_lon = getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
-                    if getattr(cfg, 'ENABLE_TASK3', True): mevcut_gorev = "T3_MID"
-                    else: mevcut_gorev = "TASK5_APPROACH"
-            elif mevcut_gorev == "T3_MID":
-                target_lat, target_lon = getattr(cfg, 'T3_MID_LAT', 0), getattr(cfg, 'T3_MID_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_RIGHT"
-            elif mevcut_gorev == "T3_RIGHT":
-                target_lat, target_lon = getattr(cfg, 'T3_RIGHT_LAT', 0), getattr(cfg, 'T3_RIGHT_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_END"
-            elif mevcut_gorev == "T3_END":
-                target_lat, target_lon = getattr(cfg, 'T3_END_LAT', 0), getattr(cfg, 'T3_END_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_END1"
-            elif mevcut_gorev == "T3_END1":
-                target_lat, target_lon = getattr(cfg, 'T3_END1_LAT', 0), getattr(cfg, 'T3_END1_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_LEFT"
-            elif mevcut_gorev == "T3_LEFT":
-                target_lat, target_lon = getattr(cfg, 'T3_LEFT_LAT', 0), getattr(cfg, 'T3_LEFT_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_RETURN_MID"
-            elif mevcut_gorev == "T3_RETURN_MID":
-                target_lat, target_lon = getattr(cfg, 'T3_MID_LAT', 0), getattr(cfg, 'T3_MID_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "T3_RETURN_START"
-            elif mevcut_gorev == "T3_RETURN_START":
-                target_lat, target_lon = getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0: mevcut_gorev = "TASK5_APPROACH"
-
-            # --- TASK 5 ---
-            elif mevcut_gorev == "TASK5_APPROACH":
-                target_lat, target_lon = getattr(cfg, 'T5_DOCK_APPROACH_LAT', 0), getattr(cfg, 'T5_DOCK_APPROACH_LON', 0)
-                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
-                    returning_home = True
-                    mevcut_gorev = "TASK1_STATE_EXIT"
+                    mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
 
             # Sync State
             shared_state['current_task'] = mevcut_gorev
@@ -571,19 +467,45 @@ def nav_worker(shared_state, command_queue, hf_data):
                             if aci_farki > 0: controller.set_servo(cfg.SOL_MOTOR, 1500 + spot_pwm); controller.set_servo(cfg.SAG_MOTOR, 1500 - spot_pwm - extra)
                             else: controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra); controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
                         else:
-                            # Run Planner
-                            nav_map, _ = planner.get_inflated_nav_map(costmap_img, ignore_green=(mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
+                            current_path = None
 
-                            plan_timer += 1
-                            if plan_timer > 4:
-                                plan_timer = 0
-                                if tx_world is not None:
-                                    if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map, costmap_center_m, COSTMAP_RES_M_PER_PX, COSTMAP_SIZE_PX):
-                                        current_path = [(robot_x, robot_y), (tx_world, ty_world)]
-                                    else:
-                                        new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world), nav_map, costmap_center_m, COSTMAP_RES_M_PER_PX, COSTMAP_SIZE_PX)
-                                        if new_path: current_path = new_path
+                            # Use A* ONLY for Task 2
+                            if "TASK2" in mevcut_gorev:
+                                # Run Planner
+                                # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
+                                crop_radius_m = 10.0 # Only look at a 20m x 20m window around the boat
+                                crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
 
+                                cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
+                                rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
+                                ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+
+                                x_min = max(0, rx_px - crop_radius_px)
+                                x_max = min(COSTMAP_SIZE_PX[0], rx_px + crop_radius_px)
+                                y_min = max(0, ry_px - crop_radius_px)
+                                y_max = min(COSTMAP_SIZE_PX[1], ry_px + crop_radius_px)
+
+                                cropped_costmap = costmap_img[y_min:y_max, x_min:x_max]
+                                cropped_center_m = (
+                                    costmap_center_m[0] + ((x_min + x_max)/2 - cw) * COSTMAP_RES_M_PER_PX,
+                                    costmap_center_m[1] - ((y_min + y_max)/2 - ch) * COSTMAP_RES_M_PER_PX
+                                )
+                                cropped_size_px = (x_max - x_min, y_max - y_min)
+
+                                nav_map, _ = planner.get_inflated_nav_map(cropped_costmap, ignore_green=(mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
+
+                                plan_timer += 1
+                                if plan_timer > 4:
+                                    plan_timer = 0
+                                    if tx_world is not None:
+                                        if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px):
+                                            current_path = [(robot_x, robot_y), (tx_world, ty_world)]
+                                        else:
+                                            new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px)
+                                            if new_path: current_path = new_path
+                                # ------------------------------------------------
+
+                            # If we have an A* path (Task 2 only), follow it with Pure Pursuit
                             if current_path:
                                 base_pwm = getattr(cfg, 'BASE_PWM', 1500)
                                 if mevcut_gorev.startswith("T3_"): base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
@@ -599,13 +521,16 @@ def nav_worker(shared_state, command_queue, hf_data):
 
                                 controller.set_servo(cfg.SOL_MOTOR, pp_sol)
                                 controller.set_servo(cfg.SAG_MOTOR, pp_sag)
+
+                            # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                             else:
                                 if target_lat is not None and target_lon is not None:
                                     if path_lost_time is None:
                                         path_lost_time = time.time()
 
-                                    if time.time() - path_lost_time < 5.0:
-                                        # Direct Drive Grace Period
+                                    # Allow unlimited grace period if we are intentionally skipping A* (Task 1 & 3)
+                                    # Or allow 5s grace period if A* failed in Task 2
+                                    if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
                                         failsafe_active = True
 
                                         # --- FIX: Reintroduce spot turn if heading is severely off ---
@@ -621,7 +546,11 @@ def nav_worker(shared_state, command_queue, hf_data):
                                                 controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra)
                                                 controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
                                         else:
-                                            base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'CRUISE_PWM', 80)
+                                            base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                                            if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
+                                                base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+                                            else:
+                                                base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                             # Full PID controller for direct steering
                                             kp = 1.5
@@ -630,11 +559,20 @@ def nav_worker(shared_state, command_queue, hf_data):
 
                                             # Calculate terms
                                             error = aci_farki
-                                            direct_drive_integral += error
 
-                                            # Integral windup limit
+                                            # --- 3-B UPDATE: Anti-Windup Logic ---
+                                            # Only accumulate integral if the error is relatively small
+                                            # This prevents massive windup when pushing against an obstacle or turning sharply
+                                            if abs(error) < 15.0:
+                                                direct_drive_integral += error
+                                            else:
+                                                # Optional: Reset or decay the integral when outside the linear region
+                                                direct_drive_integral *= 0.9
+
+                                            # Integral windup hard limit
                                             windup_limit = 500.0
                                             direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
+                                            # -------------------------------------
 
                                             derivative = error - direct_drive_prev_error
                                             direct_drive_prev_error = error
@@ -651,7 +589,7 @@ def nav_worker(shared_state, command_queue, hf_data):
                                             controller.set_servo(cfg.SOL_MOTOR, int(pp_sol))
                                             controller.set_servo(cfg.SAG_MOTOR, int(pp_sag))
                                     else:
-                                        # Stop if grace period exceeded and still no path
+                                        # Stop if grace period exceeded and still no path (Task 2 only)
                                         controller.set_servo(cfg.SOL_MOTOR, 1500)
                                         controller.set_servo(cfg.SAG_MOTOR, 1500)
                                 else:
