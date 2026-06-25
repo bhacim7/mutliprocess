@@ -135,17 +135,25 @@ def main():
 
     # 3. QUEUES FOR IPC
     command_queue = mp.Queue()
+    # --- 4-A UPDATE: Queue for heavy Lidar points ---
+    lidar_queue = mp.Queue(maxsize=10) # Small maxsize to prevent memory bloat if nav lags
 
     # 4. DEFINE PROCESSES
     processes = []
 
     # Process initialization
-    p_nav = mp.Process(target=nav_worker, args=(shared_state, command_queue, hf_data), name="NavProcess")
+    p_nav = mp.Process(target=nav_worker, args=(shared_state, command_queue, hf_data, lidar_queue), name="NavProcess")
     p_telem = mp.Process(target=telem_worker, args=(shared_state, command_queue, hf_data), name="TelemProcess")
     p_cam = mp.Process(target=camera_worker, args=(shared_state, hf_data), name="CameraProcess")
-    p_lidar = mp.Process(target=lidar_worker, args=(shared_state,), name="LidarProcess")
 
-    processes.extend([p_nav, p_telem, p_cam, p_lidar])
+    processes.extend([p_nav, p_telem, p_cam])
+
+    # Conditional Lidar Process
+    if getattr(cfg, 'ENABLE_LIDAR', True):
+        p_lidar = mp.Process(target=lidar_worker, args=(shared_state, lidar_queue), name="LidarProcess")
+        processes.append(p_lidar)
+    else:
+        print("[ORCHESTRATOR] ENABLE_LIDAR is False. Lidar process will not be started.")
 
     # 5. START PROCESSES
     print("[ORCHESTRATOR] Launching processes...")

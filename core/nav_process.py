@@ -10,7 +10,9 @@ import utils.navigasyon as nav
 import utils.planner as planner
 from utils.navigasyon import calculate_obj_gps
 
-def nav_worker(shared_state, command_queue, hf_data):
+import queue
+
+def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     """
     Independent process handling the autonomous state machine,
     A* path planning, local costmap generation, and PID motor control.
@@ -36,10 +38,6 @@ def nav_worker(shared_state, command_queue, hf_data):
     costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
     costmap_center_m = (0, 0)
     costmap_ready = True
-
-    # Temporal Point Cloud Buffer for Map Decay
-    temporal_lidar_buffer = []  # List of dicts: {'time': t, 'points': lidar_points}
-    last_lidar_points_ts = 0.0
 
     def world_to_pixel(world_x, world_y):
         cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
@@ -178,68 +176,36 @@ def nav_worker(shared_state, command_queue, hf_data):
             left_d = shared_state.get('lidar_left_dist', float('inf'))
             center_d = shared_state.get('lidar_center_dist', float('inf'))
             right_d = shared_state.get('lidar_right_dist', float('inf'))
-            lidar_data = shared_state.get('lidar_points', (0.0, []))
 
-            # Unpack the tuple (timestamp, points)
-            if isinstance(lidar_data, tuple) and len(lidar_data) == 2:
-                lidar_ts, lidar_points = lidar_data
+            # --- 4-A UPDATE: Pull from Queue instead of shared_state ---
+            lidar_data = None
+            try:
+                # Empty the queue, only keeping the absolute newest frame
+                while True:
+                    lidar_data = lidar_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            if lidar_data and isinstance(lidar_data, tuple) and len(lidar_data) == 2:
+                lidar_ts, costmap_payload = lidar_data
+                # Ensure the payload is a numpy array (it should be)
+                if isinstance(costmap_payload, np.ndarray):
+                    costmap_img = costmap_payload
             else:
-                lidar_ts, lidar_points = 0.0, lidar_data # Fallback
+                lidar_ts = 0.0 # Fallback
+            # -----------------------------------------------------------
 
             vision_objects = shared_state.get('vision_detected_objects', [])
 
             # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
-            if costmap_ready:
-                # 1. Update temporal buffer ONLY with fresh points to prevent N^2 bloat
-                current_time = time.time()
-                if lidar_points and lidar_ts > last_lidar_points_ts:
-                    temporal_lidar_buffer.append({'time': current_time, 'points': lidar_points, 'rx': robot_x, 'ry': robot_y, 'ryaw': robot_yaw})
-                    last_lidar_points_ts = lidar_ts
+            # Most logic has been moved to lidar_process (4-B Update)
 
-                # 2. Prune old points from buffer (keep only the last 3 seconds of data to prevent lag)
-                retention_time = 3.0
-                temporal_lidar_buffer = [b for b in temporal_lidar_buffer if (current_time - b['time']) <= retention_time]
-
-                # 3. Clear the costmap to base value
+            # If lidar is completely disabled or dead, we still need a blank map to draw vision objects on
+            if not getattr(cfg, 'ENABLE_LIDAR', True):
                 costmap_img.fill(127)
 
-                # 4. Accumulate probabilities correctly
-                # We use 32-bit floats to accumulate weights without clipping at 255/0 midway
-                accumulation_map = np.zeros(COSTMAP_SIZE_PX, dtype=np.float32)
-
-                free_gain = float(getattr(cfg, 'LIDAR_FREE_GAIN', 25))
-                occ_gain = float(getattr(cfg, 'LIDAR_OCCUPIED_GAIN', 80))
-
-                for buf_entry in temporal_lidar_buffer:
-                    rx, ry, ryaw = buf_entry['rx'], buf_entry['ry'], buf_entry['ryaw']
-                    p_robot = world_to_pixel(rx, ry)
-                    if not p_robot: continue
-
-                    # Create temporary masks for this specific scan
-                    temp_empty = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
-                    temp_occ = np.zeros(COSTMAP_SIZE_PX, dtype=np.uint8)
-
-                    for quality, angle_deg, dist_mm in buf_entry['points']:
-                        dist_m = dist_mm / 1000.0
-                        angle_rad = math.radians(angle_deg)
-                        global_angle = ryaw - angle_rad
-                        obs_x = rx + (dist_m * math.cos(global_angle))
-                        obs_y = ry + (dist_m * math.sin(global_angle))
-                        p_obs = world_to_pixel(obs_x, obs_y)
-
-                        if p_obs:
-                            cv2.line(temp_empty, p_robot, p_obs, 1, 1)
-                            cv2.circle(temp_occ, p_obs, 2, 1, -1)
-
-                    # Accumulate: Free space adds positive probability, occupied subtracts
-                    accumulation_map += (temp_empty.astype(np.float32) * free_gain)
-                    accumulation_map -= (temp_occ.astype(np.float32) * occ_gain)
-
-                # 5. Apply the accumulated probabilties to the base map and clip
-                final_map = 127.0 + accumulation_map
-                costmap_img = np.clip(final_map, 0, 255).astype(np.uint8)
-
             if vision_objects and costmap_ready:
+                # If we are using vision-only or fused, draw vision objects on whatever map we have
                 for obj in vision_objects:
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
@@ -572,17 +538,38 @@ def nav_worker(shared_state, command_queue, hf_data):
                             else: controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra); controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
                         else:
                             # Run Planner
-                            nav_map, _ = planner.get_inflated_nav_map(costmap_img, ignore_green=(mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
+                            # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
+                            crop_radius_m = 10.0 # Only look at a 20m x 20m window around the boat
+                            crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
+
+                            cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
+                            rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
+                            ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+
+                            x_min = max(0, rx_px - crop_radius_px)
+                            x_max = min(COSTMAP_SIZE_PX[0], rx_px + crop_radius_px)
+                            y_min = max(0, ry_px - crop_radius_px)
+                            y_max = min(COSTMAP_SIZE_PX[1], ry_px + crop_radius_px)
+
+                            cropped_costmap = costmap_img[y_min:y_max, x_min:x_max]
+                            cropped_center_m = (
+                                costmap_center_m[0] + ((x_min + x_max)/2 - cw) * COSTMAP_RES_M_PER_PX,
+                                costmap_center_m[1] - ((y_min + y_max)/2 - ch) * COSTMAP_RES_M_PER_PX
+                            )
+                            cropped_size_px = (x_max - x_min, y_max - y_min)
+
+                            nav_map, _ = planner.get_inflated_nav_map(cropped_costmap, ignore_green=(mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
 
                             plan_timer += 1
                             if plan_timer > 4:
                                 plan_timer = 0
                                 if tx_world is not None:
-                                    if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map, costmap_center_m, COSTMAP_RES_M_PER_PX, COSTMAP_SIZE_PX):
+                                    if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px):
                                         current_path = [(robot_x, robot_y), (tx_world, ty_world)]
                                     else:
-                                        new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world), nav_map, costmap_center_m, COSTMAP_RES_M_PER_PX, COSTMAP_SIZE_PX)
+                                        new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px)
                                         if new_path: current_path = new_path
+                            # ------------------------------------------------
 
                             if current_path:
                                 base_pwm = getattr(cfg, 'BASE_PWM', 1500)
@@ -630,11 +617,20 @@ def nav_worker(shared_state, command_queue, hf_data):
 
                                             # Calculate terms
                                             error = aci_farki
-                                            direct_drive_integral += error
 
-                                            # Integral windup limit
+                                            # --- 3-B UPDATE: Anti-Windup Logic ---
+                                            # Only accumulate integral if the error is relatively small
+                                            # This prevents massive windup when pushing against an obstacle or turning sharply
+                                            if abs(error) < 15.0:
+                                                direct_drive_integral += error
+                                            else:
+                                                # Optional: Reset or decay the integral when outside the linear region
+                                                direct_drive_integral *= 0.9
+
+                                            # Integral windup hard limit
                                             windup_limit = 500.0
                                             direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
+                                            # -------------------------------------
 
                                             derivative = error - direct_drive_prev_error
                                             direct_drive_prev_error = error

@@ -149,11 +149,16 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
     else:
         norm_line_x, norm_line_y = 0, 0
 
-    # 8-way movement
+    # 8-way movement (dx, dy)
     neighbors = [(0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
 
+    # Direction tracking for kinematic penalty (heading change)
+    # Store (f_score, (px, py), (dx_from_parent, dy_from_parent))
+    open_set = []
+    heapq.heappush(open_set, (0, start, (0, 0)))
+
     while open_set:
-        current = heapq.heappop(open_set)[1]
+        _, current, prev_dir = heapq.heappop(open_set)
 
         if current == goal:
             path = []
@@ -182,13 +187,33 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
                     cross_product = abs(vec_nx * norm_line_y - vec_ny * norm_line_x)
                     step_cost += (cross_product * bias_to_goal_line)
 
+                # --- 1-A UPDATE: Kinematic Constraint Penalty ---
+                kinematic_penalty = 0.0
+                if prev_dir != (0, 0):
+                    # Calculate angle difference between previous direction and current direction
+                    dot_product = prev_dir[0]*dx + prev_dir[1]*dy
+                    mag_prev = math.sqrt(prev_dir[0]**2 + prev_dir[1]**2)
+                    mag_curr = math.sqrt(dx**2 + dy**2)
+                    if mag_prev > 0 and mag_curr > 0:
+                        cos_angle = np.clip(dot_product / (mag_prev * mag_curr), -1.0, 1.0)
+                        angle_diff = math.degrees(math.acos(cos_angle))
+
+                        # Penalize sharp turns (e.g., > 45 degrees)
+                        if angle_diff > 45.0:
+                            kinematic_penalty += (angle_diff * 0.1)  # Tunable weight
+                        if angle_diff >= 90.0:
+                            kinematic_penalty += 5.0 # Heavy penalty for reversals/right angles
+
+                step_cost += kinematic_penalty
+                # ------------------------------------------------
+
                 tentative_g_score = g_score[current] + step_cost
 
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
                     f_score[neighbor] = tentative_g_score + heuristic(neighbor, goal, heuristic_weight)
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor, (dx, dy)))
 
     return None # No path found
 
