@@ -114,14 +114,12 @@ def main():
         print("  1: Task 1 (Gate)")
         print("  2: Task 2 (Debris)")
         print("  3: Task 3 (Speed)")
-        print("  5: Task 5 (Docking)")
-        choice = input("Enter number (1, 2, 3, 5): ").strip()
+        choice = input("Enter number (1, 2, 3): ").strip()
 
         task_map = {
             "1": "TASK1_STATE_ENTER",
             "2": "TASK2_START",
-            "3": "T3_START",
-            "5": "TASK5_APPROACH"
+            "3": "T3_START"
         }
 
         selected_task = task_map.get(choice, "TASK1_STATE_ENTER") # Default fallback
