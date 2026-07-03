@@ -280,7 +280,7 @@ def camera_worker(shared_state, hf_data):
     magnetic_filter = KalmanFilter(process_variance=1e-3, measurement_variance=1e-1)
 
     print("[CAM_PROCESS] Camera initialized and ready.")
-    last_print_time = time.time()
+    last_printed_task = None
 
     # Video Writer logic from legacy
     writer = None
@@ -352,12 +352,10 @@ def camera_worker(shared_state, hf_data):
                 shared_state['vision_frame_ready'] = True
 
                 # --- THROTTLED TERMINAL HEARTBEAT (FPS & STATUS) ---
-                current_time = time.time()
-                if (current_time - last_print_time) >= 1.0:
-                    anlik_fps = round(zed.get_current_fps())
-                    mevcut_gorev = shared_state.get('current_task', 'UNKNOWN')
-                    print(f"[CAM_PROCESS] Status: {mevcut_gorev} | System FPS: {anlik_fps}")
-                    last_print_time = current_time
+                mevcut_gorev = shared_state.get('current_task', 'UNKNOWN')
+                if mevcut_gorev != last_printed_task:
+                    print(f"[CAM_PROCESS] Task State Changed to: {mevcut_gorev}")
+                    last_printed_task = mevcut_gorev
 
                 # 3. YOLO INFERENCE
                 conf_val = getattr(cfg, 'YOLO_CONFIDENCE', 0.50)
