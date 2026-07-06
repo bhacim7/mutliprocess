@@ -252,11 +252,11 @@ def find_lookahead_point(x, y, path, lookahead_dist):
 
 def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, prev_error=0):
     """
-    Executes the Pure Pursuit algorithm to generate Left/Right PWM outputs.
+    Executes the Pure Pursuit algorithm to generate Base Speed and Steering Correction (Yaw Effort).
     Dynamic lookahead based on speed.
     """
     if not path or len(path) < 2:
-        return base_speed, base_speed, None, 0.0, path
+        return base_speed, 0, None, 0.0, path
 
     # 1. Dynamic Lookahead Distance
     min_ld = getattr(cfg, 'PURE_PURSUIT_MIN_LOOKAHEAD', 1.0)
@@ -268,7 +268,7 @@ def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, p
     # 2. Find target point
     target_pt, t_idx = find_lookahead_point(rx, ry, path, lookahead_dist)
     if target_pt is None:
-        return base_speed, base_speed, None, 0.0, path
+        return base_speed, 0, None, 0.0, path
 
     # 3. Calculate steering error (Alpha)
     tx, ty = target_pt
@@ -288,11 +288,7 @@ def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, p
     D = (heading_err - prev_error) * kd
     correction = P + D
 
-    # 5. Calculate Motor PWM
-    sol = int(np.clip(base_speed + correction, 1100, 1900))
-    sag = int(np.clip(base_speed - correction, 1100, 1900))
-
     # Prune path: remove points we have already passed
     pruned_path = path[t_idx:] if t_idx < len(path) else path[-1:]
 
-    return sol, sag, target_pt, heading_err, pruned_path
+    return base_speed, correction, target_pt, heading_err, pruned_path

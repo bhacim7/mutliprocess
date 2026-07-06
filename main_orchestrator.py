@@ -100,6 +100,9 @@ def main():
         # Motor State (For telemetry & debugging)
         'motor_pwm_left': 1500,
         'motor_pwm_right': 1500,
+        'motor_pwm_front_left': 1500,
+        'motor_pwm_front_right': 1500,
+        'motor_pwm_steer': 1500,
 
         # Acoustic / Interrupt State
         'interrupt_request': None,

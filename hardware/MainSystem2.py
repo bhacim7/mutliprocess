@@ -10,7 +10,8 @@ class USVController:
     def __init__(self, port="/dev/ttyACM0", baud=57600):
         self.port = port
         self.baud = baud
-        self.pwms = {1: 1500, 3: 1500} # left=1, right=3
+        # Rear Left=1, Front Left=2, Rear Right=3, Front Right=4, Steer=5
+        self.pwms = {1: 1500, 2: 1500, 3: 1500, 4: 1500, 5: 1500}
         
         print(f"[USVController] Initializing on {port} at {baud} baud. Waiting for connection...")
         try:
@@ -133,6 +134,9 @@ class USVController:
     def disarm_vehicle(self):
         """Disarms the thrusters for safety."""
         print("[USVController] Vehicle disarming...")
+        for channel in [1, 2, 3, 4, 5]:
+            self.set_servo(channel, 1500)
+
         if self.master:
             self.master.mav.command_long_send(
                 self.master.target_system,
