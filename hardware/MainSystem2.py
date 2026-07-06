@@ -10,7 +10,8 @@ class USVController:
     def __init__(self, port="/dev/ttyACM0", baud=57600):
         self.port = port
         self.baud = baud
-        self.pwms = {1: 1500, 3: 1500} # left=1, right=3
+        # Default all 5 channels to neutral (1500)
+        self.pwms = {1: 1500, 3: 1500, 4: 1500, 5: 1500, 6: 1500}
         
         print(f"[USVController] Initializing on {port} at {baud} baud. Waiting for connection...")
         try:
@@ -95,7 +96,7 @@ class USVController:
 
     def set_servo(self, channel, pwm):
         """Commands the hardware to set a specific PWM on a servo channel."""
-        self.pwms[channel] = pwm
+        self.pwms[channel] = int(pwm)
         if self.master:
             self.master.mav.command_long_send(
                 self.master.target_system,
@@ -103,9 +104,14 @@ class USVController:
                 mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
                 0,
                 channel,
-                pwm,
+                int(pwm),
                 0, 0, 0, 0, 0
             )
+
+    def reset_all_servos(self):
+        """Resets all known motor/steering channels to 1500."""
+        for channel in self.pwms.keys():
+            self.set_servo(channel, 1500)
 
     def set_mode(self, mode_name):
         """Changes the vehicle flight mode."""

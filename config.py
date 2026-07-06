@@ -15,11 +15,18 @@ INFLATION_MARGIN_M = 0.60 # Legacy value
 MAX_TILT_ANGLE = 5.0
 
 # --- PINS / CHANNELS ---
-SOL_MOTOR = 1
-SAG_MOTOR = 3
+SOL_MOTOR = 1 # Rear Left
+SAG_MOTOR = 3 # Rear Right
+FRONT_SOL_MOTOR = 5 # Front Left
+FRONT_SAG_MOTOR = 6 # Front Right
+STEER_SERVO = 4 # Front Steering Mechanism
+
 BASE_PWM = 1500
 CRUISE_PWM = 80
 T3_SPEED_PWM = 100
+
+STEER_MAX_PWM = 1900
+STEER_MIN_PWM = 1100
 
 # --- SENSORS ---
 SERIAL_PORT = "/dev/ttyACM0"

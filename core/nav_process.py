@@ -12,6 +12,51 @@ from utils.navigasyon import calculate_obj_gps
 
 import queue
 
+def apply_motor_mixer(controller, forward_pwm, yaw_correction):
+    """
+    Control Mixer for 4-Thruster Vectored-Bow architecture.
+    Takes abstract forward speed and yaw steering commands and
+    distributes them to 5 hardware channels optimally.
+    """
+    base = getattr(cfg, 'BASE_PWM', 1500)
+    steer_max = getattr(cfg, 'STEER_MAX_PWM', 1900)
+    steer_min = getattr(cfg, 'STEER_MIN_PWM', 1100)
+
+    # Calculate desired front steering angle
+    steer_pwm = int(np.clip(base - yaw_correction, steer_min, steer_max))
+
+    # Check Deadband: If steering correction is small (< 15 degrees equivalent),
+    # only use the front steering servo. No differential thrust.
+    # We estimate '15 degrees equivalent' by the size of yaw_correction
+    if abs(yaw_correction) < 50: # Tune this threshold
+        rear_left = forward_pwm
+        rear_right = forward_pwm
+        front_left = forward_pwm
+        front_right = forward_pwm
+    else:
+        # Blend in differential thrust
+        # Subtract some steering correction to use as differential offset
+        diff_offset = yaw_correction * 0.5
+
+        rear_left = int(forward_pwm + diff_offset)
+        rear_right = int(forward_pwm - diff_offset)
+
+        # Front thrusters can stay relatively equal as they are already vectored
+        front_left = int(forward_pwm + (diff_offset * 0.2))
+        front_right = int(forward_pwm - (diff_offset * 0.2))
+
+    # Clip all thrusts to safe limits
+    rear_left = np.clip(rear_left, 1100, 1900)
+    rear_right = np.clip(rear_right, 1100, 1900)
+    front_left = np.clip(front_left, 1100, 1900)
+    front_right = np.clip(front_right, 1100, 1900)
+
+    controller.set_servo(cfg.STEER_SERVO, steer_pwm)
+    controller.set_servo(cfg.SOL_MOTOR, rear_left)
+    controller.set_servo(cfg.SAG_MOTOR, rear_right)
+    controller.set_servo(cfg.FRONT_SOL_MOTOR, front_left)
+    controller.set_servo(cfg.FRONT_SAG_MOTOR, front_right)
+
 def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     """
     Independent process handling the autonomous state machine,
@@ -374,31 +419,23 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
             # --- G. CONTROL LOGIC & MOTORS ---
             if manual_mode or not mission_started:
-                controller.set_servo(cfg.SOL_MOTOR, 1500)
-                controller.set_servo(cfg.SAG_MOTOR, 1500)
+                controller.reset_all_servos()
             else:
                 # 1. Reactive Avoidance
-                if center_danger and mevcut_gorev not in ["TASK5_ENTER", "TASK5_DOCK", "TASK5_EXIT"]:
+                if center_danger:
                     if not acil_durum_aktif_mi:
-                        shock_brake_pwm = cfg.BASE_PWM - getattr(cfg, 'shock_pwm', 250)
-                        controller.set_servo(cfg.SOL_MOTOR, shock_brake_pwm)
-                        controller.set_servo(cfg.SAG_MOTOR, shock_brake_pwm)
-                        time.sleep(0.1)
+                        # Vector-Assisted Shock Brake
+                        # Steer hard away from obstacle, full reverse
+                        steer_dir = 1900 if left_d > right_d else 1100
+                        brake_pwm = cfg.BASE_PWM - getattr(cfg, 'ESCAPE_PWM', 300)
+
+                        controller.set_servo(cfg.STEER_SERVO, steer_dir)
+                        controller.set_servo(cfg.SOL_MOTOR, brake_pwm)
+                        controller.set_servo(cfg.SAG_MOTOR, brake_pwm)
+                        controller.set_servo(cfg.FRONT_SOL_MOTOR, brake_pwm)
+                        controller.set_servo(cfg.FRONT_SAG_MOTOR, brake_pwm)
+                        time.sleep(0.4)
                         acil_durum_aktif_mi = True
-
-                    escape_pwm = cfg.BASE_PWM - getattr(cfg, 'ESCAPE_PWM', 300)
-                    controller.set_servo(cfg.SOL_MOTOR, escape_pwm)
-                    controller.set_servo(cfg.SAG_MOTOR, escape_pwm)
-                    time.sleep(0.4)
-
-                    spot_turn_val = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                    if left_d > right_d:
-                        controller.set_servo(cfg.SOL_MOTOR, cfg.BASE_PWM - spot_turn_val)
-                        controller.set_servo(cfg.SAG_MOTOR, cfg.BASE_PWM + spot_turn_val)
-                    else:
-                        controller.set_servo(cfg.SOL_MOTOR, cfg.BASE_PWM + spot_turn_val)
-                        controller.set_servo(cfg.SAG_MOTOR, cfg.BASE_PWM - spot_turn_val)
-                    time.sleep(0.3)
                     current_path = None # Force replan
                     continue
                 else:
@@ -463,9 +500,23 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         should_force_alignment = force_initial_alignment
 
                         if should_force_alignment:
+                            # Unified Spot Turn Logic
                             spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                            if aci_farki > 0: controller.set_servo(cfg.SOL_MOTOR, 1500 + spot_pwm); controller.set_servo(cfg.SAG_MOTOR, 1500 - spot_pwm - extra)
-                            else: controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra); controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
+                            fwd = 1500 + spot_pwm
+                            rev = 1500 - spot_pwm
+
+                            if aci_farki > 0: # Turn Right
+                                controller.set_servo(cfg.STEER_SERVO, 1900)
+                                controller.set_servo(cfg.SOL_MOTOR, fwd)
+                                controller.set_servo(cfg.SAG_MOTOR, rev)
+                                controller.set_servo(cfg.FRONT_SOL_MOTOR, fwd)
+                                controller.set_servo(cfg.FRONT_SAG_MOTOR, rev)
+                            else: # Turn Left
+                                controller.set_servo(cfg.STEER_SERVO, 1100)
+                                controller.set_servo(cfg.SOL_MOTOR, rev)
+                                controller.set_servo(cfg.SAG_MOTOR, fwd)
+                                controller.set_servo(cfg.FRONT_SOL_MOTOR, rev)
+                                controller.set_servo(cfg.FRONT_SAG_MOTOR, fwd)
                         else:
                             current_path = None
 
@@ -510,17 +561,15 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 base_pwm = getattr(cfg, 'BASE_PWM', 1500)
                                 if mevcut_gorev.startswith("T3_"): base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
 
-                                pp_sol, pp_sag, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
+                                fwd_pwm, yaw_corr, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
                                     robot_x, robot_y, robot_yaw, current_path, current_speed=0, base_speed=base_pwm, prev_error=prev_heading_error)
 
                                 current_path = pruned_path
                                 prev_heading_error = current_error
-
                                 failsafe_active = False
                                 path_lost_time = None
 
-                                controller.set_servo(cfg.SOL_MOTOR, pp_sol)
-                                controller.set_servo(cfg.SAG_MOTOR, pp_sag)
+                                apply_motor_mixer(controller, fwd_pwm, yaw_corr)
 
                             # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                             else:
@@ -529,22 +578,29 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                         path_lost_time = time.time()
 
                                     # Allow unlimited grace period if we are intentionally skipping A* (Task 1 & 3)
-                                    # Or allow 5s grace period if A* failed in Task 2
                                     if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
                                         failsafe_active = True
 
-                                        # --- FIX: Reintroduce spot turn if heading is severely off ---
                                         threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
 
                                         if abs(aci_farki) > threshold:
+                                            # Spot Turn Recovery
                                             spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                                            extra = 50
-                                            if aci_farki > 0:  # Target Right
-                                                controller.set_servo(cfg.SOL_MOTOR, 1500 + spot_pwm)
-                                                controller.set_servo(cfg.SAG_MOTOR, 1500 - spot_pwm - extra)
-                                            else:  # Target Left
-                                                controller.set_servo(cfg.SOL_MOTOR, 1500 - spot_pwm - extra)
-                                                controller.set_servo(cfg.SAG_MOTOR, 1500 + spot_pwm)
+                                            fwd = 1500 + spot_pwm
+                                            rev = 1500 - spot_pwm
+
+                                            if aci_farki > 0: # Turn Right
+                                                controller.set_servo(cfg.STEER_SERVO, 1900)
+                                                controller.set_servo(cfg.SOL_MOTOR, fwd)
+                                                controller.set_servo(cfg.SAG_MOTOR, rev)
+                                                controller.set_servo(cfg.FRONT_SOL_MOTOR, fwd)
+                                                controller.set_servo(cfg.FRONT_SAG_MOTOR, rev)
+                                            else: # Turn Left
+                                                controller.set_servo(cfg.STEER_SERVO, 1100)
+                                                controller.set_servo(cfg.SOL_MOTOR, rev)
+                                                controller.set_servo(cfg.SAG_MOTOR, fwd)
+                                                controller.set_servo(cfg.FRONT_SOL_MOTOR, rev)
+                                                controller.set_servo(cfg.FRONT_SAG_MOTOR, fwd)
                                         else:
                                             base_pwm = getattr(cfg, 'BASE_PWM', 1500)
                                             if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
@@ -557,48 +613,29 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                             ki = 0.05
                                             kd = 0.5
 
-                                            # Calculate terms
                                             error = aci_farki
 
-                                            # --- 3-B UPDATE: Anti-Windup Logic ---
-                                            # Only accumulate integral if the error is relatively small
-                                            # This prevents massive windup when pushing against an obstacle or turning sharply
                                             if abs(error) < 15.0:
                                                 direct_drive_integral += error
                                             else:
-                                                # Optional: Reset or decay the integral when outside the linear region
                                                 direct_drive_integral *= 0.9
 
-                                            # Integral windup hard limit
                                             windup_limit = 500.0
                                             direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
-                                            # -------------------------------------
 
                                             derivative = error - direct_drive_prev_error
                                             direct_drive_prev_error = error
 
-                                            steering_correction = (error * kp) + (direct_drive_integral * ki) + (derivative * kd)
+                                            yaw_corr = (error * kp) + (direct_drive_integral * ki) + (derivative * kd)
 
-                                            pp_sol = base_pwm + steering_correction
-                                            pp_sag = base_pwm - steering_correction
-
-                                            # Clamp values
-                                            pp_sol = max(1100, min(1900, pp_sol))
-                                            pp_sag = max(1100, min(1900, pp_sag))
-
-                                            controller.set_servo(cfg.SOL_MOTOR, int(pp_sol))
-                                            controller.set_servo(cfg.SAG_MOTOR, int(pp_sag))
+                                            apply_motor_mixer(controller, base_pwm, yaw_corr)
                                     else:
                                         # Stop if grace period exceeded and still no path (Task 2 only)
-                                        controller.set_servo(cfg.SOL_MOTOR, 1500)
-                                        controller.set_servo(cfg.SAG_MOTOR, 1500)
+                                        controller.reset_all_servos()
                                 else:
-                                    controller.set_servo(cfg.SOL_MOTOR, 1500)
-                                    controller.set_servo(cfg.SAG_MOTOR, 1500)
+                                    controller.reset_all_servos()
 
             # Record final PWMs
-            # Note: We rely on the USVController object stub tracking state,
-            # but we can push directly to shared_state for safety
             shared_state['motor_pwm_left'] = controller.get_servo_pwm(cfg.SOL_MOTOR)
             shared_state['motor_pwm_right'] = controller.get_servo_pwm(cfg.SAG_MOTOR)
 
@@ -610,7 +647,6 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     finally:
         print("[NAV_PROCESS] Shutting down...")
         try:
-            controller.set_servo(cfg.SOL_MOTOR, 1500)
-            controller.set_servo(cfg.SAG_MOTOR, 1500)
+            controller.reset_all_servos()
             controller.disarm_vehicle()
         except: pass

@@ -250,25 +250,68 @@ def find_lookahead_point(x, y, path, lookahead_dist):
 
     return path[target_idx], target_idx
 
+def calculate_path_curvature(path, lookahead_idx, max_points=3):
+    """
+    Estimates the curvature of the upcoming path segment.
+    Returns a ratio from 0.0 (straight) to 1.0 (sharp turn).
+    """
+    if not path or len(path) - lookahead_idx < 3:
+        return 0.0
+
+    pts = path[lookahead_idx : lookahead_idx + max_points]
+    if len(pts) < 3:
+        return 0.0
+
+    # Simple angle check between first, middle, and last point in the segment
+    p1, p2, p3 = pts[0], pts[len(pts)//2], pts[-1]
+
+    v1 = (p2[0] - p1[0], p2[1] - p1[1])
+    v2 = (p3[0] - p2[0], p3[1] - p2[1])
+
+    mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+    mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+
+    if mag1 == 0 or mag2 == 0:
+        return 0.0
+
+    dot = v1[0]*v2[0] + v1[1]*v2[1]
+    cos_angle = np.clip(dot / (mag1 * mag2), -1.0, 1.0)
+    angle_diff = math.degrees(math.acos(cos_angle))
+
+    # Normalize curvature penalty (e.g., 0-90 degrees maps to 0.0-1.0)
+    curvature_ratio = np.clip(angle_diff / 90.0, 0.0, 1.0)
+    return curvature_ratio
+
 def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, prev_error=0):
     """
-    Executes the Pure Pursuit algorithm to generate Left/Right PWM outputs.
-    Dynamic lookahead based on speed.
+    Executes the Pure Pursuit algorithm.
+    Returns: (base_speed, steering_correction, target_pt, heading_err, pruned_path)
+    to be consumed by the central motor mixer.
     """
     if not path or len(path) < 2:
-        return base_speed, base_speed, None, 0.0, path
+        return base_speed, 0.0, None, 0.0, path
 
-    # 1. Dynamic Lookahead Distance
+    # 1. Dynamic Lookahead Distance (Speed Base)
     min_ld = getattr(cfg, 'PURE_PURSUIT_MIN_LOOKAHEAD', 1.0)
     max_ld = getattr(cfg, 'PURE_PURSUIT_MAX_LOOKAHEAD', 3.0)
     k_ld = getattr(cfg, 'PURE_PURSUIT_K_SPEED', 0.5) # Lookahead multiplier
 
-    lookahead_dist = np.clip(current_speed * k_ld, min_ld, max_ld)
+    base_lookahead = np.clip(current_speed * k_ld, min_ld, max_ld)
 
-    # 2. Find target point
+    # 2. Find initial target point to check curvature
+    temp_pt, temp_idx = find_lookahead_point(rx, ry, path, base_lookahead)
+
+    # --- Adaptive Lookahead based on curvature ---
+    curvature = calculate_path_curvature(path, temp_idx)
+
+    # Reduce lookahead distance sharply if curvature is high (tight corners)
+    adaptive_lookahead = base_lookahead - (curvature * (base_lookahead - min_ld))
+    lookahead_dist = np.clip(adaptive_lookahead, min_ld, max_ld)
+
+    # Find final target point with adapted lookahead
     target_pt, t_idx = find_lookahead_point(rx, ry, path, lookahead_dist)
     if target_pt is None:
-        return base_speed, base_speed, None, 0.0, path
+        return base_speed, 0.0, None, 0.0, path
 
     # 3. Calculate steering error (Alpha)
     tx, ty = target_pt
@@ -277,7 +320,7 @@ def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, p
     # Normalize alpha to [-pi, pi]
     alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
 
-    # Convert to Degrees for PID (invert to match legacy logic: Pos Err -> Turn Right)
+    # Convert to Degrees for PID (invert: Pos Err -> Turn Right)
     heading_err = -math.degrees(alpha)
 
     # 4. PID calculation
@@ -286,13 +329,9 @@ def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, p
 
     P = heading_err * kp
     D = (heading_err - prev_error) * kd
-    correction = P + D
-
-    # 5. Calculate Motor PWM
-    sol = int(np.clip(base_speed + correction, 1100, 1900))
-    sag = int(np.clip(base_speed - correction, 1100, 1900))
+    steering_correction = P + D
 
     # Prune path: remove points we have already passed
     pruned_path = path[t_idx:] if t_idx < len(path) else path[-1:]
 
-    return sol, sag, target_pt, heading_err, pruned_path
+    return base_speed, steering_correction, target_pt, heading_err, pruned_path
