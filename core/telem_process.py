@@ -37,6 +37,9 @@ def telem_worker(shared_state, command_queue, hf_data):
             mevcut_gorev = shared_state.get('current_task', 'TASK_UNKNOWN')
             pwm_l = shared_state.get('motor_pwm_left', 1500)
             pwm_r = shared_state.get('motor_pwm_right', 1500)
+            pwm_fl = shared_state.get('motor_pwm_front_left', 1500)
+            pwm_fr = shared_state.get('motor_pwm_front_right', 1500)
+            pwm_steer = shared_state.get('motor_pwm_steer', 1500)
             objects = shared_state.get('vision_detected_objects', [])
             manual_mode = shared_state.get('manual_mode', False)
 
@@ -69,6 +72,9 @@ def telem_worker(shared_state, command_queue, hf_data):
                     "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
                     "pwm_L": pwm_l,
                     "pwm_R": pwm_r,
+                    "pwm_FL": pwm_fl,
+                    "pwm_FR": pwm_fr,
+                    "pwm_STEER": pwm_steer,
                     "spd": shared_state.get('horizontal_speed', 0.0),
                     "hdg": f"{heading:.0f}" if heading is not None else "0",
                     "trg_hdg": shared_state.get('adviced_course', 0.0),

@@ -457,6 +457,9 @@ def camera_worker(shared_state, hf_data):
                 task = shared_state.get('current_task', 'UNKNOWN')
                 pwm_l = shared_state.get('motor_pwm_left', 1500)
                 pwm_r = shared_state.get('motor_pwm_right', 1500)
+                pwm_fl = shared_state.get('motor_pwm_front_left', 1500)
+                pwm_fr = shared_state.get('motor_pwm_front_right', 1500)
+                pwm_steer = shared_state.get('motor_pwm_steer', 1500)
                 
                 # Navigasyon Verileri
                 dist = shared_state.get('target_dist', 0.0)
@@ -484,8 +487,9 @@ def camera_worker(shared_state, hf_data):
                 cv2.putText(frame, f"FPS: {fps_val}", (10, y), font, scale, c_yellow, thick); y += 30
                 cv2.putText(frame, f"Gorev: {task}", (10, y), font, scale, c_red, thick); y += 60
                 
-                cv2.putText(frame, f"sol:{int(pwm_l)}", (10, y), font, scale, c_red, thick); y += 30
-                cv2.putText(frame, f"sag:{int(pwm_r)}", (10, y), font, scale, c_red, thick); y += 40
+                cv2.putText(frame, f"RL:{int(pwm_l)} RR:{int(pwm_r)}", (10, y), font, scale, c_red, thick); y += 30
+                cv2.putText(frame, f"FL:{int(pwm_fl)} FR:{int(pwm_fr)}", (10, y), font, scale, c_red, thick); y += 30
+                cv2.putText(frame, f"STEER:{int(pwm_steer)}", (10, y), font, scale, c_red, thick); y += 40
                 
 
                 # 4. SAĞ SÜTUN ÇİZİMİ
