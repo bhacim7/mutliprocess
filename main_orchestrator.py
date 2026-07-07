@@ -102,13 +102,7 @@ def main():
         'motor_pwm_right': 1500,
         'motor_pwm_front_left': 1500,
         'motor_pwm_front_right': 1500,
-        'motor_pwm_steer': 1500,
-
-        # Acoustic / Interrupt State
-        'interrupt_request': None,
-        'detected_freq': 0
-
-        
+        'motor_pwm_steer': 1500
     })
 
     # --- 1.5. CONDITIONAL TERMINAL UI (TASK SELECTION) ---

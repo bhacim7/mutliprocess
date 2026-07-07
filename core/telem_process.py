@@ -56,15 +56,9 @@ def telem_worker(shared_state, command_queue, hf_data):
                     "GPS3": {"lat": float(getattr(cfg, "T1_GATE_EXIT_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_EXIT_LON", 0.0))},
                     "GPS4": {"lat": float(getattr(cfg, "T2_ZONE_ENTRY_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_ENTRY_LON", 0.0))},
                     "GPS5": {"lat": float(getattr(cfg, "T2_ZONE_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_MID_LON", 0.0))},
-                    "GPS6": {"lat": float(getattr(cfg, "T2_ZONE_MID1_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_MID1_LON", 0.0))},
-                    "GPS7": {"lat": float(getattr(cfg, "T2_ZONE_END_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_END_LON", 0.0))},
-                    "GPS8": {"lat": float(getattr(cfg, "T3_START_LAT", 0.0)), "lon": float(getattr(cfg, "T3_START_LON", 0.0))},
-                    "GPS9": {"lat": float(getattr(cfg, "T3_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T3_MID_LON", 0.0))},
-                    "GPS10": {"lat": float(getattr(cfg, "T3_RIGHT_LAT", 0.0)), "lon": float(getattr(cfg, "T3_RIGHT_LON", 0.0))},
-                    "GPS11": {"lat": float(getattr(cfg, "T3_END_LAT", 0.0)), "lon": float(getattr(cfg, "T3_END_LON", 0.0))},
-                    "GPS12": {"lat": float(getattr(cfg, "T3_END1_LAT", 0.0)), "lon": float(getattr(cfg, "T3_END1_LON", 0.0))},
-                    "GPS13": {"lat": float(getattr(cfg, "T3_LEFT_LAT", 0.0)), "lon": float(getattr(cfg, "T3_LEFT_LON", 0.0))},
-                    "GPS14": {"lat": float(getattr(cfg, "T5_DOCK_APPROACH_LAT", 0.0)), "lon": float(getattr(cfg, "T5_DOCK_APPROACH_LON", 0.0))},
+                    "GPS6": {"lat": float(getattr(cfg, "T2_ZONE_END_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_END_LON", 0.0))},
+                    "GPS7": {"lat": float(getattr(cfg, "T3_START_LAT", 0.0)), "lon": float(getattr(cfg, "T3_START_LON", 0.0))},
+                    "GPS8": {"lat": float(getattr(cfg, "T3_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T3_MID_LON", 0.0))},
                 }
 
                 payload = {
