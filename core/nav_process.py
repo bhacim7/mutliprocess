@@ -109,26 +109,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         return None
 
     # 3. State Machine Variables
-    task5_dock_timer = 0
-    task5_dock_side = "RIGHT"
-
     # PID Control Variables for Direct Drive
     direct_drive_integral = 0.0
     direct_drive_prev_error = 0.0
-
-    task2_green_verify_count = 0
-    task2_circle_center_lat = None
-    task2_circle_center_lon = None
-    task2_search_phase = 0
-    task2_circle_target_phase = 0
-    task2_stall_start_time = None
-    task2_stall_check_time = None
-    task2_last_dist_to_wp = 0.0
-    task2_search_accumulated_yaw = 0.0
-    task2_search_prev_yaw = None
-    task2_search_start_yaw = None
-
-    task3_gate_passed = False
 
     current_path = []
     plan_timer = 0
@@ -202,15 +185,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         elif idx == 3: cfg.T1_GATE_EXIT_LAT = lat; cfg.T1_GATE_EXIT_LON = lon
                         elif idx == 4: cfg.T2_ZONE_ENTRY_LAT = lat; cfg.T2_ZONE_ENTRY_LON = lon
                         elif idx == 5: cfg.T2_ZONE_MID_LAT = lat; cfg.T2_ZONE_MID_LON = lon
-                        elif idx == 6: cfg.T2_ZONE_MID1_LAT = lat; cfg.T2_ZONE_MID1_LON = lon
-                        elif idx == 7: cfg.T2_ZONE_END_LAT = lat; cfg.T2_ZONE_END_LON = lon
-                        elif idx == 8: cfg.T3_START_LAT = lat; cfg.T3_START_LON = lon
-                        elif idx == 9: cfg.T3_MID_LAT = lat; cfg.T3_MID_LON = lon
-                        elif idx == 10: cfg.T3_RIGHT_LAT = lat; cfg.T3_RIGHT_LON = lon
-                        elif idx == 11: cfg.T3_END_LAT = lat; cfg.T3_END_LON = lon
-                        elif idx == 12: cfg.T3_END1_LAT = lat; cfg.T3_END1_LON = lon
-                        elif idx == 13: cfg.T3_LEFT_LAT = lat; cfg.T3_LEFT_LON = lon
-                        elif idx == 14: cfg.T5_DOCK_APPROACH_LAT = lat; cfg.T5_DOCK_APPROACH_LON = lon
+                        elif idx == 6: cfg.T2_ZONE_END_LAT = lat; cfg.T2_ZONE_END_LON = lon
+                        elif idx == 7: cfg.T3_START_LAT = lat; cfg.T3_START_LON = lon
+                        elif idx == 8: cfg.T3_MID_LAT = lat; cfg.T3_MID_LON = lon
                         print(f"[NAV_PROCESS] Updated GPS Point {idx}")
                     elif cmd_str == "set_task":
                         new_task = cmd.get("task_name")
@@ -282,31 +259,27 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             # 3-A UPDATE: Refactored modular state machine
 
             # Helper to execute task routing logic
-            def execute_task1(task_state, lat, lon, returning):
-                if task_state == "TASK1_APPROACH": return "TASK1_STATE_ENTER", None, None, returning
+            def execute_task1(task_state, lat, lon):
+                if task_state == "TASK1_APPROACH": return "TASK1_STATE_ENTER", None, None
 
                 targets = {
                     "TASK1_STATE_ENTER": (getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0)),
                     "TASK1_STATE_MID": (getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)),
-                    "TASK1_STATE_EXIT": (getattr(cfg, 'T1_GATE_EXIT_LAT', 0), getattr(cfg, 'T1_GATE_EXIT_LON', 0)),
-                    "TASK1_RETURN_MID": (getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0)),
-                    "TASK1_RETURN_ENTER": (getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0))
+                    "TASK1_STATE_EXIT": (getattr(cfg, 'T1_GATE_EXIT_LAT', 0), getattr(cfg, 'T1_GATE_EXIT_LON', 0))
                 }
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
                 if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                     if task_state == "TASK1_STATE_ENTER": task_state = "TASK1_STATE_MID"
                     elif task_state == "TASK1_STATE_MID": task_state = "TASK1_STATE_EXIT"
-                    elif task_state == "TASK1_STATE_EXIT": task_state = "TASK1_RETURN_MID" if returning else "TASK2_START"
-                    elif task_state == "TASK1_RETURN_MID": task_state = "TASK1_RETURN_ENTER"
-                    elif task_state == "TASK1_RETURN_ENTER": task_state = "FINISHED"
-                return task_state, t_lat, t_lon, returning
+                    elif task_state == "TASK1_STATE_EXIT": task_state = "TASK2_START"
+                return task_state, t_lat, t_lon
 
             def execute_task2(task_state, lat, lon):
                 targets = {
                     "TASK2_START": (getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0), "TASK2_GO_TO_MID"),
                     "TASK2_GO_TO_MID": (getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0), "TASK2_GO_TO_END"),
-                    "TASK2_GO_TO_END": (getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0), "TASK3_APPROACH"),
+                    "TASK2_GO_TO_END": (getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0), "T3_START"),
                 }
 
                 if task_state in targets:
@@ -340,12 +313,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             if "TASK1" in mevcut_gorev or mevcut_gorev == "FINISHED":
                 if mevcut_gorev == "FINISHED":
                     if not finished_printed:
-                        print("[TASK1] MISSION COMPLETE")
+                        print("[MISSION] ALL TASKS COMPLETE")
                         finished_printed = True
                     apply_motor_mixer(controller, 1500, 0)
 
                 else:
-                    mevcut_gorev, target_lat, target_lon, returning_home = execute_task1(mevcut_gorev, ida_enlem, ida_boylam, returning_home)
+                    mevcut_gorev, target_lat, target_lon = execute_task1(mevcut_gorev, ida_enlem, ida_boylam)
 
             elif "TASK2" in mevcut_gorev:
                 mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
@@ -367,9 +340,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                             # Check collision condition
                             if dist_m < 1.0 or obj.get('area', 0) > 300000: # Bounding box fills screen or very close
-                                print("[TASK3] KAMIKAZE COLLISION CONFIRMED! RETURNING HOME.")
-                                returning_home = True
-                                mevcut_gorev = "TASK1_STATE_EXIT" # Triggers return sequence
+                                print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
+                                mevcut_gorev = "FINISHED" # Finish mission
                             break
 
                     if not found_target:
@@ -405,29 +377,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             # Hybrid targeting setup
             tx_world, ty_world = None, None
             if costmap_ready and target_lat is not None:
-                if mevcut_gorev in ["TASK5_ENTER"]:
-                    need_new_target = True
-                    if hybrid_local_target:
-                        d_local = math.sqrt((hybrid_local_target[0] - robot_x) ** 2 + (hybrid_local_target[1] - robot_y) ** 2)
-                        if d_local > 0.5:
-                            need_new_target = False  # Hala gidiyoruz
-
-                    if need_new_target and 'aci_farki' in locals() and aci_farki is not None:
-                        step_dist = getattr(cfg, 'HYBRID_STEP_DIST', 2.0)
-                        h_tx, h_ty = nav.get_hybrid_point(robot_x, robot_y, robot_yaw, aci_farki, step_dist)
-                        hybrid_local_target = (h_tx, h_ty)
-
-                    if hybrid_local_target:
-                        tx_world, ty_world = hybrid_local_target
-                    else:
-                        gps_lookahead = 1.5
-                        tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
-                        ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
-                else:
-                    hybrid_local_target = None  # Reset
-                    gps_lookahead = 1.5
-                    tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
-                    ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
+                hybrid_local_target = None  # Reset
+                gps_lookahead = 1.5
+                tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
+                ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
 
             # --- G. CONTROL LOGIC & MOTORS ---
             if manual_mode or not mission_started:
@@ -435,7 +388,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
             else:
                 # 1. Reactive Avoidance (Vector-Assisted Braking)
-                if center_danger and mevcut_gorev not in ["TASK5_ENTER", "TASK5_DOCK", "TASK5_EXIT"]:
+                if center_danger:
                     if not acil_durum_aktif_mi:
                         shock_brake_pwm = cfg.BASE_PWM - getattr(cfg, 'shock_pwm', 250)
                         # Braking: Reverse thrust, hard steer away
@@ -460,50 +413,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 else:
                     acil_durum_aktif_mi = False
 
-                # 2. Task 5 Specific (Blind Lidar Navigation) - (Legacy, replaced with mixer)
-                if mevcut_gorev == "TASK5_ENTER":
-                    r_val = right_d if not math.isinf(right_d) else 2.0
-                    l_val = left_d if not math.isinf(left_d) else 2.0
-                    err = r_val - l_val
-                    rot = np.clip(err * 100, -200, 200)
-                    apply_motor_mixer(controller, 1580, rot)
-
-                elif mevcut_gorev == "TASK5_DOCK":
-                    task5_dock_timer += 1
-                    turn_pwm = 200 if task5_dock_side == "RIGHT" else -200
-
-                    if task5_dock_timer < 25:
-                        apply_motor_mixer(controller, 1500, turn_pwm)
-                    elif task5_dock_timer < 65:
-                        apply_motor_mixer(controller, 1600, 0)
-                    else:
-                        apply_motor_mixer(controller, 1500, 0)
-
-                        mevcut_gorev = "TASK5_EXIT"
-                        task5_dock_timer = 0
-
-                elif mevcut_gorev == "TASK5_EXIT":
-                    task5_dock_timer += 1
-                    if task5_dock_timer < 45:
-                        apply_motor_mixer(controller, 1400, 0)
-                    elif task5_dock_timer < 75:
-                        turn_pwm = 200 if task5_dock_side == "RIGHT" else -200
-                        apply_motor_mixer(controller, 1500, turn_pwm)
-                    else:
-                        r_val = right_d if not math.isinf(right_d) else 2.0
-                        l_val = left_d if not math.isinf(left_d) else 2.0
-                        rot = np.clip((r_val - l_val) * 100, -200, 200)
-                        apply_motor_mixer(controller, 1580, rot)
-
-                # 3. Task 2 Search Rotation overrides
-                elif mevcut_gorev == "TASK2_SEARCH_PATTERN":
-                    spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                    apply_motor_mixer(controller, 1500, spot_pwm)
-
-                # 4. Standard A* / Direct Drive
-                else:
-                    if target_lat is not None:
-                        # Initial alignment logic
+                # 2. Standard A* / Direct Drive
+                if target_lat is not None:
+                    # Initial alignment logic
                         if force_initial_alignment and abs(aci_farki) < 5.0:
                             force_initial_alignment = False
 
