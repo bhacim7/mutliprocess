@@ -34,9 +34,14 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     # 2. Differential Thrust (Only applied if outside deadband)
     diff_thrust = 0
     if abs(yaw_pwm) > deadband_pwm:
-        # Scale the differential thrust based on how far past the deadband we are
-        # (Yaw > 0 means turning Right)
-        diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
+        # Calculate how fast we are going forward (0.0 to 1.0)
+        # assuming base is 1500 and max practical forward is ~1900
+        speed_factor = max(0.0, (forward_pwm - 1500) / 400.0)
+
+        # Dynamic differential multiplier based on speed
+        # At zero speed, multiplier is 1.0. At high speed, it increases to force the turn.
+        diff_multiplier = 1.0 + (speed_factor * 1.5)
+        diff_thrust = yaw_pwm * diff_multiplier
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
@@ -272,7 +277,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 }
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
-                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
                     if task_state == "TASK1_STATE_ENTER": task_state = "TASK1_STATE_MID"
                     elif task_state == "TASK1_STATE_MID": task_state = "TASK1_STATE_EXIT"
                     elif task_state == "TASK1_STATE_EXIT": task_state = "TASK2_START"
@@ -287,7 +292,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                    if nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
                         task_state = next_state
                     return task_state, t_lat, t_lon
 
@@ -303,7 +308,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                    if nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
                         task_state = next_state
                     return task_state, t_lat, t_lon
 
@@ -516,9 +521,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                                 base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                             # Full PID controller for direct steering
-                                            kp = 2.0
-                                            ki = 0.05
-                                            kd = 0.5
+                                            kp = getattr(cfg, 'DIRECT_DRIVE_KP', 2.5)
+                                            ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.05)
+                                            kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
 
                                             # Calculate terms
                                             error = aci_farki
@@ -526,7 +531,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                             # --- 3-B UPDATE: Anti-Windup Logic ---
                                             # Only accumulate integral if the error is relatively small
                                             # This prevents massive windup when pushing against an obstacle or turning sharply
-                                            if abs(error) < 15.0:
+                                            anti_windup_threshold = getattr(cfg, 'ANTI_WINDUP_DEG', 15.0)
+                                            if abs(error) < anti_windup_threshold:
                                                 direct_drive_integral += error
                                             else:
                                                 # Optional: Reset or decay the integral when outside the linear region
