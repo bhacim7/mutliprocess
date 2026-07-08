@@ -371,9 +371,13 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 adviced_course = nav.calculate_bearing(ida_enlem, ida_boylam, target_lat, target_lon)
                 aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
+        
+                # MESAFEYİ HESAPLAYAN KODU EKLİYORUZ
+                hedefe_mesafe = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
+        
                 shared_state['angle_error'] = float(aci_farki)
                 shared_state['adviced_course'] = float(adviced_course)
-                shared_state['target_dist'] = float(hedefe_mesafe) if 'hedefe_mesafe' in locals() else 0.0
+                shared_state['target_dist'] = float(hedefe_mesafe)
                 shared_state['target_lat'] = float(target_lat)
                 shared_state['target_lon'] = float(target_lon)
 
@@ -512,9 +516,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                                 base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                             # Full PID controller for direct steering
-                                            kp = 1.5
+                                            kp = 2.0
                                             ki = 0.05
-                                            kd = 0.5
+                                            kd = 0.8
 
                                             # Calculate terms
                                             error = aci_farki
