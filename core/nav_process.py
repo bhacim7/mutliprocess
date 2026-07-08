@@ -242,6 +242,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             if vision_objects and costmap_ready:
                 # If we are using vision-only or fused, draw vision objects on whatever map we have
                 for obj in vision_objects:
+                    if "TASK2" in mevcut_gorev and obj.get('cid') not in [1, 3]:
+                        continue
+
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
                         pixel_offset = (obj.get('cx', 1280/2) - (1280 / 2)) / 1280.0
@@ -327,8 +330,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
                     for obj in vision_objects:
-                        # Assuming CIDs: 3=Red, 4=Green, 10=Black (Adjust as per dataset)
-                        if obj.get('cid') in [3, 4, 10]:
+                        # Assuming CIDs: 0=Red, 2=Black, 4=Green
+                        if obj.get('cid') in [0, 2, 4]:
                             found_target = True
                             dist_m = obj.get('dist', 10.0)
 

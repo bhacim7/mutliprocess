@@ -170,6 +170,7 @@ class ProtoEnum:
     COLOR_BLACK = 2
     COLOR_RED = 3
     COLOR_GREEN = 4
+    COLOR_ORANGE = 5
     TASK_UNKNOWN = 0
     TASK_NONE = 1
     TASK_ENTRY_EXIT = 2
@@ -361,21 +362,21 @@ def camera_worker(shared_state, hf_data):
                         r_type = ProtoEnum.OBJECT_UNKNOWN
                         r_color = ProtoEnum.COLOR_UNKNOWN
 
-                        if cid in [5, 9, 10, 12]:
+                        if cid in [0, 1, 2, 3, 4]:
                             r_type = ProtoEnum.OBJECT_BUOY
-                        elif cid in [3, 4]:
-                            r_type = ProtoEnum.OBJECT_LIGHT_BEACON
                         else:
                             continue
 
-                        if cid in [3, 5]:
+                        if cid == 0:
                             r_color = ProtoEnum.COLOR_RED
-                        elif cid in [4, 12]:
-                            r_color = ProtoEnum.COLOR_GREEN
-                        elif cid == 9:
+                        elif cid == 1:
                             r_color = ProtoEnum.COLOR_YELLOW
-                        elif cid == 10:
+                        elif cid == 2:
                             r_color = ProtoEnum.COLOR_BLACK
+                        elif cid == 3:
+                            r_color = ProtoEnum.COLOR_ORANGE
+                        elif cid == 4:
+                            r_color = ProtoEnum.COLOR_GREEN
 
                         # 2. Calculate Position
                         x1, y1, x2, y2 = map(int, coords[i])
