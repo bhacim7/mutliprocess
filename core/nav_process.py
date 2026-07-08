@@ -36,7 +36,7 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     if abs(yaw_pwm) > deadband_pwm:
         # Scale the differential thrust based on how far past the deadband we are
         # (Yaw > 0 means turning Right)
-        diff_thrust = yaw_pwm * 0.8  # Slight dampening factor for thruster diff
+        diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
@@ -423,7 +423,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # 2. Standard A* / Direct Drive
                 if target_lat is not None:
                     # Initial alignment logic
-                        if force_initial_alignment and abs(aci_farki) < 5.0:
+                        if force_initial_alignment and abs(aci_farki) < 15.0:
                             force_initial_alignment = False
 
                         should_force_alignment = force_initial_alignment
@@ -518,7 +518,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                             # Full PID controller for direct steering
                                             kp = 2.0
                                             ki = 0.05
-                                            kd = 0.8
+                                            kd = 0.5
 
                                             # Calculate terms
                                             error = aci_farki
