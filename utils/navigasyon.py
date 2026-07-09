@@ -35,6 +35,29 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+def calculate_cross_track_error(start_lat, start_lon, current_lat, current_lon, target_lat, target_lon):
+    """
+    Calculates the Cross-Track Error (XTE) in meters.
+    This is the perpendicular distance from the current position to the
+    great-circle line connecting the start point and target point.
+    Positive value means the boat is to the right of the line, negative means to the left.
+    """
+    R = 6371000  # radius of Earth in meters
+
+    # Calculate bearing from start to target
+    theta_13 = math.radians(calculate_bearing(start_lat, start_lon, target_lat, target_lon))
+
+    # Calculate bearing from start to current position
+    theta_12 = math.radians(calculate_bearing(start_lat, start_lon, current_lat, current_lon))
+
+    # Calculate distance from start to current position
+    dist_13 = haversine(start_lat, start_lon, current_lat, current_lon) / R
+
+    # Calculate Cross-Track Error
+    xte_rad = math.asin(math.sin(dist_13) * math.sin(theta_12 - theta_13))
+
+    return xte_rad * R
+
 def calculate_bearing(lat1, lon1, lat2, lon2):
     """Calculates bearing between two GPS points"""
     phi1 = math.radians(lat1)

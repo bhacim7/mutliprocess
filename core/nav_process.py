@@ -122,6 +122,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     force_initial_alignment = False
     prev_target_lat = None
     prev_target_lon = None
+    start_lat = None
+    start_lon = None
     returning_home = False
     finished_printed = False
 
@@ -384,12 +386,42 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     force_initial_alignment = True
                     prev_target_lat = target_lat
                     prev_target_lon = target_lon
+                    # Record the exact position where we started heading to this new target
+                    start_lat = ida_enlem
+                    start_lon = ida_boylam
 
+                # Calculate standard bearing and distance to the final target
                 adviced_course = nav.calculate_bearing(ida_enlem, ida_boylam, target_lat, target_lon)
-                aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
-
-                # MESAFEYİ HESAPLAYAN KODU EKLİYORUZ
                 hedefe_mesafe = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
+
+                # Line of Sight (LOS) Guidance Logic (for non-A* paths)
+                # If we have a valid start point, we create a virtual target (rabbit) on the line
+                # to correct for cross-track error.
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True):
+                    # How far off the ideal line are we?
+                    xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
+
+                    # LOS lookahead distance (the carrot distance on the line)
+                    # Scales with distance, but kept within sane bounds (e.g., look 4-10m ahead)
+                    los_lookahead = max(4.0, min(10.0, hedefe_mesafe * 0.5))
+
+                    # Calculate the bearing of the ideal line itself
+                    path_bearing = nav.calculate_bearing(start_lat, start_lon, target_lat, target_lon)
+
+                    # Calculate LOS correction angle based on XTE
+                    # K_los controls how aggressively we turn back to the line
+                    k_los = getattr(cfg, 'LOS_KP', 1.5)
+                    # Inverse tangent creates a smooth S-curve back to the line
+                    correction_angle = math.degrees(math.atan2(k_los * xte, los_lookahead))
+
+                    # The new desired heading points back to the line, rather than straight at the target
+                    los_heading = (path_bearing - correction_angle) % 360
+
+                    # Update aci_farki to chase the LOS heading instead of the direct bearing
+                    aci_farki = nav.signed_angle_difference(magnetic_heading, los_heading)
+                else:
+                    # Fallback to direct bearing if LOS is disabled or no start point
+                    aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
 
                 shared_state['angle_error'] = float(aci_farki)
                 shared_state['adviced_course'] = float(adviced_course)
