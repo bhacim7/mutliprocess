@@ -556,63 +556,57 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                         else:
                             if target_lat is not None and target_lon is not None:
-                                if path_lost_time is None:
-                                    path_lost_time = time.time()
+                                # Always use Direct Drive PID (and spot turns) as a fallback when A* has no path
+                                # This prevents the boat from freezing if A* inflation blocks the target
+                                # or if initial alignment takes longer than 5 seconds.
+                                failsafe_active = True
 
-                                # Allow unlimited grace period if we are intentionally skipping A* (Task 1 & 3)
-                                # Or allow 5s grace period if A* failed in Task 2
-                                if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
-                                    failsafe_active = True
+                                # --- FIX: Reintroduce spot turn if heading is severely off ---
+                                threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
 
-                                    # --- FIX: Reintroduce spot turn if heading is severely off ---
-                                    threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
-
-                                    if abs(aci_farki) > threshold:
-                                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                                        if aci_farki > 0:  # Target Right
-                                            apply_motor_mixer(controller, 1500, spot_pwm)
-                                        else:  # Target Left
-                                            apply_motor_mixer(controller, 1500, -spot_pwm)
-                                    else:
-                                        base_pwm = getattr(cfg, 'BASE_PWM', 1500)
-                                        if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
-                                            base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
-                                        else:
-                                            base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
-
-                                        # Full PID controller for direct steering
-                                        kp = 2.0
-                                        ki = 0.05
-                                        kd = 0.5
-
-                                        # Calculate terms
-                                        error = aci_farki
-
-                                        # --- 3-B UPDATE: Anti-Windup Logic ---
-                                        # Only accumulate integral if the error is relatively small
-                                        # This prevents massive windup when pushing against an obstacle or turning sharply
-                                        if abs(error) < 15.0:
-                                            direct_drive_integral += error
-                                        else:
-                                            # Optional: Reset or decay the integral when outside the linear region
-                                            direct_drive_integral *= 0.9
-
-                                        # Integral windup hard limit
-                                        windup_limit = 500.0
-                                        direct_drive_integral = max(-windup_limit,
-                                                                    min(windup_limit, direct_drive_integral))
-                                        # -------------------------------------
-
-                                        derivative = error - direct_drive_prev_error
-                                        direct_drive_prev_error = error
-
-                                        steering_correction = (error * kp) + (direct_drive_integral * ki) + (
-                                                    derivative * kd)
-
-                                        apply_motor_mixer(controller, base_pwm, steering_correction)
+                                if abs(aci_farki) > threshold:
+                                    spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                                    if aci_farki > 0:  # Target Right
+                                        apply_motor_mixer(controller, 1500, spot_pwm)
+                                    else:  # Target Left
+                                        apply_motor_mixer(controller, 1500, -spot_pwm)
                                 else:
-                                    # Stop if grace period exceeded and still no path (Task 2 only)
-                                    apply_motor_mixer(controller, 1500, 0)
+                                    base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                                    if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
+                                        base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+                                    else:
+                                        base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
+
+                                    # Full PID controller for direct steering
+                                    kp = 2.0
+                                    ki = 0.05
+                                    kd = 0.5
+
+                                    # Calculate terms
+                                    error = aci_farki
+
+                                    # --- 3-B UPDATE: Anti-Windup Logic ---
+                                    # Only accumulate integral if the error is relatively small
+                                    # This prevents massive windup when pushing against an obstacle or turning sharply
+                                    if abs(error) < 15.0:
+                                        direct_drive_integral += error
+                                    else:
+                                        # Optional: Reset or decay the integral when outside the linear region
+                                        direct_drive_integral *= 0.9
+
+                                    # Integral windup hard limit
+                                    windup_limit = 500.0
+                                    direct_drive_integral = max(-windup_limit,
+                                                                min(windup_limit, direct_drive_integral))
+                                    # -------------------------------------
+
+                                    derivative = error - direct_drive_prev_error
+                                    direct_drive_prev_error = error
+
+                                    steering_correction = (error * kp) + (direct_drive_integral * ki) + (
+                                                derivative * kd)
+
+                                    apply_motor_mixer(controller, base_pwm, steering_correction)
 
                             else:
                                 apply_motor_mixer(controller, 1500, 0)
