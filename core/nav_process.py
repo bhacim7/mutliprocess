@@ -361,7 +361,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                             # Simple P controller for pixel error to steering PWM
                             kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
-                            steering_correction = pixel_error * kp_pixel
+
+                            # Use inversion toggle to fix the circling bug
+                            if getattr(cfg, 'TASK3_INVERT_STEERING', False):
+                                steering_correction = -pixel_error * kp_pixel
+                            else:
+                                steering_correction = pixel_error * kp_pixel
 
                             base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
                             apply_motor_mixer(controller, base_pwm, steering_correction)

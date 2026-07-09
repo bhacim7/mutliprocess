@@ -98,5 +98,6 @@ T3_START_LON = 29.2622185
 T3_MID_LAT = 40.8096174
 T3_MID_LON = 29.2622489
 TASK3_KAMIKAZE_COLOR = "red"  # Options: "red", "green", "black"
+TASK3_INVERT_STEERING = True  # Toggle if boat turns away from target
 
 MEVCUT_GOREV = "TASK2_START"
