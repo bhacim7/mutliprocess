@@ -12,6 +12,7 @@ from utils.navigasyon import calculate_obj_gps
 
 import queue
 
+
 def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     """
     Control Mixer: Distributes Forward Effort and Yaw Effort across 5 channels.
@@ -41,7 +42,7 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
     # we DO NOT want positive differential thrust pushing us forward on the outside.
-    if forward_pwm < 1450: # Actively reversing
+    if forward_pwm < 1450:  # Actively reversing
         rear_left = int(forward_pwm)
         rear_right = int(forward_pwm)
         front_left = int(forward_pwm)
@@ -83,7 +84,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         fc_port = getattr(cfg, 'FC_PORT', '/dev/ttyACM0')
         fc_baud = getattr(cfg, 'FC_BAUD', 57600)
         controller = USVController(fc_port, baud=fc_baud)
-        
+
         controller.set_mode("MANUAL")
         print("[NAV_PROCESS] USV Controller Initialized.")
     except Exception as e:
@@ -166,7 +167,6 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
             hf_data['magnetic_heading'].value = magnetic_heading
 
-
             # --- B. PROCESS INCOMING COMMANDS ---
             try:
                 while not command_queue.empty():
@@ -182,21 +182,30 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         idx = cmd.get("index")
                         lat = cmd.get("lat")
                         lon = cmd.get("lon")
-                        if idx == 1: cfg.T1_GATE_ENTER_LAT = lat; cfg.T1_GATE_ENTER_LON = lon
-                        elif idx == 2: cfg.T1_GATE_MID_LAT = lat; cfg.T1_GATE_MID_LON = lon
-                        elif idx == 3: cfg.T1_GATE_EXIT_LAT = lat; cfg.T1_GATE_EXIT_LON = lon
-                        elif idx == 4: cfg.T2_ZONE_ENTRY_LAT = lat; cfg.T2_ZONE_ENTRY_LON = lon
-                        elif idx == 5: cfg.T2_ZONE_MID_LAT = lat; cfg.T2_ZONE_MID_LON = lon
-                        elif idx == 6: cfg.T2_ZONE_END_LAT = lat; cfg.T2_ZONE_END_LON = lon
-                        elif idx == 7: cfg.T3_START_LAT = lat; cfg.T3_START_LON = lon
-                        elif idx == 8: cfg.T3_MID_LAT = lat; cfg.T3_MID_LON = lon
+                        if idx == 1:
+                            cfg.T1_GATE_ENTER_LAT = lat; cfg.T1_GATE_ENTER_LON = lon
+                        elif idx == 2:
+                            cfg.T1_GATE_MID_LAT = lat; cfg.T1_GATE_MID_LON = lon
+                        elif idx == 3:
+                            cfg.T1_GATE_EXIT_LAT = lat; cfg.T1_GATE_EXIT_LON = lon
+                        elif idx == 4:
+                            cfg.T2_ZONE_ENTRY_LAT = lat; cfg.T2_ZONE_ENTRY_LON = lon
+                        elif idx == 5:
+                            cfg.T2_ZONE_MID_LAT = lat; cfg.T2_ZONE_MID_LON = lon
+                        elif idx == 6:
+                            cfg.T2_ZONE_END_LAT = lat; cfg.T2_ZONE_END_LON = lon
+                        elif idx == 7:
+                            cfg.T3_START_LAT = lat; cfg.T3_START_LON = lon
+                        elif idx == 8:
+                            cfg.T3_MID_LAT = lat; cfg.T3_MID_LON = lon
                         print(f"[NAV_PROCESS] Updated GPS Point {idx}")
                     elif cmd_str == "set_task":
                         new_task = cmd.get("task_name")
                         if new_task:
                             shared_state['current_task'] = new_task
                             print(f"[NAV_PROCESS] Task updated to {new_task}")
-            except: pass
+            except:
+                pass
 
             # --- C. SYNC WITH SHARED STATE ---
             magnetic_heading = hf_data['magnetic_heading'].value
@@ -229,7 +238,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 if isinstance(costmap_payload, np.ndarray):
                     costmap_img = costmap_payload
             else:
-                lidar_ts = 0.0 # Fallback
+                lidar_ts = 0.0  # Fallback
             # -----------------------------------------------------------
 
             vision_objects = shared_state.get('vision_detected_objects', [])
@@ -249,7 +258,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
-                        pixel_offset = (obj.get('cx', 1280/2) - (1280 / 2)) / 1280.0
+                        pixel_offset = (obj.get('cx', 1280 / 2) - (1280 / 2)) / 1280.0
                         angle_offset = -pixel_offset * math.radians(getattr(cfg, 'CAM_HFOV', 110.0))
                         obj_global_angle = robot_yaw + angle_offset
 
@@ -275,16 +284,22 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
                 if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
-                    if task_state == "TASK1_STATE_ENTER": task_state = "TASK1_STATE_MID"
-                    elif task_state == "TASK1_STATE_MID": task_state = "TASK1_STATE_EXIT"
-                    elif task_state == "TASK1_STATE_EXIT": task_state = "TASK2_START"
+                    if task_state == "TASK1_STATE_ENTER":
+                        task_state = "TASK1_STATE_MID"
+                    elif task_state == "TASK1_STATE_MID":
+                        task_state = "TASK1_STATE_EXIT"
+                    elif task_state == "TASK1_STATE_EXIT":
+                        task_state = "TASK2_START"
                 return task_state, t_lat, t_lon
 
             def execute_task2(task_state, lat, lon):
                 targets = {
-                    "TASK2_START": (getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0), "TASK2_GO_TO_MID"),
-                    "TASK2_GO_TO_MID": (getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0), "TASK2_GO_TO_END"),
-                    "TASK2_GO_TO_END": (getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0), "T3_START"),
+                    "TASK2_START": (getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0),
+                                    "TASK2_GO_TO_MID"),
+                    "TASK2_GO_TO_MID": (getattr(cfg, 'T2_ZONE_MID_LAT', 0), getattr(cfg, 'T2_ZONE_MID_LON', 0),
+                                        "TASK2_GO_TO_END"),
+                    "TASK2_GO_TO_END": (getattr(cfg, 'T2_ZONE_END_LAT', 0), getattr(cfg, 'T2_ZONE_END_LON', 0),
+                                        "T3_START"),
                 }
 
                 if task_state in targets:
@@ -299,7 +314,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 if task_state == "TASK3_APPROACH": return "T3_START", None, None
 
                 targets = {
-                    "T3_START": (getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0), "T3_MID" if getattr(cfg, 'ENABLE_TASK3', True) else "FINISHED"),
+                    "T3_START": (getattr(cfg, 'T3_START_LAT', 0), getattr(cfg, 'T3_START_LON', 0),
+                                 "T3_MID" if getattr(cfg, 'ENABLE_TASK3', True) else "FINISHED"),
                     "T3_MID": (getattr(cfg, 'T3_MID_LAT', 0), getattr(cfg, 'T3_MID_LON', 0), "TASK3_SEARCH_KAMIKAZE")
                 }
 
@@ -344,9 +360,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             target_lat, target_lon = calculate_obj_gps(ida_enlem, ida_boylam, dist_m, obj_bearing)
 
                             # Check collision condition
-                            if dist_m < 1.0 or obj.get('area', 0) > 300000: # Bounding box fills screen or very close
+                            if dist_m < 1.0 or obj.get('area', 0) > 300000:  # Bounding box fills screen or very close
                                 print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
-                                mevcut_gorev = "FINISHED" # Finish mission
+                                mevcut_gorev = "FINISHED"  # Finish mission
                             break
 
                     if not found_target:
@@ -406,7 +422,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 else:
                     # Fallback to direct bearing if LOS is disabled or no start point
                     aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
-        
+
                 shared_state['angle_error'] = float(aci_farki)
                 shared_state['adviced_course'] = float(adviced_course)
                 shared_state['target_dist'] = float(hedefe_mesafe)
@@ -447,7 +463,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     else:
                         apply_motor_mixer(controller, cfg.BASE_PWM, spot_turn_val)
                     time.sleep(0.3)
-                    current_path = None # Force replan
+                    current_path = None  # Force replan
                     continue
                 else:
                     acil_durum_aktif_mi = False
@@ -455,133 +471,142 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # 2. Standard A* / Direct Drive
                 if target_lat is not None:
                     # Initial alignment logic
-                        if force_initial_alignment and abs(aci_farki) < 15.0:
-                            force_initial_alignment = False
+                    if force_initial_alignment and abs(aci_farki) < 15.0:
+                        force_initial_alignment = False
 
-                        should_force_alignment = force_initial_alignment
+                    should_force_alignment = force_initial_alignment
 
-                        if should_force_alignment:
-                            spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                            if aci_farki > 0: apply_motor_mixer(controller, 1500, spot_pwm)
-                            else: apply_motor_mixer(controller, 1500, -spot_pwm)
+                    if should_force_alignment:
+                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                        if aci_farki > 0:
+                            apply_motor_mixer(controller, 1500, spot_pwm)
                         else:
-                            current_path = None
+                            apply_motor_mixer(controller, 1500, -spot_pwm)
+                    else:
+                        current_path = None
 
-                            # Use A* ONLY for Task 2
-                            if "TASK2" in mevcut_gorev:
-                                # Run Planner
-                                # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
-                                crop_radius_m = 10.0 # Only look at a 20m x 20m window around the boat
-                                crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
+                        # Use A* ONLY for Task 2
+                        if "TASK2" in mevcut_gorev:
+                            # Run Planner
+                            # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
+                            crop_radius_m = 10.0  # Only look at a 20m x 20m window around the boat
+                            crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
 
-                                cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
-                                rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
-                                ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+                            cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
+                            rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
+                            ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
 
-                                x_min = max(0, rx_px - crop_radius_px)
-                                x_max = min(COSTMAP_SIZE_PX[0], rx_px + crop_radius_px)
-                                y_min = max(0, ry_px - crop_radius_px)
-                                y_max = min(COSTMAP_SIZE_PX[1], ry_px + crop_radius_px)
+                            x_min = max(0, rx_px - crop_radius_px)
+                            x_max = min(COSTMAP_SIZE_PX[0], rx_px + crop_radius_px)
+                            y_min = max(0, ry_px - crop_radius_px)
+                            y_max = min(COSTMAP_SIZE_PX[1], ry_px + crop_radius_px)
 
-                                cropped_costmap = costmap_img[y_min:y_max, x_min:x_max]
-                                cropped_center_m = (
-                                    costmap_center_m[0] + ((x_min + x_max)/2 - cw) * COSTMAP_RES_M_PER_PX,
-                                    costmap_center_m[1] - ((y_min + y_max)/2 - ch) * COSTMAP_RES_M_PER_PX
-                                )
-                                cropped_size_px = (x_max - x_min, y_max - y_min)
+                            cropped_costmap = costmap_img[y_min:y_max, x_min:x_max]
+                            cropped_center_m = (
+                                costmap_center_m[0] + ((x_min + x_max) / 2 - cw) * COSTMAP_RES_M_PER_PX,
+                                costmap_center_m[1] - ((y_min + y_max) / 2 - ch) * COSTMAP_RES_M_PER_PX
+                            )
+                            cropped_size_px = (x_max - x_min, y_max - y_min)
 
-                                nav_map, _ = planner.get_inflated_nav_map(cropped_costmap, ignore_green=(mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
+                            nav_map, _ = planner.get_inflated_nav_map(cropped_costmap, ignore_green=(
+                                        mevcut_gorev == "TASK2_GREEN_MARKER_FOUND"))
 
-                                plan_timer += 1
-                                if plan_timer > 4:
-                                    plan_timer = 0
-                                    if tx_world is not None:
-                                        if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px):
-                                            current_path = [(robot_x, robot_y), (tx_world, ty_world)]
-                                        else:
-                                            new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world), nav_map, cropped_center_m, COSTMAP_RES_M_PER_PX, cropped_size_px)
-                                            if new_path: current_path = new_path
-                                # ------------------------------------------------
-
-                            # If we have an A* path (Task 2 only), follow it with Pure Pursuit
-                            if current_path:
-                                base_pwm = getattr(cfg, 'BASE_PWM', 1500)
-                                if mevcut_gorev.startswith("T3_"): base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
-
-                                # Pure pursuit now returns base_speed and steering_correction instead of left/right pwms
-                                p_base, p_steer, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
-                                    robot_x, robot_y, robot_yaw, current_path, current_speed=0, base_speed=base_pwm, prev_error=prev_heading_error)
-
-                                current_path = pruned_path
-                                prev_heading_error = current_error
-
-                                failsafe_active = False
-                                path_lost_time = None
-
-                                apply_motor_mixer(controller, p_base, p_steer)
-
-                            # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
-                            else:
-                                if target_lat is not None and target_lon is not None:
-                                    if path_lost_time is None:
-                                        path_lost_time = time.time()
-
-                                    # Allow unlimited grace period if we are intentionally skipping A* (Task 1 & 3)
-                                    # Or allow 5s grace period if A* failed in Task 2
-                                    if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
-                                        failsafe_active = True
-
-                                        # --- FIX: Reintroduce spot turn if heading is severely off ---
-                                        threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
-
-                                        if abs(aci_farki) > threshold:
-                                            spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
-                                            if aci_farki > 0:  # Target Right
-                                                apply_motor_mixer(controller, 1500, spot_pwm)
-                                            else:  # Target Left
-                                                apply_motor_mixer(controller, 1500, -spot_pwm)
-                                        else:
-                                            base_pwm = getattr(cfg, 'BASE_PWM', 1500)
-                                            if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
-                                                base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
-                                            else:
-                                                base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
-
-                                            # Full PID controller for direct steering
-                                            kp = 2.0
-                                            ki = 0.05
-                                            kd = 0.5
-
-                                            # Calculate terms
-                                            error = aci_farki
-
-                                            # --- 3-B UPDATE: Anti-Windup Logic ---
-                                            # Only accumulate integral if the error is relatively small
-                                            # This prevents massive windup when pushing against an obstacle or turning sharply
-                                            if abs(error) < 15.0:
-                                                direct_drive_integral += error
-                                            else:
-                                                # Optional: Reset or decay the integral when outside the linear region
-                                                direct_drive_integral *= 0.9
-
-                                            # Integral windup hard limit
-                                            windup_limit = 500.0
-                                            direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
-                                            # -------------------------------------
-
-                                            derivative = error - direct_drive_prev_error
-                                            direct_drive_prev_error = error
-
-                                            steering_correction = (error * kp) + (direct_drive_integral * ki) + (derivative * kd)
-
-                                            apply_motor_mixer(controller, base_pwm, steering_correction)
+                            plan_timer += 1
+                            if plan_timer > 4:
+                                plan_timer = 0
+                                if tx_world is not None:
+                                    if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map,
+                                                                   cropped_center_m, COSTMAP_RES_M_PER_PX,
+                                                                   cropped_size_px):
+                                        current_path = [(robot_x, robot_y), (tx_world, ty_world)]
                                     else:
-                                        # Stop if grace period exceeded and still no path (Task 2 only)
-                                        apply_motor_mixer(controller, 1500, 0)
+                                        new_path = planner.get_path_plan((robot_x, robot_y), (tx_world, ty_world),
+                                                                         nav_map, cropped_center_m,
+                                                                         COSTMAP_RES_M_PER_PX, cropped_size_px)
+                                        if new_path: current_path = new_path
+                            # ------------------------------------------------
 
+                        # If we have an A* path (Task 2 only), follow it with Pure Pursuit
+                        if current_path:
+                            base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                            if mevcut_gorev.startswith("T3_"): base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+
+                            # Pure pursuit now returns base_speed and steering_correction instead of left/right pwms
+                            p_base, p_steer, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
+                                robot_x, robot_y, robot_yaw, current_path, current_speed=0, base_speed=base_pwm,
+                                prev_error=prev_heading_error)
+
+                            current_path = pruned_path
+                            prev_heading_error = current_error
+
+                            failsafe_active = False
+                            path_lost_time = None
+
+                            apply_motor_mixer(controller, p_base, p_steer)
+
+                        # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
+                        else:
+                            if target_lat is not None and target_lon is not None:
+                                if path_lost_time is None:
+                                    path_lost_time = time.time()
+
+                                # Allow unlimited grace period if we are intentionally skipping A* (Task 1 & 3)
+                                # Or allow 5s grace period if A* failed in Task 2
+                                if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
+                                    failsafe_active = True
+
+                                    # --- FIX: Reintroduce spot turn if heading is severely off ---
+                                    threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
+
+                                    if abs(aci_farki) > threshold:
+                                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                                        if aci_farki > 0:  # Target Right
+                                            apply_motor_mixer(controller, 1500, spot_pwm)
+                                        else:  # Target Left
+                                            apply_motor_mixer(controller, 1500, -spot_pwm)
+                                    else:
+                                        base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                                        if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
+                                            base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+                                        else:
+                                            base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
+
+                                        # Full PID controller for direct steering
+                                        kp = 2.0
+                                        ki = 0.05
+                                        kd = 0.5
+
+                                        # Calculate terms
+                                        error = aci_farki
+
+                                        # --- 3-B UPDATE: Anti-Windup Logic ---
+                                        # Only accumulate integral if the error is relatively small
+                                        # This prevents massive windup when pushing against an obstacle or turning sharply
+                                        if abs(error) < 15.0:
+                                            direct_drive_integral += error
+                                        else:
+                                            # Optional: Reset or decay the integral when outside the linear region
+                                            direct_drive_integral *= 0.9
+
+                                        # Integral windup hard limit
+                                        windup_limit = 500.0
+                                        direct_drive_integral = max(-windup_limit,
+                                                                    min(windup_limit, direct_drive_integral))
+                                        # -------------------------------------
+
+                                        derivative = error - direct_drive_prev_error
+                                        direct_drive_prev_error = error
+
+                                        steering_correction = (error * kp) + (direct_drive_integral * ki) + (
+                                                    derivative * kd)
+
+                                        apply_motor_mixer(controller, base_pwm, steering_correction)
                                 else:
+                                    # Stop if grace period exceeded and still no path (Task 2 only)
                                     apply_motor_mixer(controller, 1500, 0)
 
+                            else:
+                                apply_motor_mixer(controller, 1500, 0)
 
             # Record final PWMs
             # Note: We rely on the USVController object stub tracking state,
@@ -603,4 +628,5 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             apply_motor_mixer(controller, 1500, 0)
 
             controller.disarm_vehicle()
-        except: pass
+        except:
+            pass
