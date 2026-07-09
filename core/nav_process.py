@@ -140,6 +140,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     # Store legacy PWM defaults
     extra = 50
 
+    # Task 3 Search State variables
+    t3_search_state = "INIT_SEARCH"
+    t3_original_heading = None
+    t3_search_move_target = None
+
     try:
         while not shared_state['shutdown']:
             start_time = time.time()
@@ -347,30 +352,114 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             elif "T3" in mevcut_gorev or mevcut_gorev == "TASK3_APPROACH":
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
+                    target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
+                    target_cid = 0
+                    if target_color == "yellow": target_cid = 1
+                    elif target_color == "black": target_cid = 2
+                    elif target_color == "orange": target_cid = 3
+                    elif target_color == "green": target_cid = 4
+
                     for obj in vision_objects:
-                        # Assuming CIDs: 0=Red, 2=Black, 4=Green
-                        if obj.get('cid') in [0, 2, 4]:
+                        if obj.get('cid') == target_cid:
                             found_target = True
                             dist_m = obj.get('dist', 10.0)
 
-                            # Calculate the global GPS of the buoy to set as target
-                            pixel_offset = (obj['cx'] - (1280 / 2)) / 1280.0
-                            angle_offset_deg = pixel_offset * getattr(cfg, 'CAM_HFOV', 110.0)
-                            obj_bearing = (magnetic_heading + angle_offset_deg) % 360
-                            target_lat, target_lon = calculate_obj_gps(ida_enlem, ida_boylam, dist_m, obj_bearing)
+                            # Visual Servoing logic
+                            # Prevent GPS PID from interfering by setting targets to None
+                            target_lat, target_lon = None, None
+
+                            pixel_error = obj['cx'] - (1280 / 2) # Assuming 1280 width (ZED HD720)
+
+                            # Simple P controller for pixel error to steering PWM
+                            kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
+
+                            # Use inversion toggle to fix the circling bug
+                            if getattr(cfg, 'TASK3_INVERT_STEERING', False):
+                                steering_correction = -pixel_error * kp_pixel
+                            else:
+                                steering_correction = pixel_error * kp_pixel
+
+                            base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
+                            apply_motor_mixer(controller, base_pwm, steering_correction)
 
                             # Check collision condition
-                            if dist_m < 1.0 or obj.get('area', 0) > 300000:  # Bounding box fills screen or very close
+                            if dist_m < 1.0 or obj.get('area', 0) > 300000: # Bounding box fills screen or very close
                                 print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
-                                mevcut_gorev = "FINISHED"  # Finish mission
+                                apply_motor_mixer(controller, 1500, 0)
+                                mevcut_gorev = "FINISHED" # Finish mission
                             break
 
                     if not found_target:
-                        # Spin slowly to search
+                        target_lat, target_lon = None, None # Default to not using GPS PID unless moving
                         spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 150)
-                        apply_motor_mixer(controller, 1500, spot_pwm)
-                        # Ensure we don't drop into A* or PID below while spinning
-                        target_lat, target_lon = None, None
+
+                        if t3_search_state == "INIT_SEARCH":
+                            t3_original_heading = magnetic_heading
+                            t3_search_state = "PAN_LEFT"
+
+                        elif t3_search_state == "PAN_LEFT":
+                            target_h = (t3_original_heading - 45) % 360
+                            diff = nav.signed_angle_difference(magnetic_heading, target_h)
+                            if abs(diff) < 5.0:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "PAN_RIGHT"
+                            else:
+                                apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
+
+                        elif t3_search_state == "PAN_RIGHT":
+                            target_h = (t3_original_heading + 45) % 360
+                            diff = nav.signed_angle_difference(magnetic_heading, target_h)
+                            if abs(diff) < 5.0:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "CALC_MOVE_L60"
+                            else:
+                                apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
+
+                        elif t3_search_state == "CALC_MOVE_L60":
+                            target_h = (t3_original_heading - 60) % 360
+                            t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
+                            t3_search_move_target = (t_lat, t_lon)
+                            t3_search_state = "MOVE_L60"
+
+                        elif t3_search_state == "MOVE_L60":
+                            target_lat, target_lon = t3_search_move_target
+                            dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
+                            if dist < 1.5:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "PAN_LEFT_2"
+                                target_lat, target_lon = None, None
+
+                        elif t3_search_state == "PAN_LEFT_2":
+                            target_h = (t3_original_heading - 45) % 360
+                            diff = nav.signed_angle_difference(magnetic_heading, target_h)
+                            if abs(diff) < 5.0:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "PAN_RIGHT_2"
+                            else:
+                                apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
+
+                        elif t3_search_state == "PAN_RIGHT_2":
+                            target_h = (t3_original_heading + 45) % 360
+                            diff = nav.signed_angle_difference(magnetic_heading, target_h)
+                            if abs(diff) < 5.0:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "CALC_MOVE_R60"
+                            else:
+                                apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
+
+                        elif t3_search_state == "CALC_MOVE_R60":
+                            target_h = (t3_original_heading + 60) % 360
+                            t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
+                            t3_search_move_target = (t_lat, t_lon)
+                            t3_search_state = "MOVE_R60"
+
+                        elif t3_search_state == "MOVE_R60":
+                            target_lat, target_lon = t3_search_move_target
+                            dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
+                            if dist < 1.5:
+                                apply_motor_mixer(controller, 1500, 0)
+                                t3_search_state = "PAN_LEFT"
+                                target_lat, target_lon = None, None
                 else:
                     mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
 
