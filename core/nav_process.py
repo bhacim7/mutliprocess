@@ -390,7 +390,19 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             tx_world, ty_world = None, None
             if costmap_ready and target_lat is not None:
                 hybrid_local_target = None  # Reset
-                gps_lookahead = 1.5
+
+                # We project the target up to 10 meters away (edge of our cropped costmap)
+                # so A* can actually "see" the obstacles and plan around them, rather than
+                # being blindfolded at 1.5m. If we are closer to the target than 10m, we just use the real distance.
+                # Use local variable hedefe_mesafe calculated on line 383
+                try:
+                    hedefe_mesafe_safe = float(hedefe_mesafe)
+                except:
+                    hedefe_mesafe_safe = 10.0
+
+                gps_lookahead = min(10.0, hedefe_mesafe_safe)
+
+                # Project the global GPS bearing into the local ZED map frame
                 tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
                 ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
 
@@ -504,10 +516,18 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
                                         failsafe_active = True
 
-                                        # --- FIX: Reintroduce spot turn if heading is severely off ---
+                                        # --- FIX: Spot Turn Jerking & Proximity Dampener ---
                                         threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
+                                        try:
+                                            dist_to_target = float(hedefe_mesafe)
+                                        except:
+                                            dist_to_target = 10.0
 
-                                        if abs(aci_farki) > threshold:
+                                        # Disable hard Spot Turns if we are within 8 meters, to prevent oscillating/jerking
+                                        # when entering the final approach. Let PID handle it smoothly.
+                                        allow_spot_turn = dist_to_target > 8.0
+
+                                        if allow_spot_turn and abs(aci_farki) > threshold:
                                             spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
                                             if aci_farki > 0:  # Target Right
                                                 apply_motor_mixer(controller, 1500, spot_pwm)
@@ -521,12 +541,18 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                                 base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                             # Full PID controller for direct steering
-                                            kp = getattr(cfg, 'DIRECT_DRIVE_KP', 2.5)
-                                            ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.05)
-                                            kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
+                                            kp = getattr(cfg, 'DIRECT_DRIVE_KP', 12.0)
+                                            ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.1)
+                                            kd = getattr(cfg, 'DIRECT_DRIVE_KD', 4.0)
 
                                             # Calculate terms
                                             error = aci_farki
+
+                                            # Proximity Dampener: If very close to the target (< 4 meters), the geometric
+                                            # angle explodes (being slightly off causes massive heading error jumps).
+                                            # We artificially clamp the error so the boat doesn't aggressively snap sideways.
+                                            if dist_to_target < 4.0:
+                                                error = max(-15.0, min(15.0, error))
 
                                             # --- 3-B UPDATE: Anti-Windup Logic ---
                                             # Only accumulate integral if the error is relatively small
