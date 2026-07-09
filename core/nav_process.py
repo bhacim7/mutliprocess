@@ -34,14 +34,9 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     # 2. Differential Thrust (Only applied if outside deadband)
     diff_thrust = 0
     if abs(yaw_pwm) > deadband_pwm:
-        # Calculate how fast we are going forward (0.0 to 1.0)
-        # assuming base is 1500 and max practical forward is ~1900
-        speed_factor = max(0.0, (forward_pwm - 1500) / 400.0)
-
-        # Dynamic differential multiplier based on speed
-        # At zero speed, multiplier is 1.0. At high speed, it increases to force the turn.
-        diff_multiplier = 1.0 + (speed_factor * 1.5)
-        diff_thrust = yaw_pwm * diff_multiplier
+        # Scale the differential thrust based on how far past the deadband we are
+        # (Yaw > 0 means turning Right)
+        diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
@@ -126,6 +121,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     force_initial_alignment = False
     prev_target_lat = None
     prev_target_lon = None
+    start_lat = None
+    start_lon = None
     returning_home = False
     finished_printed = False
 
@@ -277,7 +274,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 }
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
-                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
+                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                     if task_state == "TASK1_STATE_ENTER": task_state = "TASK1_STATE_MID"
                     elif task_state == "TASK1_STATE_MID": task_state = "TASK1_STATE_EXIT"
                     elif task_state == "TASK1_STATE_EXIT": task_state = "TASK2_START"
@@ -292,7 +289,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                         task_state = next_state
                     return task_state, t_lat, t_lon
 
@@ -308,7 +305,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < getattr(cfg, 'WAYPOINT_RADIUS_M', 2.0):
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                         task_state = next_state
                     return task_state, t_lat, t_lon
 
@@ -373,12 +370,43 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     force_initial_alignment = True
                     prev_target_lat = target_lat
                     prev_target_lon = target_lon
+                    # Record the exact position where we started heading to this new target
+                    start_lat = ida_enlem
+                    start_lon = ida_boylam
 
+                # Calculate standard bearing and distance to the final target
                 adviced_course = nav.calculate_bearing(ida_enlem, ida_boylam, target_lat, target_lon)
-                aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
-        
-                # MESAFEYİ HESAPLAYAN KODU EKLİYORUZ
                 hedefe_mesafe = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
+
+                # Line of Sight (LOS) Guidance Logic (for non-A* paths)
+                # If we have a valid start point, we create a virtual target (rabbit) on the line
+                # to correct for cross-track error.
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True):
+                    # How far off the ideal line are we?
+                    xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
+
+                    # LOS lookahead distance (the carrot distance on the line)
+                    # Scales with distance, but kept within sane bounds (e.g., look 4-10m ahead)
+                    los_lookahead = max(4.0, min(10.0, hedefe_mesafe * 0.5))
+
+                    # Calculate the bearing of the ideal line itself
+                    path_bearing = nav.calculate_bearing(start_lat, start_lon, target_lat, target_lon)
+
+                    # Calculate LOS correction angle based on XTE
+                    # K_los controls how aggressively we turn back to the line
+                    k_los = getattr(cfg, 'LOS_KP', 1.5)
+                    # Inverse tangent creates a smooth S-curve back to the line
+                    correction_angle = math.degrees(math.atan2(k_los * xte, los_lookahead))
+
+                    # The new desired heading points back to the line, rather than straight at the target
+                    los_heading = (path_bearing - correction_angle) % 360
+
+                    # Update aci_farki to chase the LOS heading instead of the direct bearing
+                    aci_farki = nav.signed_angle_difference(magnetic_heading, los_heading)
+                else:
+                    # Fallback to direct bearing if LOS is disabled or no start point
+                    aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
+
         
                 shared_state['angle_error'] = float(aci_farki)
                 shared_state['adviced_course'] = float(adviced_course)
@@ -390,19 +418,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             tx_world, ty_world = None, None
             if costmap_ready and target_lat is not None:
                 hybrid_local_target = None  # Reset
-
-                # We project the target up to 10 meters away (edge of our cropped costmap)
-                # so A* can actually "see" the obstacles and plan around them, rather than
-                # being blindfolded at 1.5m. If we are closer to the target than 10m, we just use the real distance.
-                # Use local variable hedefe_mesafe calculated on line 383
-                try:
-                    hedefe_mesafe_safe = float(hedefe_mesafe)
-                except:
-                    hedefe_mesafe_safe = 10.0
-
-                gps_lookahead = min(10.0, hedefe_mesafe_safe)
-
-                # Project the global GPS bearing into the local ZED map frame
+                gps_lookahead = 1.5
                 tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
                 ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
 
@@ -516,18 +532,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     if ("TASK2" not in mevcut_gorev) or (time.time() - path_lost_time < 5.0):
                                         failsafe_active = True
 
-                                        # --- FIX: Spot Turn Jerking & Proximity Dampener ---
+                                        # --- FIX: Reintroduce spot turn if heading is severely off ---
                                         threshold = getattr(cfg, 'SPOT_TURN_THRESHOLD', 45.0)
-                                        try:
-                                            dist_to_target = float(hedefe_mesafe)
-                                        except:
-                                            dist_to_target = 10.0
 
-                                        # Disable hard Spot Turns if we are within 8 meters, to prevent oscillating/jerking
-                                        # when entering the final approach. Let PID handle it smoothly.
-                                        allow_spot_turn = dist_to_target > 8.0
-
-                                        if allow_spot_turn and abs(aci_farki) > threshold:
+                                        if abs(aci_farki) > threshold:
                                             spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
                                             if aci_farki > 0:  # Target Right
                                                 apply_motor_mixer(controller, 1500, spot_pwm)
@@ -541,24 +549,17 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                                 base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                             # Full PID controller for direct steering
-                                            kp = getattr(cfg, 'DIRECT_DRIVE_KP', 12.0)
-                                            ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.1)
-                                            kd = getattr(cfg, 'DIRECT_DRIVE_KD', 4.0)
+                                            kp = 2.0
+                                            ki = 0.05
+                                            kd = 0.5
 
                                             # Calculate terms
                                             error = aci_farki
 
-                                            # Proximity Dampener: If very close to the target (< 4 meters), the geometric
-                                            # angle explodes (being slightly off causes massive heading error jumps).
-                                            # We artificially clamp the error so the boat doesn't aggressively snap sideways.
-                                            if dist_to_target < 4.0:
-                                                error = max(-15.0, min(15.0, error))
-
                                             # --- 3-B UPDATE: Anti-Windup Logic ---
                                             # Only accumulate integral if the error is relatively small
                                             # This prevents massive windup when pushing against an obstacle or turning sharply
-                                            anti_windup_threshold = getattr(cfg, 'ANTI_WINDUP_DEG', 15.0)
-                                            if abs(error) < anti_windup_threshold:
+                                            if abs(error) < 15.0:
                                                 direct_drive_integral += error
                                             else:
                                                 # Optional: Reset or decay the integral when outside the linear region
