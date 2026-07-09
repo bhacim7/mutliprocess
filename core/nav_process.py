@@ -406,7 +406,6 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 else:
                     # Fallback to direct bearing if LOS is disabled or no start point
                     aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
-
         
                 shared_state['angle_error'] = float(aci_farki)
                 shared_state['adviced_course'] = float(adviced_course)
