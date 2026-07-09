@@ -386,7 +386,14 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     force_initial_alignment = True
                     prev_target_lat = target_lat
                     prev_target_lon = target_lon
-                    # Record the exact position where we started heading to this new target
+                    # Reset start_lat so we can capture it
+                    start_lat = None
+                    start_lon = None
+
+                # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
+                # This prevents the boat from drawing a line from the coast of Africa.
+                # It continually attempts to acquire the GPS coordinates if they were initially 0.0
+                if start_lat is None and ida_enlem != 0.0 and ida_boylam != 0.0:
                     start_lat = ida_enlem
                     start_lon = ida_boylam
 
@@ -397,7 +404,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # Line of Sight (LOS) Guidance Logic (for non-A* paths)
                 # If we have a valid start point, we create a virtual target (rabbit) on the line
                 # to correct for cross-track error.
-                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True):
+                # Fix 2: Disable LOS if we are within 6 meters of the target. This prevents the boat
+                # from doing a U-turn or steering wildly backwards if it slightly overshoots the line.
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 6.0:
                     # How far off the ideal line are we?
                     xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
 
