@@ -670,9 +670,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                         base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                     # Full PID controller for direct steering
-                                    kp = 2.0
+                                    kp = 4.0
                                     ki = 0.05
-                                    kd = 0.5
+                                    kd = 0.7
 
                                     # Calculate terms
                                     error = aci_farki
