@@ -335,6 +335,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             # Main State Router
             target_lat = None
             target_lon = None
+            skip_default_nav = False
 
             if "TASK1" in mevcut_gorev or mevcut_gorev == "FINISHED":
                 if mevcut_gorev == "FINISHED":
@@ -460,6 +461,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 apply_motor_mixer(controller, 1500, 0)
                                 t3_search_state = "PAN_LEFT"
                                 target_lat, target_lon = None, None
+
+                    skip_default_nav = True
                 else:
                     mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
 
@@ -567,7 +570,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     acil_durum_aktif_mi = False
 
                 # 2. Standard A* / Direct Drive
-                if target_lat is not None:
+                if not skip_default_nav and target_lat is not None:
                     # Initial alignment logic
                     if force_initial_alignment and abs(aci_farki) < 15.0:
                         force_initial_alignment = False
@@ -697,8 +700,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                     apply_motor_mixer(controller, base_pwm, steering_correction)
 
-                            else:
-                                apply_motor_mixer(controller, 1500, 0)
+                elif not skip_default_nav:
+                    apply_motor_mixer(controller, 1500, 0)
 
             # Record final PWMs
             # Note: We rely on the USVController object stub tracking state,
