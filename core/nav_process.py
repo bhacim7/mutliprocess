@@ -462,7 +462,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 t3_search_state = "PAN_LEFT"
                                 target_lat, target_lon = None, None
 
-                    skip_default_nav = True
+                    # Only skip default nav if we didn't set a GPS target to drive to during the search phase
+                    if target_lat is None:
+                        skip_default_nav = True
                 else:
                     mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
 
