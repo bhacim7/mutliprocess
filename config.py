@@ -63,7 +63,7 @@ MAX_PWM_CHANGE = 60
 HYBRID_STEP_DIST = 2.0
 HYBRID_HEADING_THRESHOLD = 30.0
 ENABLE_LOS_GUIDANCE = True
-LOS_KP = 1.5
+LOS_KP = 2.0
 
 # --- PURE PURSUIT (A* PATH FOLLOWING) ---
 PURE_PURSUIT_MIN_LOOKAHEAD = 1.0
@@ -95,7 +95,7 @@ T3_START_LON = 29.2622185
 T3_MID_LAT = 40.8096174
 T3_MID_LON = 29.2622489
 
-TASK3_KAMIKAZE_COLOR = "red"  # Options: "red", "green", "black"
+TASK3_KAMIKAZE_COLOR = "green"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = True  # Toggle if boat turns away from target
 
 MEVCUT_GOREV = "TASK2_START"
