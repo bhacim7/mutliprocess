@@ -1,7 +1,7 @@
 import socket
 import struct
-import pickle
 import cv2
+import numpy as np
 import threading  # Threading kütüphanesi eklendi
 
 
@@ -17,7 +17,7 @@ def client_handler(conn, addr):
         while True:
             # 1. Mesaj boyutunu al
             while len(data) < payload_size:
-                packet = conn.recv(4096)
+                packet = conn.recv(65536)
                 if not packet: break
                 data += packet
 
@@ -30,7 +30,7 @@ def client_handler(conn, addr):
 
             # 2. Asıl frame verisini al
             while len(data) < msg_size:
-                packet = conn.recv(4096)
+                packet = conn.recv(65536)
                 if not packet: break
                 data += packet
 
@@ -42,8 +42,8 @@ def client_handler(conn, addr):
 
             try:
                 # Veriyi çöz ve görüntüle
-                buffer = pickle.loads(frame_data)
-                frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+                nparr = np.frombuffer(frame_data, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                 if frame is not None:
                     # DİKKAT: Her istemcinin pencere adı farklı olmalı!

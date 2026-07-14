@@ -26,11 +26,10 @@ import threading
 import queue
 import socket
 import struct
-import pickle
 import cv2
 
 class AsyncStreamer(threading.Thread):
-    def __init__(self, ip, port=5000, max_queue=2):
+    def __init__(self, ip, port=5000, max_queue=5):
         super().__init__()
         self.ip = ip
         self.port = port
@@ -80,7 +79,7 @@ class AsyncStreamer(threading.Thread):
                         ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
                         
                         if ret:
-                            data = pickle.dumps(buffer)
+                            data = buffer.tobytes()
                             size_pack = struct.pack("!Q", len(data))
                             self.client_socket.sendall(size_pack + data)
                     except Exception as e:
