@@ -2420,13 +2420,16 @@ class MainWindow(QtWidgets.QMainWindow):
         g.setSpacing(4)
 
         ui = {}
-        keys = ["SOL_PWM", "SAĞ_PWM", "HIZ", "HDG",
-                "HEDEF_HDG", "HDG_SAG", "SONRAKİ", "KALAN",
-                "KONUM", "MANUEL", "ZAMAN", "FPS"]
+        keys = [
+            "SOL_PWM", "SAG_PWM", "ON_SOL_PWM", "ON_SAG_PWM",
+            "STEER_PWM", "HIZ", "HDG", "HEDEF_HDG",
+            "ACI_FARKI", "HEDEFE_MESAFE", "MEVCUT_GOREV", "MANUEL",
+            "ZAMAN", "FPS", "SENSOR_SAGLIK", "IDA_KONUM", "HEDEF_KONUM"
+        ]
 
         for i, k in enumerate(keys):
-            row = i // 4
-            col_base = (i % 4) * 2
+            row = i // 2
+            col_base = (i % 2) * 2
 
             # --- DEĞİŞİKLİK BURADA: BAŞLIKLAR ARTIK KALIN ---
             lbl_title = QtWidgets.QLabel(k)
@@ -2973,24 +2976,36 @@ class MainWindow(QtWidgets.QMainWindow):
                     txt = txt[:10] + ".."
                 ui[k].setText(txt)
 
-        s("SOL_PWM", "pwm_L");
-        s("SAĞ_PWM", "pwm_R")
-        s("HIZ", "spd");
-        s("HDG", "hdg");
+        s("SOL_PWM", "pwm_L")
+        s("SAG_PWM", "pwm_R")
+        s("ON_SOL_PWM", "pwm_FL")
+        s("ON_SAG_PWM", "pwm_FR")
+        s("STEER_PWM", "pwm_STEER")
+        s("HIZ", "spd")
+        s("HDG", "hdg")
         s("HEDEF_HDG", "trg_hdg")
-        s("HDG_SAG", "hlth");
-        s("SONRAKİ", "task");
-        s("KALAN", "dist")
-        s("MANUEL", "mod");
-        s("ZAMAN", "t_ms");
+        s("ACI_FARKI", "err_ang")
+        s("HEDEFE_MESAFE", "dist")
+        s("MEVCUT_GOREV", "task")
+        s("MANUEL", "mod")
+        s("ZAMAN", "t_ms")
         s("FPS", "FPS")
+        s("SENSOR_SAGLIK", "hlth")
 
         pos = d.get("MEVCUT_KONUM", {})
-        lat = pos.get("lat", 0.0);
+        lat = pos.get("lat", 0.0)
         lon = pos.get("lon", 0.0)
         if lat and lon:
-            ui["KONUM"].setText(
-                f"{lat:.5f},\n{lon:.5f}")  # \n ile alt satıra atarsak daha az yer kaplar
+            ui["IDA_KONUM"].setText(f"{lat:.5f},\n{lon:.5f}")
+
+        t_pos = d.get("HEDEF_KONUM", {})
+        t_lat = t_pos.get("lat", 0.0)
+        t_lon = t_pos.get("lon", 0.0)
+        if t_lat and t_lon:
+            ui["HEDEF_KONUM"].setText(f"{t_lat:.5f},\n{t_lon:.5f}")
+
+        if lat and lon:
+
             # Yazı boyutunu biraz küçültelim ki sığsın
             self.map.update_current_position(lat, lon, boat_id=bid)
             # Log

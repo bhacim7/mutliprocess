@@ -209,6 +209,14 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         if new_task:
                             shared_state['current_task'] = new_task
                             print(f"[NAV_PROCESS] Task updated to {new_task}")
+                    elif cmd_str == "set_manual":
+                        val = cmd.get("value")
+                        if val is True:
+                            shared_state['manual_mode'] = True
+                            print("[NAV_PROCESS] 🎮 Switched to MANUAL mode.")
+                        elif val is False:
+                            shared_state['manual_mode'] = False
+                            print("[NAV_PROCESS] 🤖 Switched to AUTO mode.")
             except:
                 pass
 
