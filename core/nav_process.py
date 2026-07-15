@@ -21,23 +21,15 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     base = getattr(cfg, 'BASE_PWM', 1500)
 
     # 1. Yaw Effort mappings
-    # Convert the Deadband from Degrees into a rough PWM equivalent.
-    # If a full 90-degree error maps to a ~400 PWM correction, 15 degrees is roughly ~65 PWM.
-    deadband_deg = getattr(cfg, 'STEER_DEADBAND_DEG', 15.0)
-    deadband_pwm = deadband_deg * (400.0 / 90.0)
-
     # Map Yaw to Steering Servo (Direct proportion)
     steer_out = base + yaw_pwm
     steer_max = getattr(cfg, 'STEER_MAX_PWM', 1900)
     steer_min = getattr(cfg, 'STEER_MIN_PWM', 1100)
     steer_out = np.clip(steer_out, steer_min, steer_max)
 
-    # 2. Differential Thrust (Only applied if outside deadband)
-    diff_thrust = 0
-    if abs(yaw_pwm) > deadband_pwm:
-        # Scale the differential thrust based on how far past the deadband we are
-        # (Yaw > 0 means turning Right)
-        diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
+    # 2. Differential Thrust (Continuous micro-corrections, removed deadband)
+    # Applying differential thrust continuously prevents lateral drift by fighting wind/current smoothly
+    diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
@@ -498,7 +490,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # to correct for cross-track error.
                 # Fix 2: Disable LOS if we are within 6 meters of the target. This prevents the boat
                 # from doing a U-turn or steering wildly backwards if it slightly overshoots the line.
-                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 6.0:
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 2.0:
                     # How far off the ideal line are we?
                     xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
 
@@ -634,7 +626,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                             # Pure pursuit now returns base_speed and steering_correction instead of left/right pwms
                             p_base, p_steer, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
-                                robot_x, robot_y, robot_yaw, current_path, current_speed=0, base_speed=base_pwm,
+                                robot_x, robot_y, robot_yaw, current_path, current_speed=base_pwm - 1500, base_speed=base_pwm,
                                 prev_error=prev_heading_error)
 
                             current_path = pruned_path
@@ -670,9 +662,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                         base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                     # Full PID controller for direct steering
-                                    kp = 2.0
-                                    ki = 0.05
-                                    kd = 0.5
+                                    kp = getattr(cfg, 'DIRECT_DRIVE_KP', 1.5)
+                                    ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.05)
+                                    kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
 
                                     # Calculate terms
                                     error = aci_farki
@@ -680,16 +672,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     # --- 3-B UPDATE: Anti-Windup Logic ---
                                     # Only accumulate integral if the error is relatively small
                                     # This prevents massive windup when pushing against an obstacle or turning sharply
-                                    if abs(error) < 15.0:
+                                    anti_windup_deg = getattr(cfg, 'ANTI_WINDUP_DEG', 15.0)
+                                    if abs(error) < anti_windup_deg:
                                         direct_drive_integral += error
                                     else:
                                         # Optional: Reset or decay the integral when outside the linear region
                                         direct_drive_integral *= 0.9
 
+                                    # Add natural decay if error crosses zero (sign change) to prevent residual windup
+                                    if (error > 0 and direct_drive_integral < 0) or (error < 0 and direct_drive_integral > 0):
+                                        direct_drive_integral *= 0.5
+
                                     # Integral windup hard limit
-                                    windup_limit = 500.0
-                                    direct_drive_integral = max(-windup_limit,
-                                                                min(windup_limit, direct_drive_integral))
+                                    windup_limit = getattr(cfg, 'ANTI_WINDUP_LIMIT', 500.0)
+                                    direct_drive_integral = max(-windup_limit, min(windup_limit, direct_drive_integral))
                                     # -------------------------------------
 
                                     derivative = error - direct_drive_prev_error
