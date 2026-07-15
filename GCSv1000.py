@@ -2423,7 +2423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         keys = [
             "SOL_PWM", "SAG_PWM", "ON_SOL_PWM", "ON_SAG_PWM",
             "STEER_PWM", "HIZ", "HDG", "HEDEF_HDG",
-            "ACI_FARKI", "HEDEFE_MESAFE", "MEVCUT_GOREV", "MANUEL",
+            "ACI_FARKI", "KONTROL_HATA", "HEDEFE_MESAFE", "MEVCUT_GOREV", "MANUEL",
             "ZAMAN", "FPS", "SENSOR_SAGLIK", "IDA_KONUM", "HEDEF_KONUM"
         ]
 

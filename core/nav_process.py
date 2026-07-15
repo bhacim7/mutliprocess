@@ -499,9 +499,22 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # Line of Sight (LOS) Guidance Logic (for non-A* paths)
                 # If we have a valid start point, we create a virtual target (rabbit) on the line
                 # to correct for cross-track error.
-                # Fix 2: Disable LOS if we are within 6 meters of the target. This prevents the boat
+                # Fix 2: Disable LOS dynamically based on speed. This prevents the boat
                 # from doing a U-turn or steering wildly backwards if it slightly overshoots the line.
-                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 3.5:
+
+                # Dynamic speed factor calculation
+                base_pwm_current = getattr(cfg, 'BASE_PWM', 1500)
+                if "TASK3" in mevcut_gorev or mevcut_gorev.startswith("T3_"):
+                    base_pwm_current += getattr(cfg, 'T3_SPEED_PWM', 100)
+                else:
+                    base_pwm_current += getattr(cfg, 'CRUISE_PWM', 80)
+
+                speed_factor = max(0.0, (base_pwm_current - 1500) / 100.0)
+
+                # Dynamic LOS cutoff distance (e.g., 3.5m at base speed, ~8m at high speed)
+                dynamic_los_cutoff = 3.5 + (speed_factor * 1.5)
+
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > dynamic_los_cutoff:
                     # How far off the ideal line are we?
                     xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
 
@@ -517,6 +530,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     k_los = getattr(cfg, 'LOS_KP', 1.5)
                     # Inverse tangent creates a smooth S-curve back to the line
                     correction_angle = math.degrees(math.atan2(k_los * xte, los_lookahead))
+
+                    # HARD CLAMP: Prevent massive skidding. Never ask the boat to turn more than 30 degrees sideways
+                    correction_angle = max(-30.0, min(30.0, correction_angle))
 
                     # The new desired heading points back to the line, rather than straight at the target
                     los_heading = (path_bearing - correction_angle) % 360
@@ -679,7 +695,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     # Full PID controller for direct steering
                                     kp = getattr(cfg, 'DIRECT_DRIVE_KP', 1.5)
                                     ki = getattr(cfg, 'DIRECT_DRIVE_KI', 0.05)
-                                    kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
+
+                                    # Dynamic KD scaling for high speed momentum braking
+                                    base_kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
+                                    speed_factor_pid = max(0.0, (base_pwm - 1500) / 100.0)
+                                    kd = base_kd + (speed_factor_pid * 0.3)
 
                                     # Calculate terms
                                     error = control_error
