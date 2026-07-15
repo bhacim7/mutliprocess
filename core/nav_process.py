@@ -358,7 +358,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             elif "TASK2" in mevcut_gorev:
                 mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
 
-            elif "T3" in mevcut_gorev or mevcut_gorev == "TASK3_APPROACH":
+            elif "T3" in mevcut_gorev or "TASK3" in mevcut_gorev:
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
                     target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
@@ -680,9 +680,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                         base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                                     # Full PID controller for direct steering
-                                    kp = 4.0
+                                    kp = 3.0
                                     ki = 0.05
-                                    kd = 0.7
+                                    kd = 0.6
 
                                     # Calculate terms
                                     error = aci_farki
