@@ -500,7 +500,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # to correct for cross-track error.
                 # Fix 2: Disable LOS if we are within 6 meters of the target. This prevents the boat
                 # from doing a U-turn or steering wildly backwards if it slightly overshoots the line.
-                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 2.0:
+                if start_lat is not None and start_lon is not None and getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and hedefe_mesafe > 3.5:
                     # How far off the ideal line are we?
                     xte = nav.calculate_cross_track_error(start_lat, start_lon, ida_enlem, ida_boylam, target_lat, target_lon)
 
