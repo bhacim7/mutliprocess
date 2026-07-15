@@ -473,6 +473,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
             # --- F. NAVIGATION CALCULATIONS & HYBRID LOGIC ---
             aci_farki = 0.0
+            control_error = 0.0
             adviced_course = 0.0
 
             if target_lat is not None:
@@ -520,13 +521,17 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     # The new desired heading points back to the line, rather than straight at the target
                     los_heading = (path_bearing - correction_angle) % 360
 
-                    # Update aci_farki to chase the LOS heading instead of the direct bearing
-                    aci_farki = nav.signed_angle_difference(magnetic_heading, los_heading)
+                    # Update control_error to chase the LOS heading
+                    control_error = nav.signed_angle_difference(magnetic_heading, los_heading)
+                    # Keep aci_farki pure for target bearing
+                    aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
                 else:
                     # Fallback to direct bearing if LOS is disabled or no start point
                     aci_farki = nav.signed_angle_difference(magnetic_heading, adviced_course)
+                    control_error = aci_farki
 
                 shared_state['angle_error'] = float(aci_farki)
+                shared_state['control_error'] = float(control_error)
                 shared_state['adviced_course'] = float(adviced_course)
                 shared_state['target_dist'] = float(hedefe_mesafe)
                 shared_state['target_lat'] = float(target_lat)
@@ -677,7 +682,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     kd = getattr(cfg, 'DIRECT_DRIVE_KD', 0.8)
 
                                     # Calculate terms
-                                    error = aci_farki
+                                    error = control_error
 
                                     # --- 3-B UPDATE: Anti-Windup Logic ---
                                     # Only accumulate integral if the error is relatively small
