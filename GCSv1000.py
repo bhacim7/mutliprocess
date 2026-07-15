@@ -2985,6 +2985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s("HDG", "hdg")
         s("HEDEF_HDG", "trg_hdg")
         s("ACI_FARKI", "err_ang")
+        s("KONTROL_HATA", "ctrl_err")
         s("HEDEFE_MESAFE", "dist")
         s("MEVCUT_GOREV", "task")
         s("MANUEL", "mod")

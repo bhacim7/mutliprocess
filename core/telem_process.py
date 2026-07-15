@@ -73,6 +73,7 @@ def telem_worker(shared_state, command_queue, hf_data):
                     "hdg": f"{heading:.0f}" if heading is not None else "0",
                     "trg_hdg": shared_state.get('adviced_course', 0.0),
                     "err_ang": shared_state.get('angle_error', 0.0),
+                    "ctrl_err": shared_state.get('control_error', 0.0),
                     "hlth": "GOOD", # Simplified for now, or read from shared state
                     "task": mevcut_gorev,
                     "objects": objects, # Lightweight dicts, safe to serialize

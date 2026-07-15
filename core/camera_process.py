@@ -468,6 +468,7 @@ def camera_worker(shared_state, hf_data):
                 dist = shared_state.get('target_dist', 0.0)
                 adv_crs = shared_state.get('adviced_course', 0.0)
                 err_ang = shared_state.get('angle_error', 0.0)
+                ctrl_err = shared_state.get('control_error', 0.0)
                 hdg = hf_data['magnetic_heading'].value
                 lat = hf_data['gps_lat'].value
                 lon = hf_data['gps_lon'].value
@@ -509,6 +510,7 @@ def camera_worker(shared_state, hf_data):
                 draw_text(f"HDG: {hdg:.0f}", x_r, y_r, c_yellow); y_r += 30
                 draw_text(f"HEDEF_HDG: {adv_crs:.0f}", x_r, y_r, c_orange); y_r += 30
                 draw_text(f"ACI_FARKI: {err_ang:.0f}", x_r, y_r, c_yellow); y_r += 30
+                draw_text(f"KONTROL_HATA: {ctrl_err:.0f}", x_r, y_r, c_yellow); y_r += 30
                 draw_text(f"HEDEFE_MESAFE: {dist:.1f}", x_r, y_r, c_red); y_r += 30
 
                 y_r += 20
