@@ -29,7 +29,10 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
 
     # 2. Differential Thrust (Continuous micro-corrections, removed deadband)
     # Applying differential thrust continuously prevents lateral drift by fighting wind/current smoothly
-    diff_thrust = yaw_pwm * 1.0  # Slight dampening factor for thruster diff
+    # Dynamic multiplier: Boosts differential thrust at lower speeds where the steering servo is hydrodynamically weak.
+    # At 1500 (stopped), multiplier is 2.0. At 1700 (CRUISE_PWM=200), multiplier is ~1.4. At 1850+ (max speed), multiplier is 1.0.
+    diff_multiplier = 1.0 + max(0.0, (1850.0 - forward_pwm) / 350.0)
+    diff_thrust = yaw_pwm * diff_multiplier
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
