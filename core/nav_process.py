@@ -201,6 +201,14 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         if new_task:
                             shared_state['current_task'] = new_task
                             print(f"[NAV_PROCESS] Task updated to {new_task}")
+                    elif cmd_str == "set_manual":
+                        val = cmd.get("value")
+                        if val is True:
+                            shared_state['manual_mode'] = True
+                            print("[NAV_PROCESS] 🎮 Switched to MANUAL mode.")
+                        elif val is False:
+                            shared_state['manual_mode'] = False
+                            print("[NAV_PROCESS] 🤖 Switched to AUTO mode.")
             except:
                 pass
 
@@ -342,7 +350,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             elif "TASK2" in mevcut_gorev:
                 mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
 
-            elif "T3" in mevcut_gorev or mevcut_gorev == "TASK3_APPROACH":
+            elif "T3" in mevcut_gorev or "TASK3" in mevcut_gorev:
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
                     target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
@@ -454,7 +462,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 t3_search_state = "PAN_LEFT"
                                 target_lat, target_lon = None, None
 
-                    skip_default_nav = True
+                    # Only skip default nav if we didn't set a GPS target to drive to during the search phase
+                    if target_lat is None:
+                        skip_default_nav = True
                 else:
                     mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
 

@@ -26,11 +26,10 @@ import threading
 import queue
 import socket
 import struct
-import pickle
 import cv2
 
 class AsyncStreamer(threading.Thread):
-    def __init__(self, ip, port=5000, max_queue=2):
+    def __init__(self, ip, port=5000, max_queue=5):
         super().__init__()
         self.ip = ip
         self.port = port
@@ -80,7 +79,7 @@ class AsyncStreamer(threading.Thread):
                         ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
                         
                         if ret:
-                            data = pickle.dumps(buffer)
+                            data = buffer.tobytes()
                             size_pack = struct.pack("!Q", len(data))
                             self.client_socket.sendall(size_pack + data)
                     except Exception as e:
@@ -485,31 +484,39 @@ def camera_worker(shared_state, hf_data):
                 c_orange = (0, 165, 255)
                 c_magenta = (255, 0, 255)
 
-                # 3. SOL SÜTUN ÇİZİMİ
-                y = 30
-                cv2.putText(frame, datetime.datetime.now().strftime("%H:%M:%S"), (10, y), font, scale, c_red, thick); y += 30
-                cv2.putText(frame, f"FPS: {fps_val}", (10, y), font, scale, c_yellow, thick); y += 30
-                cv2.putText(frame, f"Gorev: {task}", (10, y), font, scale, c_red, thick); y += 60
-                
-                cv2.putText(frame, f"RL:{int(pwm_l)} RR:{int(pwm_r)}", (10, y), font, scale, c_red, thick); y += 30
-                cv2.putText(frame, f"FL:{int(pwm_fl)} FR:{int(pwm_fr)}", (10, y), font, scale, c_red, thick); y += 30
-                cv2.putText(frame, f"STEER:{int(pwm_steer)}", (10, y), font, scale, c_red, thick); y += 40
-                
+                # 3. YAZI ÇİZİMİ (SAF METİN - MAKSİMUM FPS)
+                def draw_text(text, x, y, text_color):
+                    cv2.putText(frame, text, (x, y), font, scale, text_color, thick)
 
-                # 4. SAĞ SÜTUN ÇİZİMİ
-                x_r = 450
+                # SOL SÜTUN ÇİZİMİ
+                y = 30
+                draw_text(f"ZAMAN: {datetime.datetime.now().strftime('%H:%M:%S')}", 10, y, c_red); y += 30
+                draw_text(f"FPS: {fps_val}", 10, y, c_yellow); y += 30
+                draw_text(f"MANUEL: {shared_state.get('manual_mode', False)}", 10, y, c_orange); y += 30
+                draw_text(f"MEVCUT_GOREV: {task}", 10, y, c_red); y += 30
+                
+                y += 20
+                draw_text(f"SOL_PWM: {int(pwm_l)}", 10, y, c_red); y += 30
+                draw_text(f"SAG_PWM: {int(pwm_r)}", 10, y, c_red); y += 30
+                draw_text(f"ON_SOL_PWM: {int(pwm_fl)}", 10, y, c_red); y += 30
+                draw_text(f"ON_SAG_PWM: {int(pwm_fr)}", 10, y, c_red); y += 30
+                draw_text(f"STEER_PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
+                
+                # SAĞ SÜTUN ÇİZİMİ
+                x_r = 900
                 y_r = 30
-                cv2.putText(frame, f"Hedefe mesafe: {dist:.2f}", (x_r, y_r), font, scale, c_red, thick); y_r += 30
-                cv2.putText(frame, f"Rota tavsiyesi: {adv_crs:.0f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"aci farki: {err_ang:.0f}", (x_r, y_r), font, scale, c_yellow, thick); y_r += 30
-                cv2.putText(frame, f"Heading: {hdg:.0f}", (x_r, y_r), font, scale, c_yellow, thick); y_r += 30
-                cv2.putText(frame, f"manyetometre durumu: GOOD", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"Heading dogrulugu: 0.9", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"GPS DURUMU: 3D Fix", (x_r, y_r), font, scale, c_red, thick); y_r += 30
-                cv2.putText(frame, f"ida enlem: {lat:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"ida boylam: {lon:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"hedef enlem: {t_lat:.6f}", (x_r, y_r), font, scale, c_orange, thick); y_r += 30
-                cv2.putText(frame, f"hedef boylam: {t_lon:.6f}", (x_r, y_r), font, scale, c_orange, thick)
+                draw_text(f"HIZ: {shared_state.get('horizontal_speed', 0.0):.1f}", x_r, y_r, c_red); y_r += 30
+                draw_text(f"HDG: {hdg:.0f}", x_r, y_r, c_yellow); y_r += 30
+                draw_text(f"HEDEF_HDG: {adv_crs:.0f}", x_r, y_r, c_orange); y_r += 30
+                draw_text(f"ACI_FARKI: {err_ang:.0f}", x_r, y_r, c_yellow); y_r += 30
+                draw_text(f"HEDEFE_MESAFE: {dist:.1f}", x_r, y_r, c_red); y_r += 30
+
+                y_r += 20
+                draw_text(f"IDA_KONUM:", x_r, y_r, c_orange); y_r += 30
+                draw_text(f" {lat:.6f}, {lon:.6f}", x_r, y_r, c_orange); y_r += 30
+                draw_text(f"HEDEF_KONUM:", x_r, y_r, c_orange); y_r += 30
+                draw_text(f" {t_lat:.6f}, {t_lon:.6f}", x_r, y_r, c_orange); y_r += 30
+                draw_text(f"SENSOR_SAGLIK: GOOD", x_r, y_r, c_orange); y_r += 30
                 # -----------------------------------------------
 
                 # 4. VIDEO RECORDING
