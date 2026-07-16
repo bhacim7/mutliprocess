@@ -2216,7 +2216,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll1 = QtWidgets.QScrollArea();
         scroll1.setWidget(left_widget);
         scroll1.setWidgetResizable(True)
-        scroll1.setFixedWidth(380)
+        scroll1.setFixedWidth(500)
         splitter.addWidget(scroll1)
 
         # =========================================================
@@ -2421,8 +2421,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ui = {}
         keys = [
-            "SOL_PWM", "SAG_PWM", "ON_SOL_PWM", "ON_SAG_PWM",
-            "STEER_PWM", "HIZ", "HDG", "HEDEF_HDG",
+            "ARKA SOL PWM", "ARKA SAĞ PWM", "ÖN SOL PWM", "ÖN SAĞ PWM",
+            "DÜMEN PWM", "HIZ", "HDG", "HEDEF_HDG",
             "ACI_FARKI", "KONTROL_HATA", "HEDEFE_MESAFE", "MEVCUT_GOREV", "MANUEL",
             "ZAMAN", "FPS", "SENSOR_SAGLIK", "IDA_KONUM", "HEDEF_KONUM"
         ]
@@ -2976,11 +2976,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     txt = txt[:10] + ".."
                 ui[k].setText(txt)
 
-        s("SOL_PWM", "pwm_L")
-        s("SAG_PWM", "pwm_R")
-        s("ON_SOL_PWM", "pwm_FL")
-        s("ON_SAG_PWM", "pwm_FR")
-        s("STEER_PWM", "pwm_STEER")
+        s("ARKA SOL PWM", "pwm_L")
+        s("ARKA SAĞ PWM", "pwm_R")
+        s("ÖN SOL PWM", "pwm_FL")
+        s("ÖN SAĞ PWM", "pwm_FR")
+        s("DÜMEN PWM", "pwm_STEER")
         s("HIZ", "spd")
         s("HDG", "hdg")
         s("HEDEF_HDG", "trg_hdg")

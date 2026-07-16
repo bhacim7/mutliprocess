@@ -164,6 +164,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             hf_data['gps_lat'].value = ida_enlem
             hf_data['gps_lon'].value = ida_boylam
 
+            # Fetch and store horizontal speed
+            try:
+                shared_state['horizontal_speed'] = controller.get_horizontal_speed()
+            except AttributeError:
+                pass  # Fallback if get_horizontal_speed doesn't exist on dummy controller
+
             fc_hdg = controller.get_heading()
             if fc_hdg is not None:
                 shared_state['fc_heading'] = fc_hdg
