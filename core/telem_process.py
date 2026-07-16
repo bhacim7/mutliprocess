@@ -43,6 +43,7 @@ def telem_worker(shared_state, command_queue, hf_data):
             objects = shared_state.get('vision_detected_objects', [])
             manual_mode = shared_state.get('manual_mode', False)
 
+
             # In a real scenario, incoming commands from GCS (set_gps, emergency_stop, set_task)
             # would be read by the serial thread and pushed into command_queue for NavProcess to handle.
 
