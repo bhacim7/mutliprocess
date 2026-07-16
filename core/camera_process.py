@@ -500,11 +500,11 @@ def camera_worker(shared_state, hf_data):
                 draw_text(f"MEVCUT_GOREV: {task}", 10, y, c_red); y += 30
                 
                 y += 20
-                draw_text(f"ARKA SOL PWM: {int(pwm_l)}", 10, y, c_red); y += 30
-                draw_text(f"ARKA SAG PWM: {int(pwm_r)}", 10, y, c_red); y += 30
-                draw_text(f"ON SOL PWM: {int(pwm_fl)}", 10, y, c_red); y += 30
-                draw_text(f"ON SAG PWM: {int(pwm_fr)}", 10, y, c_red); y += 30
-                draw_text(f"DUMEN PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
+                draw_text(f"ARKA_SOL_PWM: {int(pwm_l)}", 10, y, c_red); y += 30
+                draw_text(f"ARKA_SAG_PWM: {int(pwm_r)}", 10, y, c_red); y += 30
+                draw_text(f"ON_SOL_PWM: {int(pwm_fl)}", 10, y, c_red); y += 30
+                draw_text(f"ON_SAG_PWM: {int(pwm_fr)}", 10, y, c_red); y += 30
+                draw_text(f"DUMEN_PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
                 
                 # SAĞ SÜTUN ÇİZİMİ
                 x_r = 900

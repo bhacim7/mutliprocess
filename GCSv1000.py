@@ -2421,8 +2421,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ui = {}
         keys = [
-            "ARKA SOL PWM", "ARKA SAĞ PWM", "ÖN SOL PWM", "ÖN SAĞ PWM",
-            "DÜMEN PWM", "HIZ", "HDG", "HEDEF_HDG",
+            "ARKA_SOL_PWM", "ARKA_SAĞ_PWM", "ÖN_SOL_PWM", "ÖN_SAĞ_PWM",
+            "DÜMEN_PWM", "HIZ", "HDG", "HEDEF_HDG",
             "ACI_FARKI", "KONTROL_HATA", "HEDEFE_MESAFE", "MEVCUT_GOREV", "MANUEL",
             "ZAMAN", "FPS", "SENSOR_SAGLIK", "IDA_KONUM", "HEDEF_KONUM"
         ]
@@ -2976,11 +2976,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     txt = txt[:10] + ".."
                 ui[k].setText(txt)
 
-        s("ARKA SOL PWM", "pwm_L")
-        s("ARKA SAĞ PWM", "pwm_R")
-        s("ÖN SOL PWM", "pwm_FL")
-        s("ÖN SAĞ PWM", "pwm_FR")
-        s("DÜMEN PWM", "pwm_STEER")
+        s("ARKA_SOL_PWM", "pwm_L")
+        s("ARKA_SAĞ_PWM", "pwm_R")
+        s("ÖN_SOL_PWM", "pwm_FL")
+        s("ÖN_SAĞ_PWM", "pwm_FR")
+        s("DÜMEN_PWM", "pwm_STEER")
         s("HIZ", "spd")
         s("HDG", "hdg")
         s("HEDEF_HDG", "trg_hdg")
