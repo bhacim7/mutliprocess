@@ -2437,7 +2437,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # font-weight: bold ekledik ve rengi açtık (#cfd8dc)
             lbl_title.setStyleSheet("""
                 color: #cfd8dc; 
-                font-size: 9px; 
+                font-size: 14px;
                 font-weight: bold; 
                 margin-right: 2px; 
                 border: none;
@@ -2451,7 +2451,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl_val.setStyleSheet("""
                             color: #00e5ff; 
                             font-weight: bold; 
-                            font-size: 8px; 
+                            font-size: 14px;
                             border: none;
                             background-color: rgba(0, 0, 0, 40);
                             border-radius: 3px;
