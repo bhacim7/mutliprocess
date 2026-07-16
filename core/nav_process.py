@@ -356,48 +356,25 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 return task_state, None, None
 
-            def execute_gps_mission(task_state, lat, lon):
-                targets = {
-                    "GPS1": (getattr(cfg, 'T1_GATE_ENTER_LAT', 0), getattr(cfg, 'T1_GATE_ENTER_LON', 0), "GPS2"),
-                    "GPS2": (getattr(cfg, 'T1_GATE_MID_LAT', 0), getattr(cfg, 'T1_GATE_MID_LON', 0), "GPS3"),
-                    "GPS3": (getattr(cfg, 'T1_GATE_EXIT_LAT', 0), getattr(cfg, 'T1_GATE_EXIT_LON', 0), "GPS4"),
-                    "GPS4": (getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0), getattr(cfg, 'T2_ZONE_ENTRY_LON', 0), "FINISHED")
-                }
-
-                if task_state in targets:
-                    t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
-                        task_state = next_state
-                    return task_state, t_lat, t_lon
-
-                return task_state, None, None
-
             # Main State Router
             target_lat = None
             target_lon = None
             skip_default_nav = False
 
-            if mevcut_gorev == "FINISHED":
-                if not finished_printed:
-                    print("[MISSION] ALL TASKS COMPLETE")
-                    finished_printed = True
+            if "TASK1" in mevcut_gorev or mevcut_gorev == "FINISHED":
+                if mevcut_gorev == "FINISHED":
+                    if not finished_printed:
+                        print("[MISSION] ALL TASKS COMPLETE")
+                        finished_printed = True
+                    apply_motor_mixer(controller, 1500, 0)
 
-                # Fulfill the requirement of switching to manual mode upon completion
-                shared_state['manual_mode'] = True
-                apply_motor_mixer(controller, 1500, 0)
+                else:
+                    mevcut_gorev, target_lat, target_lon = execute_task1(mevcut_gorev, ida_enlem, ida_boylam)
 
-            elif "GPS" in mevcut_gorev:
-                mevcut_gorev, target_lat, target_lon = execute_gps_mission(mevcut_gorev, ida_enlem, ida_boylam)
+            elif "TASK2" in mevcut_gorev:
+                mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
 
-            # --- OLD MISSION LOGIC COMMENTED OUT FOR BACKUP ---
-            # elif "TASK1" in mevcut_gorev:
-            #     mevcut_gorev, target_lat, target_lon = execute_task1(mevcut_gorev, ida_enlem, ida_boylam)
-            #
-            # elif "TASK2" in mevcut_gorev:
-            #     mevcut_gorev, target_lat, target_lon = execute_task2(mevcut_gorev, ida_enlem, ida_boylam)
-            #
-            # elif "T3" in mevcut_gorev or "TASK3" in mevcut_gorev:
-            elif False: # Disabled Task 3 logic
+            elif "T3" in mevcut_gorev or "TASK3" in mevcut_gorev:
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
                     target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
