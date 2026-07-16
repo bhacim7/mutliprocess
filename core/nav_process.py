@@ -29,10 +29,18 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
 
     # 2. Differential Thrust (Continuous micro-corrections, removed deadband)
     # Applying differential thrust continuously prevents lateral drift by fighting wind/current smoothly
-    # Dynamic multiplier: Boosts differential thrust at lower speeds where the steering servo is hydrodynamically weak.
-    # At 1500 (stopped), multiplier is 2.0. At 1700 (CRUISE_PWM=200), multiplier is ~1.4. At 1850+ (max speed), multiplier is 1.0.
-    diff_multiplier = 1.0 + max(0.0, (1850.0 - forward_pwm) / 350.0)
-    diff_thrust = yaw_pwm * diff_multiplier
+
+    # Check if we are doing a pure spot turn (stationary)
+    is_spot_turn = (forward_pwm == 1500 and yaw_pwm != 0)
+
+    if is_spot_turn:
+        # Disable dynamic multiplier for pure spot turns so we don't multiply max outputs
+        diff_thrust = yaw_pwm * 1.0
+    else:
+        # Dynamic multiplier: Boosts differential thrust at lower speeds where the steering servo is hydrodynamically weak.
+        # At 1500 (stopped), multiplier is 2.0. At 1700 (CRUISE_PWM=200), multiplier is ~1.4. At 1850+ (max speed), multiplier is 1.0.
+        diff_multiplier = 1.0 + max(0.0, (1850.0 - forward_pwm) / 350.0)
+        diff_thrust = yaw_pwm * diff_multiplier
 
     # 3. Calculate Individual Thrusters
     # Evasive Braking override: If we are actively braking (reverse thrust),
@@ -42,13 +50,20 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
         rear_right = int(forward_pwm)
         front_left = int(forward_pwm)
         front_right = int(forward_pwm)
+    elif is_spot_turn:
+        # Pure Pivot: Front and rear motors must use identical differential thrust
+        # to ensure the boat twists perfectly around its center without moving backward.
+        rear_left = int(forward_pwm + diff_thrust)
+        rear_right = int(forward_pwm - diff_thrust)
+        front_left = int(forward_pwm + diff_thrust)
+        front_right = int(forward_pwm - diff_thrust)
     else:
-        # Standard turning
+        # Standard turning (forward movement)
         # Right turn (yaw_pwm > 0): Left motors spin faster, Right motors slower
         rear_left = int(forward_pwm + diff_thrust)
         rear_right = int(forward_pwm - diff_thrust)
 
-        # Front thrusters (keep forward effort high, apply smaller diff)
+        # Front thrusters (keep forward effort high, apply smaller diff to prevent crab-walking)
         front_left = int(forward_pwm + (diff_thrust * 0.5))
         front_right = int(forward_pwm - (diff_thrust * 0.5))
 
