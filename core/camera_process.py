@@ -473,6 +473,7 @@ def camera_worker(shared_state, hf_data):
                 pwm_fl = shared_state.get('motor_pwm_front_left', 1500)
                 pwm_fr = shared_state.get('motor_pwm_front_right', 1500)
                 pwm_steer = shared_state.get('motor_pwm_steer', 1500)
+                shared_state['camera_fps'] = fps_val
 
                 # Navigasyon Verileri
                 dist = shared_state.get('target_dist', 0.0)
