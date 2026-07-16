@@ -28,6 +28,7 @@ import socket
 import struct
 import cv2
 
+
 class AsyncStreamer(threading.Thread):
     def __init__(self, ip, port=5000, max_queue=5):
         super().__init__()
@@ -36,12 +37,12 @@ class AsyncStreamer(threading.Thread):
         self.q = queue.Queue(maxsize=max_queue)
         self.client_socket = None
         self.running = True
-        
+
         # Soket bağlantısını başlat
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             # Zaman aşımı ekleyelim ki bağlantı koptuğunda sistemi kitlemesin
-            self.client_socket.settimeout(2.0) 
+            self.client_socket.settimeout(2.0)
             self.client_socket.connect((self.ip, self.port))
             # Bağlandıktan sonra timeout'u kaldır ki büyük verilerde kopmasın
             self.client_socket.settimeout(None)
@@ -55,7 +56,7 @@ class AsyncStreamer(threading.Thread):
         if self.running and self.client_socket:
             if self.q.full():
                 try:
-                    self.q.get_nowait() # En eski kareyi çöpe at (Drop frame)
+                    self.q.get_nowait()  # En eski kareyi çöpe at (Drop frame)
                 except queue.Empty:
                     pass
             try:
@@ -65,27 +66,27 @@ class AsyncStreamer(threading.Thread):
 
     def run(self):
         """Arka planda sürekli kuyruktan frame alıp Wi-Fi üzerinden yollar."""
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40] # Kalite %40
-        
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40]  # Kalite %40
+
         while self.running:
             try:
                 # 0.1 saniye timeout ile kuyruktan kare bekle
-                frame = self.q.get(timeout=0.1) 
-                
+                frame = self.q.get(timeout=0.1)
+
                 if self.client_socket:
                     try:
                         # Görüntüyü küçült ve sıkıştır (Bu işlem artık ana kamerayı yavaşlatmaz!)
                         stream_frame = cv2.resize(frame, (640, 360))
                         ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
-                        
+
                         if ret:
                             data = buffer.tobytes()
                             size_pack = struct.pack("!Q", len(data))
                             self.client_socket.sendall(size_pack + data)
                     except Exception as e:
                         print(f"[STREAMER] Connection lost during send: {e}")
-                        self.client_socket = None # Koptuysa bir daha göndermeyi deneme
-                        
+                        self.client_socket = None  # Koptuysa bir daha göndermeyi deneme
+
                 self.q.task_done()
             except queue.Empty:
                 continue
@@ -97,8 +98,10 @@ class AsyncStreamer(threading.Thread):
         if self.client_socket:
             try:
                 self.client_socket.close()
-            except: pass
+            except:
+                pass
         self.join()
+
 
 class ObjectMemoryManager:
     def __init__(self):
@@ -159,6 +162,7 @@ class ObjectMemoryManager:
             })
             return new_id, lat, lon
 
+
 class ProtoEnum:
     OBJECT_UNKNOWN = 0
     OBJECT_BOAT = 1
@@ -179,6 +183,7 @@ class ProtoEnum:
     TASK_DOCKING = 6
     TASK_SOUND_SIGNAL = 7
 
+
 TASK_CONTEXT_MAP = {
     "TASK1_STATE_ENTER": ProtoEnum.TASK_NONE,
     "TASK1_STATE_MID": ProtoEnum.TASK_ENTRY_EXIT,
@@ -190,11 +195,12 @@ TASK_CONTEXT_MAP = {
     "T3_START": ProtoEnum.TASK_NONE,
     "T3_MID": ProtoEnum.TASK_SPEED_CHALLENGE,
     "TASK3_SEARCH_KAMIKAZE": ProtoEnum.TASK_SPEED_CHALLENGE,
-    "GPS1": ProtoEnum.TASK_NONE,
-    "GPS2": ProtoEnum.TASK_ENTRY_EXIT,
-    "GPS3": ProtoEnum.TASK_ENTRY_EXIT,
-    "GPS4": ProtoEnum.TASK_NONE
+    #"GPS1": ProtoEnum.TASK_NONE,
+    #"GPS2": ProtoEnum.TASK_ENTRY_EXIT,
+    #"GPS3": ProtoEnum.TASK_ENTRY_EXIT,
+    #"GPS4": ProtoEnum.TASK_NONE
 }
+
 
 def camera_worker(shared_state, hf_data):
     """
@@ -222,7 +228,7 @@ def camera_worker(shared_state, hf_data):
         model = YOLO(model_path)
 
     try:
-        #model.to('cuda').half()
+        # model.to('cuda').half()
         print("[CAM_PROCESS] Model loaded in FP16 mode.")
     except Exception as e:
         print(f"[CAM_PROCESS] Model GPU error: {e}")
@@ -405,7 +411,7 @@ def camera_worker(shared_state, hf_data):
                             # Use the median depth to reject extreme outliers (like NaN or Inf points)
                             dist_m = float(np.median(depth_values))
                         else:
-                            dist_m = float('inf') # Invalid depth
+                            dist_m = float('inf')  # Invalid depth
 
                         if not np.isnan(dist_m) and not np.isinf(dist_m) and 0.5 < dist_m < 15.0:
                             pixel_offset = (cx - (width / 2)) / width
@@ -435,11 +441,11 @@ def camera_worker(shared_state, hf_data):
 
                                 # Draw Bounding Box and Label
                                 color_map = {
-                                    0: (0, 0, 255),    # Red
+                                    0: (0, 0, 255),  # Red
                                     1: (0, 255, 255),  # Yellow
-                                    2: (0, 0, 0),      # Black
+                                    2: (0, 0, 0),  # Black
                                     3: (0, 165, 255),  # Orange
-                                    4: (0, 255, 0)     # Green
+                                    4: (0, 255, 0)  # Green
                                 }
                                 label_map = {
                                     0: "Red",
@@ -449,16 +455,16 @@ def camera_worker(shared_state, hf_data):
                                     4: "Green"
                                 }
 
-                                # box_color = color_map.get(cid, (255, 255, 255))
-                                # label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                                 box_color = color_map.get(cid, (255, 255, 255))
+                                 label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                # cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                # cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
 
                 import datetime
-                
+
                 # 1. Verileri Paylaşımlı Bellekten Çek
                 fps_val = round(zed.get_current_fps()) if 'zed' in locals() else 0
                 task = shared_state.get('current_task', 'UNKNOWN')
@@ -467,7 +473,7 @@ def camera_worker(shared_state, hf_data):
                 pwm_fl = shared_state.get('motor_pwm_front_left', 1500)
                 pwm_fr = shared_state.get('motor_pwm_front_right', 1500)
                 pwm_steer = shared_state.get('motor_pwm_steer', 1500)
-                
+
                 # Navigasyon Verileri
                 dist = shared_state.get('target_dist', 0.0)
                 adv_crs = shared_state.get('adviced_course', 0.0)
@@ -486,7 +492,7 @@ def camera_worker(shared_state, hf_data):
                 c_red = (0, 0, 255)
                 c_yellow = (255, 255, 0)  # Cyan for better contrast
                 c_green = (0, 255, 0)
-                c_orange = (255, 255, 255) # Pure White for better contrast
+                c_orange = (255, 255, 255)  # Pure White for better contrast
                 c_magenta = (255, 0, 255)
 
                 # 3. YAZI ÇİZİMİ (GÖLGELİ METİN - MAKSİMUM FPS)
@@ -498,40 +504,60 @@ def camera_worker(shared_state, hf_data):
 
                 # SOL SÜTUN ÇİZİMİ
                 y = 30
-                draw_text(f"ZAMAN: {datetime.datetime.now().strftime('%H:%M:%S')}", 10, y, c_red); y += 30
-                draw_text(f"FPS: {fps_val}", 10, y, c_yellow); y += 30
-                draw_text(f"MANUEL: {shared_state.get('manual_mode', False)}", 10, y, c_orange); y += 30
-                draw_text(f"MEVCUT_GOREV: {task}", 10, y, c_red); y += 30
-                
+                draw_text(f"ZAMAN: {datetime.datetime.now().strftime('%H:%M:%S')}", 10, y, c_red);
+                y += 30
+                draw_text(f"FPS: {fps_val}", 10, y, c_yellow);
+                y += 30
+                draw_text(f"MANUEL: {shared_state.get('manual_mode', False)}", 10, y, c_orange);
+                y += 30
+                draw_text(f"MEVCUT_GOREV: {task}", 10, y, c_red);
+                y += 30
+
                 y += 20
-                draw_text(f"ARKA_SOL_PWM: {int(pwm_l)}", 10, y, c_red); y += 30
-                draw_text(f"ARKA_SAG_PWM: {int(pwm_r)}", 10, y, c_red); y += 30
-                draw_text(f"ON_SOL_PWM: {int(pwm_fl)}", 10, y, c_red); y += 30
-                draw_text(f"ON_SAG_PWM: {int(pwm_fr)}", 10, y, c_red); y += 30
-                draw_text(f"DUMEN_PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
-                
+                draw_text(f"ARKA_SOL_PWM: {int(pwm_l)}", 10, y, c_red);
+                y += 30
+                draw_text(f"ARKA_SAG_PWM: {int(pwm_r)}", 10, y, c_red);
+                y += 30
+                draw_text(f"ON_SOL_PWM: {int(pwm_fl)}", 10, y, c_red);
+                y += 30
+                draw_text(f"ON_SAG_PWM: {int(pwm_fr)}", 10, y, c_red);
+                y += 30
+                draw_text(f"DUMEN_PWM: {int(pwm_steer)}", 10, y, c_red);
+                y += 30
+
                 # SAĞ SÜTUN ÇİZİMİ
                 x_r = 900
                 y_r = 30
-                draw_text(f"HIZ: {shared_state.get('horizontal_speed', 0.0):.1f}", x_r, y_r, c_red); y_r += 30
-                draw_text(f"HDG: {hdg:.0f}", x_r, y_r, c_yellow); y_r += 30
-                draw_text(f"HEDEF_HDG: {adv_crs:.0f}", x_r, y_r, c_orange); y_r += 30
-                draw_text(f"ACI_FARKI: {err_ang:.0f}", x_r, y_r, c_yellow); y_r += 30
-                draw_text(f"KONTROL_HATA: {ctrl_err:.0f}", x_r, y_r, c_yellow); y_r += 30
-                draw_text(f"HEDEFE_MESAFE: {dist:.1f}", x_r, y_r, c_red); y_r += 30
+                draw_text(f"HIZ: {shared_state.get('horizontal_speed', 0.0):.1f}", x_r, y_r, c_red);
+                y_r += 30
+                draw_text(f"HDG: {hdg:.0f}", x_r, y_r, c_yellow);
+                y_r += 30
+                draw_text(f"HEDEF_HDG: {adv_crs:.0f}", x_r, y_r, c_orange);
+                y_r += 30
+                draw_text(f"ACI_FARKI: {err_ang:.0f}", x_r, y_r, c_yellow);
+                y_r += 30
+                draw_text(f"KONTROL_HATA: {ctrl_err:.0f}", x_r, y_r, c_yellow);
+                y_r += 30
+                draw_text(f"HEDEFE_MESAFE: {dist:.1f}", x_r, y_r, c_red);
+                y_r += 30
 
                 y_r += 20
-                draw_text(f"IDA_KONUM:", x_r, y_r, c_orange); y_r += 30
-                draw_text(f" {lat:.6f}, {lon:.6f}", x_r, y_r, c_orange); y_r += 30
-                draw_text(f"HEDEF_KONUM:", x_r, y_r, c_orange); y_r += 30
-                draw_text(f" {t_lat:.6f}, {t_lon:.6f}", x_r, y_r, c_orange); y_r += 30
-                draw_text(f"SENSOR_SAGLIK: GOOD", x_r, y_r, c_orange); y_r += 30
+                draw_text(f"IDA_KONUM:", x_r, y_r, c_orange);
+                y_r += 30
+                draw_text(f" {lat:.6f}, {lon:.6f}", x_r, y_r, c_orange);
+                y_r += 30
+                draw_text(f"HEDEF_KONUM:", x_r, y_r, c_orange);
+                y_r += 30
+                draw_text(f" {t_lat:.6f}, {t_lon:.6f}", x_r, y_r, c_orange);
+                y_r += 30
+                draw_text(f"SENSOR_SAGLIK: GOOD", x_r, y_r, c_orange);
+                y_r += 30
                 # -----------------------------------------------
 
                 # 4. VIDEO RECORDING
                 if writer:
                     writer.enqueue(frame)
-                
+
                 if streamer:
                     streamer.enqueue(frame)
 
