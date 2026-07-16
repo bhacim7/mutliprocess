@@ -195,10 +195,10 @@ TASK_CONTEXT_MAP = {
     "T3_START": ProtoEnum.TASK_NONE,
     "T3_MID": ProtoEnum.TASK_SPEED_CHALLENGE,
     "TASK3_SEARCH_KAMIKAZE": ProtoEnum.TASK_SPEED_CHALLENGE,
-    #"GPS1": ProtoEnum.TASK_NONE,
-    #"GPS2": ProtoEnum.TASK_ENTRY_EXIT,
-    #"GPS3": ProtoEnum.TASK_ENTRY_EXIT,
-    #"GPS4": ProtoEnum.TASK_NONE
+    "GPS1": ProtoEnum.TASK_NONE,
+    "GPS2": ProtoEnum.TASK_ENTRY_EXIT,
+    "GPS3": ProtoEnum.TASK_ENTRY_EXIT,
+    "GPS4": ProtoEnum.TASK_NONE
 }
 
 
