@@ -462,6 +462,7 @@ def camera_worker(shared_state, hf_data):
                                  cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
+                shared_state['vision_detected_objects'] = current_frame_objects
 
                 import datetime
 
@@ -499,7 +500,7 @@ def camera_worker(shared_state, hf_data):
                 # 3. YAZI ÇİZİMİ (GÖLGELİ METİN - MAKSİMUM FPS)
                 def draw_text(text, x, y, text_color):
                     # Draw black shadow slightly offset
-                    cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
+                    #cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
                     # Draw main text
                     cv2.putText(frame, text, (x, y), font, scale, text_color, thick)
 
