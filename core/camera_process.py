@@ -476,17 +476,20 @@ def camera_worker(shared_state, hf_data):
                 t_lon = shared_state.get('target_lon', 0.0)
 
                 # 2. Yazı Tipleri ve Renkler (BGR formatında)
-                font = cv2.FONT_HERSHEY_SIMPLEX
+                font = cv2.FONT_HERSHEY_DUPLEX
                 scale = 0.7
-                thick = 2
+                thick = 1
                 c_red = (0, 0, 255)
-                c_yellow = (0, 255, 255)
+                c_yellow = (255, 255, 0)  # Cyan for better contrast
                 c_green = (0, 255, 0)
-                c_orange = (0, 165, 255)
+                c_orange = (255, 255, 255) # Pure White for better contrast
                 c_magenta = (255, 0, 255)
 
-                # 3. YAZI ÇİZİMİ (SAF METİN - MAKSİMUM FPS)
+                # 3. YAZI ÇİZİMİ (GÖLGELİ METİN - MAKSİMUM FPS)
                 def draw_text(text, x, y, text_color):
+                    # Draw black shadow slightly offset
+                    cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
+                    # Draw main text
                     cv2.putText(frame, text, (x, y), font, scale, text_color, thick)
 
                 # SOL SÜTUN ÇİZİMİ
@@ -497,11 +500,11 @@ def camera_worker(shared_state, hf_data):
                 draw_text(f"MEVCUT_GOREV: {task}", 10, y, c_red); y += 30
                 
                 y += 20
-                draw_text(f"SOL_PWM: {int(pwm_l)}", 10, y, c_red); y += 30
-                draw_text(f"SAG_PWM: {int(pwm_r)}", 10, y, c_red); y += 30
+                draw_text(f"ARKA_SOL_PWM: {int(pwm_l)}", 10, y, c_red); y += 30
+                draw_text(f"ARKA_SAG_PWM: {int(pwm_r)}", 10, y, c_red); y += 30
                 draw_text(f"ON_SOL_PWM: {int(pwm_fl)}", 10, y, c_red); y += 30
                 draw_text(f"ON_SAG_PWM: {int(pwm_fr)}", 10, y, c_red); y += 30
-                draw_text(f"STEER_PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
+                draw_text(f"DUMEN_PWM: {int(pwm_steer)}", 10, y, c_red); y += 30
                 
                 # SAĞ SÜTUN ÇİZİMİ
                 x_r = 900
