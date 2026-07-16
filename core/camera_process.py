@@ -189,7 +189,11 @@ TASK_CONTEXT_MAP = {
     "TASK2_GO_TO_END": ProtoEnum.TASK_NAV_CHANNEL,
     "T3_START": ProtoEnum.TASK_NONE,
     "T3_MID": ProtoEnum.TASK_SPEED_CHALLENGE,
-    "TASK3_SEARCH_KAMIKAZE": ProtoEnum.TASK_SPEED_CHALLENGE
+    "TASK3_SEARCH_KAMIKAZE": ProtoEnum.TASK_SPEED_CHALLENGE,
+    "GPS1": ProtoEnum.TASK_NONE,
+    "GPS2": ProtoEnum.TASK_ENTRY_EXIT,
+    "GPS3": ProtoEnum.TASK_ENTRY_EXIT,
+    "GPS4": ProtoEnum.TASK_NONE
 }
 
 def camera_worker(shared_state, hf_data):
@@ -445,11 +449,11 @@ def camera_worker(shared_state, hf_data):
                                     4: "Green"
                                 }
 
-                                box_color = color_map.get(cid, (255, 255, 255))
-                                label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                                # box_color = color_map.get(cid, (255, 255, 255))
+                                # label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                # cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                                # cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
 
