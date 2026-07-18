@@ -295,7 +295,7 @@ def camera_worker(shared_state, hf_data):
                     if ts_handler.is_new(sensors_data.get_imu_data()):
                         raw_heading = sensors_data.get_magnetometer_data().magnetic_heading
                         zed_heading = magnetic_filter.update(raw_heading)
-                        zed_heading = (zed_heading - 6) % 360
+                        zed_heading = (zed_heading + 6) % 360  # Istanbul magnetic declination is approx +6 degrees
 
                         # Push raw zed heading to shared state.
                         # nav_process will determine final magnetic_heading
@@ -455,11 +455,11 @@ def camera_worker(shared_state, hf_data):
                                     4: "Green"
                                 }
 
-                                 box_color = color_map.get(cid, (255, 255, 255))
-                                 label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                                box_color = color_map.get(cid, (255, 255, 255))
+                                label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                                cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
                 shared_state['vision_detected_objects'] = current_frame_objects

@@ -512,7 +512,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
                 # This prevents the boat from drawing a line from the coast of Africa.
                 # It continually attempts to acquire the GPS coordinates if they were initially 0.0
-                if start_lat is None and ida_enlem != 0.0 and ida_boylam != 0.0:
+                # FIX 3: Also wait until force_initial_alignment is False before capturing start point.
+                # This ensures we only draw the LOS path *after* we are pointing at the target,
+                # eliminating massive half-moon sweeps caused by starting the path sideways.
+                if start_lat is None and ida_enlem != 0.0 and ida_boylam != 0.0 and not force_initial_alignment:
                     start_lat = ida_enlem
                     start_lon = ida_boylam
 
