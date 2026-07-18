@@ -635,8 +635,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     else:
                         current_path = None
 
-                        # Use A* ONLY for Task 2
-                        if "TASK2" in mevcut_gorev:
+                        # Failsafe: Use A* for Task 2 always, or for all tasks if LOS guidance is explicitly disabled
+                        use_astar_planner = "TASK2" in mevcut_gorev or not getattr(cfg, 'ENABLE_LOS_GUIDANCE', True)
+
+                        if use_astar_planner:
                             # Run Planner
                             # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
                             crop_radius_m = 10.0  # Only look at a 20m x 20m window around the boat
