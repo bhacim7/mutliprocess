@@ -512,7 +512,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
                 # This prevents the boat from drawing a line from the coast of Africa.
                 # It continually attempts to acquire the GPS coordinates if they were initially 0.0
-                if start_lat is None and ida_enlem != 0.0 and ida_boylam != 0.0:
+                # Fix 3: Also do not lock the start position while we are still performing the initial spot-turn alignment.
+                # Capturing it while drifting/turning causes massive LOS path cross-track errors.
+                if start_lat is None and ida_enlem != 0.0 and ida_boylam != 0.0 and not force_initial_alignment:
                     start_lat = ida_enlem
                     start_lon = ida_boylam
 

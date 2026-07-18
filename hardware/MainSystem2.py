@@ -50,8 +50,11 @@ class USVController:
     def _listen_messages(self):
         """Arka planda MAVLink mesajlarını dinler ve msg_dict'te saklar."""
         while self.running and self.master:
-            msg = self.master.recv_match(blocking=False)
-            if msg:
+            # Drain the entire queue to prevent buffer bloat
+            while True:
+                msg = self.master.recv_match(blocking=False)
+                if not msg:
+                    break
                 self.msg_dict[msg.get_type()] = msg
             time.sleep(0.01) # CPU'yu boğmamak için ufak gecikme
 

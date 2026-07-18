@@ -295,7 +295,8 @@ def camera_worker(shared_state, hf_data):
                     if ts_handler.is_new(sensors_data.get_imu_data()):
                         raw_heading = sensors_data.get_magnetometer_data().magnetic_heading
                         zed_heading = magnetic_filter.update(raw_heading)
-                        zed_heading = (zed_heading - 6) % 360
+                        # Magnetic declination for Istanbul is approx +6 degrees.
+                        zed_heading = (zed_heading + 6) % 360
 
                         # Push raw zed heading to shared state.
                         # nav_process will determine final magnetic_heading
