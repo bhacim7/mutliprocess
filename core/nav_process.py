@@ -627,11 +627,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     should_force_alignment = force_initial_alignment
 
                     if should_force_alignment:
-                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                        # YENİ EKLENEN KISIM: Hedefe yaklaştıkça yavaşlayan Oransal (P) Dönüş
+                        base_spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+
+                        # Hedefe 45 derece kala yavaşlamaya başla.
+                        # abs(aci_farki) azaldıkça hiz_carpani küçülecek (0.0 ile 1.0 arası)
+                        hiz_carpani = min(1.0, abs(aci_farki) / 45.0)
+
+                        # Minimum PWM (örn: 60) tanımlıyoruz ki tekne son derecelerde su direncine takılıp durmasın
+                        dinamik_spot_pwm = int(60 + (base_spot_pwm - 60) * hiz_carpani)
+
                         if aci_farki > 0:
-                            apply_motor_mixer(controller, 1500, spot_pwm)
+                            apply_motor_mixer(controller, 1500, dinamik_spot_pwm)
                         else:
-                            apply_motor_mixer(controller, 1500, -spot_pwm)
+                            apply_motor_mixer(controller, 1500, -dinamik_spot_pwm)
                     else:
                         current_path = None
 
