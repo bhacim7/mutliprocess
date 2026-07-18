@@ -66,7 +66,7 @@ class AsyncStreamer(threading.Thread):
 
     def run(self):
         """Arka planda sürekli kuyruktan frame alıp Wi-Fi üzerinden yollar."""
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40]  # Kalite %40
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]  # Kalite %40
 
         while self.running:
             try:
@@ -76,7 +76,7 @@ class AsyncStreamer(threading.Thread):
                 if self.client_socket:
                     try:
                         # Görüntüyü küçült ve sıkıştır (Bu işlem artık ana kamerayı yavaşlatmaz!)
-                        stream_frame = cv2.resize(frame, (640, 360))
+                        stream_frame = cv2.resize(frame, (860, 540))
                         ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
 
                         if ret:
@@ -455,11 +455,11 @@ def camera_worker(shared_state, hf_data):
                                     4: "Green"
                                 }
 
-                                 box_color = color_map.get(cid, (255, 255, 255))
-                                 label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                                #box_color = color_map.get(cid, (255, 255, 255))
+                                #label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                 #cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                                 #cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
                 shared_state['vision_detected_objects'] = current_frame_objects
