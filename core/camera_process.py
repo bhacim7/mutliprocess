@@ -280,12 +280,11 @@ def camera_worker(shared_state, hf_data):
         import datetime
         from utils.utilities import AsyncVideoWriter
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        video_path = f"idaKayit/kayit_{ts}.mp4"
-        if not os.path.exists("idaKayit"):
-            os.makedirs("idaKayit")
-        writer = AsyncVideoWriter(video_path, fps=10.0, max_queue=130)
+        video_path = f"kayit_{ts}.mp4"
+        fps_val = float(getattr(cfg, 'CAM_FPS', 30.0))
+        writer = AsyncVideoWriter(video_path, fps=fps_val, max_queue=130)
         writer.start()
-        print(f"[CAM_PROCESS] Video recording started: {video_path}")
+        print(f"[CAM_PROCESS] Video recording started: {video_path} at {fps_val} FPS")
 
     try:
         while not shared_state['shutdown']:
