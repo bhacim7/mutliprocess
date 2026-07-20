@@ -694,6 +694,22 @@ class MapPanel(QtWidgets.QWidget):
         # İz geçmişini tutacak listeler (Maks 500m için)
         self.trail_points_1 = []
         self.trail_points_2 = []
+        # --- YUMUŞATMA (SMOOTHING) VE İNTERPOLASYON DEĞİŞKENLERİ ---
+        self._target_lat_1 = None
+        self._target_lon_1 = None
+        self._visual_lat_1 = None
+        self._visual_lon_1 = None
+
+        self._target_lat_2 = None
+        self._target_lon_2 = None
+        self._visual_lat_2 = None
+        self._visual_lon_2 = None
+
+        # Saniyede ~30 kare güncelleyecek animasyon zamanlayıcısı
+        self.anim_timer = QtCore.QTimer(self)
+        self.anim_timer.timeout.connect(self._animate_markers)
+        self.anim_timer.start(33)  # ~30 FPS (1000ms / 30)
+
 
         # --- Heading overlays ---
         self._last_lat = None;
@@ -799,7 +815,7 @@ class MapPanel(QtWidgets.QWidget):
             }
             QLabel {
                 color: #00e5ff;
-                font-size: 22px; 
+                font-size: 22px;
                 background: transparent;
                 border: none;
             }
@@ -1188,7 +1204,7 @@ class MapPanel(QtWidgets.QWidget):
 
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet("""
-            QMenu { background-color: #333; color: white; border: 1px solid #555; } 
+            QMenu { background-color: #333; color: white; border: 1px solid #555; }
             QMenu::item:selected { background-color: #555; }
         """)
 
@@ -1681,60 +1697,104 @@ class MapPanel(QtWidgets.QWidget):
             self.path_item_2.setPath(self.path_path_2)
 
     def update_current_position(self, lat: float, lon: float, boat_id=1, draw_tail=True):
-        p = self._scene_pos_from_latlon(lat, lon)
-        if p is None: return
+        # 1. EMA Filtresi uygula (Low-Pass Filter) - Zikzakları engeller
+        alpha = 0.3  # Yumuşatma faktörü (0 ile 1 arası, 1 = filtresiz, düşük değer = yumuşak ama gecikmeli)
+        dist_threshold_m = 50.0  # 50 metreden büyük atlamalarda filtreyi sıfırla (Işınlanma/ilk açılış)
+
+        if boat_id == 1:
+            if getattr(self, '_target_lat_1', None) is None:
+                # İlk konum geldi
+                self._target_lat_1, self._target_lon_1 = lat, lon
+                self._visual_lat_1, self._visual_lon_1 = lat, lon
+            else:
+                dist = haversine_distance(self._target_lat_1, self._target_lon_1, lat, lon)
+                if dist > dist_threshold_m:
+                    # Büyük atlama, direkt zıpla
+                    self._target_lat_1, self._target_lon_1 = lat, lon
+                    self._visual_lat_1, self._visual_lon_1 = lat, lon
+                else:
+                    # EMA yumuşatma
+                    self._target_lat_1 = (alpha * lat) + ((1.0 - alpha) * self._target_lat_1)
+                    self._target_lon_1 = (alpha * lon) + ((1.0 - alpha) * self._target_lon_1)
+
+            self._last_lat, self._last_lon = self._target_lat_1, self._target_lon_1
+            self._update_heading_items()
+            self.update_range_rings()
+
+        elif boat_id == 2:
+            if getattr(self, '_target_lat_2', None) is None:
+                self._target_lat_2, self._target_lon_2 = lat, lon
+                self._visual_lat_2, self._visual_lon_2 = lat, lon
+            else:
+                dist = haversine_distance(self._target_lat_2, self._target_lon_2, lat, lon)
+                if dist > dist_threshold_m:
+                    self._target_lat_2, self._target_lon_2 = lat, lon
+                    self._visual_lat_2, self._visual_lon_2 = lat, lon
+                else:
+                    self._target_lat_2 = (alpha * lat) + ((1.0 - alpha) * self._target_lat_2)
+                    self._target_lon_2 = (alpha * lon) + ((1.0 - alpha) * self._target_lon_2)
+
+    def _animate_markers(self):
+        """Timer ile saniyede 30 kez çağrılır. Görsel marker'ı hedef EMA koordinatına yumuşakça kaydırır (Tweening)."""
+        interp_factor = 0.2  # Her animasyon karesinde hedefe %20 yaklaş
 
         # Performans için sayaçları tanımla (eğer yoksa)
         if not hasattr(self, 'prune_counter_1'): self.prune_counter_1 = 0
         if not hasattr(self, 'prune_counter_2'): self.prune_counter_2 = 0
 
-        if boat_id == 1:
-            self._last_lat, self._last_lon = lat, lon
-            self.curr_marker.setPos(p)
-            self.curr_marker.setVisible(True)
+        # --- IDA 1 ---
+        if getattr(self, '_visual_lat_1', None) is not None and getattr(self, '_target_lat_1', None) is not None:
+            # İnterpolasyon
+            self._visual_lat_1 += (self._target_lat_1 - self._visual_lat_1) * interp_factor
+            self._visual_lon_1 += (self._target_lon_1 - self._visual_lon_1) * interp_factor
 
-            if draw_tail:
-                if not self.trail_points_1 or self.trail_points_1[-1] != (lat, lon):
-                    self.trail_points_1.append((lat, lon))
+            p = self._scene_pos_from_latlon(self._visual_lat_1, self._visual_lon_1)
+            if p is not None:
+                self.curr_marker.setPos(p)
+                self.curr_marker.setVisible(True)
 
-                    # --- 1. ANINDA ÇİZİM (SIFIR GECİKME) ---
-                    # Beklemeden mevcut çizginin ucuna direkt ekle
-                    if self.path_path.isEmpty():
-                        self.path_path.moveTo(p)
-                    else:
-                        self.path_path.lineTo(p)
-                    self.path_item.setPath(self.path_path)
+                # İz (Trail) Çizimi - Artık yumuşatılmış görsel koordinatlarla çiziliyor
+                draw_tail = True  # İstenirse dışarıdan parametre alınabilir
+                if draw_tail:
+                    if not self.trail_points_1 or self.trail_points_1[-1] != (self._visual_lat_1, self._visual_lon_1):
+                        self.trail_points_1.append((self._visual_lat_1, self._visual_lon_1))
 
-                    # --- 2. PERİYODİK TEMİZLİK (KASMAYI ÖNLER) ---
-                    # Hesaplamayı her adımda değil, 50 adımda bir yap
-                    self.prune_counter_1 += 1
-                    if self.prune_counter_1 > 50:
-                        self._prune_and_redraw_trail(1)
-                        self.prune_counter_1 = 0
+                        if self.path_path.isEmpty():
+                            self.path_path.moveTo(p)
+                        else:
+                            self.path_path.lineTo(p)
+                        self.path_item.setPath(self.path_path)
 
-            self._update_heading_items()
-            self.update_range_rings()
+                        self.prune_counter_1 += 1
+                        if self.prune_counter_1 > 50:
+                            self._prune_and_redraw_trail(1)
+                            self.prune_counter_1 = 0
 
-        elif boat_id == 2:
-            self.curr_marker_2.setPos(p)
-            self.curr_marker_2.setVisible(True)
+        # --- IDA 2 ---
+        if getattr(self, '_visual_lat_2', None) is not None and getattr(self, '_target_lat_2', None) is not None and hasattr(self, 'curr_marker_2'):
+            self._visual_lat_2 += (self._target_lat_2 - self._visual_lat_2) * interp_factor
+            self._visual_lon_2 += (self._target_lon_2 - self._visual_lon_2) * interp_factor
 
-            if draw_tail:
-                if not self.trail_points_2 or self.trail_points_2[-1] != (lat, lon):
-                    self.trail_points_2.append((lat, lon))
+            p2 = self._scene_pos_from_latlon(self._visual_lat_2, self._visual_lon_2)
+            if p2 is not None:
+                self.curr_marker_2.setPos(p2)
+                self.curr_marker_2.setVisible(True)
 
-                    # --- 1. ANINDA ÇİZİM (SIFIR GECİKME) ---
-                    if self.path_path_2.isEmpty():
-                        self.path_path_2.moveTo(p)
-                    else:
-                        self.path_path_2.lineTo(p)
-                    self.path_item_2.setPath(self.path_path_2)
+                draw_tail = True
+                if draw_tail and hasattr(self, 'path_path_2'):
+                    if not self.trail_points_2 or self.trail_points_2[-1] != (self._visual_lat_2, self._visual_lon_2):
+                        self.trail_points_2.append((self._visual_lat_2, self._visual_lon_2))
 
-                    # --- 2. PERİYODİK TEMİZLİK (KASMAYI ÖNLER) ---
-                    self.prune_counter_2 += 1
-                    if self.prune_counter_2 > 50:
-                        self._prune_and_redraw_trail(2)
-                        self.prune_counter_2 = 0
+                        if self.path_path_2.isEmpty():
+                            self.path_path_2.moveTo(p2)
+                        else:
+                            self.path_path_2.lineTo(p2)
+                        self.path_item_2.setPath(self.path_path_2)
+
+                        self.prune_counter_2 += 1
+                        if self.prune_counter_2 > 50:
+                            self._prune_and_redraw_trail(2)
+                            self.prune_counter_2 = 0
 
     def clear_ghost_trail_by_id(self, boat_id):
         """İlgili tekneye ait canlı izi (ve varsa hayalet izi) tamamen sıfırlar."""
@@ -1967,14 +2027,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Stil Dosyası (GÜÇLENDİRİLMİŞ & PARLAK BEYAZ)
         self.setStyleSheet("""
-                    QMainWindow { 
-                        background-color: #2b2b2b; 
-                        color: #e0e0e0; 
+                    QMainWindow {
+                        background-color: #2b2b2b;
+                        color: #e0e0e0;
                     }
 
                     /* --- GÜÇLENDİRİLMİŞ BUTONLAR --- */
                     /* Daha spesifik seçici kullanarak stilin uygulanmasını garantiye alıyoruz */
-                    QWidget QPushButton { 
+                    QWidget QPushButton {
                         background-color: #37474f;       /* Koyu Zemin */
                         color: #eceff1;                  /* Açık Gri/Beyaz Yazı */
                         border: 2px solid #546e7a;       /* DAHA KALIN (2px) BELİRGİN ÇERÇEVE */
@@ -1984,20 +2044,20 @@ class MainWindow(QtWidgets.QMainWindow):
                         font-size: 11px;
                     }
                     /* Hover Efekti - PARLASIN */
-                    QWidget QPushButton:hover { 
-                        background-color: #455a64; 
+                    QWidget QPushButton:hover {
+                        background-color: #455a64;
                         border: 2px solid #81d4fa;       /* Çerçeve Parlak Açık Mavi */
                         color: #ffffff;                  /* Yazı Tam Beyaz */
                     }
                     /* Pressed Efekti - GÖMÜLSÜN */
-                    QWidget QPushButton:pressed { 
-                        background-color: #263238; 
+                    QWidget QPushButton:pressed {
+                        background-color: #263238;
                         border: 2px solid #263238;
                         padding-top: 6px;                /* Tıklama hissi için kaydır */
                         padding-left: 6px;
                     }
                     /* Seçili (Checked) Efekti */
-                    QWidget QPushButton:checked { 
+                    QWidget QPushButton:checked {
                         background-color: #00897b;
                         border: 2px solid #00e676;
                         color: white;
@@ -2026,23 +2086,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     }
 
                     /* --- DİĞER BİLEŞENLER --- */
-                    QGroupBox { 
+                    QGroupBox {
                         border: 2px solid #444;          /* Çerçeveyi belirginleştir */
-                        border-radius: 6px; 
-                        margin-top: 12px; 
-                        background-color: #323639; 
-                        font-weight: bold; 
+                        border-radius: 6px;
+                        margin-top: 12px;
+                        background-color: #323639;
+                        font-weight: bold;
                     }
-                    QGroupBox::title { 
-                        subcontrol-origin: margin; 
-                        left: 10px; 
-                        padding: 0 5px; 
+                    QGroupBox::title {
+                        subcontrol-origin: margin;
+                        left: 10px;
+                        padding: 0 5px;
                         color: #4fc3f7;
                         background-color: #323639;       /* Başlık arka planı */
                     }
-                    QCheckBox { 
-                        spacing: 8px; 
-                        color: #b0bec5; 
+                    QCheckBox {
+                        spacing: 8px;
+                        color: #b0bec5;
                         font-weight: bold;
                     }
                     QCheckBox::indicator {
@@ -2056,19 +2116,19 @@ class MainWindow(QtWidgets.QMainWindow):
                         background-color: #00e676;
                         border-color: #00e676;
                     }
-                    QLineEdit, QSpinBox, QComboBox { 
-                        background-color: #263238; 
+                    QLineEdit, QSpinBox, QComboBox {
+                        background-color: #263238;
                         color: #ffffff;                  /* Girdiler de Parlak Beyaz olsun */
-                        border: 2px solid #546e7a; 
-                        padding: 4px; 
+                        border: 2px solid #546e7a;
+                        padding: 4px;
                         border-radius: 3px;
                         font-weight: bold;
                     }
-                    QSplitter::handle { 
-                        background-color: #1c1c1c; 
+                    QSplitter::handle {
+                        background-color: #1c1c1c;
                     }
-                    QLabel { 
-                        color: #cfd8dc; 
+                    QLabel {
+                        color: #cfd8dc;
                     }
                     /* Tooltip */
                     QToolTip {
@@ -2148,10 +2208,10 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_id1 = QtWidgets.QLabel("IDA 1")
         # Arka plan: Koyu Gri (%60 Görünür), Yazı: Kırmızı
         lbl_id1.setStyleSheet("""
-                    color: #ff1744; 
-                    font-weight: bold; 
+                    color: #ff1744;
+                    font-weight: bold;
                     font-size: 12pt;
-                    background-color: rgba(40, 40, 40, 160); 
+                    background-color: rgba(40, 40, 40, 160);
                     padding: 2px 6px; /* Üst-Alt: 2px, Sağ-Sol: 6px */
                     border-radius: 4px;
                     border: 1px solid #ff1744; /* İstersen ince bir çerçeve de ekler */
@@ -2203,9 +2263,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Log için özel stil (Monospace font, siyah zemin)
         self.usv1_log.setStyleSheet("""
                     QPlainTextEdit {
-                        background-color: black; 
-                        color: #00e676; 
-                        font-family: Consolas, monospace; 
+                        background-color: black;
+                        color: #00e676;
+                        font-family: Consolas, monospace;
                         font-size: 9pt;
                         border: none;
                     }
@@ -2381,8 +2441,8 @@ class MainWindow(QtWidgets.QMainWindow):
         frame = QtWidgets.QFrame()
         frame.setStyleSheet("""
             QFrame {
-                background-color: rgba(30, 30, 30, 180); 
-                border: 1px solid #546e7a; 
+                background-color: rgba(30, 30, 30, 180);
+                border: 1px solid #546e7a;
                 border-radius: 6px;
             }
         """)
@@ -2397,15 +2457,15 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_header = QtWidgets.QLabel("TELEMETRİ VERİLERİ")
         lbl_header.setAlignment(QtCore.Qt.AlignCenter)
         lbl_header.setStyleSheet("""
-            background-color: #37474f; 
-            color: #eceff1; 
-            font-size: 11px; 
-            font-weight: bold; 
+            background-color: #37474f;
+            color: #eceff1;
+            font-size: 11px;
+            font-weight: bold;
             letter-spacing: 2px;
             padding: 4px;
             border: none;
             border-bottom: 1px solid #546e7a;
-            border-top-left-radius: 5px; 
+            border-top-left-radius: 5px;
             border-top-right-radius: 5px;
         """)
         l_main.addWidget(lbl_header)
@@ -2436,10 +2496,10 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl_title.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             # font-weight: bold ekledik ve rengi açtık (#cfd8dc)
             lbl_title.setStyleSheet("""
-                color: #cfd8dc; 
+                color: #cfd8dc;
                 font-size: 14px;
-                font-weight: bold; 
-                margin-right: 2px; 
+                font-weight: bold;
+                margin-right: 2px;
                 border: none;
             """)
             g.addWidget(lbl_title, row, col_base)
@@ -2449,8 +2509,8 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl_val.setAlignment(QtCore.Qt.AlignCenter)  # Yazıyı ortala
 
             lbl_val.setStyleSheet("""
-                            color: #00e5ff; 
-                            font-weight: bold; 
+                            color: #00e5ff;
+                            font-weight: bold;
                             font-size: 14px;
                             border: none;
                             background-color: rgba(0, 0, 0, 40);
@@ -2493,17 +2553,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- STİL ---
         table.setStyleSheet("""
-            QTableWidget { 
-                border: none; 
-                background-color: #263238; 
-                color: white; 
-                gridline-color: #455a64; 
+            QTableWidget {
+                border: none;
+                background-color: #263238;
+                color: white;
+                gridline-color: #455a64;
             }
-            QHeaderView::section { 
-                background-color: #37474f; 
-                color: #cfd8dc; 
-                border: 1px solid #546e7a; 
-                padding: 0px;           
+            QHeaderView::section {
+                background-color: #37474f;
+                color: #cfd8dc;
+                border: 1px solid #546e7a;
+                padding: 0px;
                 font-size: 10px;
                 height: 20px;
             }
@@ -2512,9 +2572,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 padding-bottom: 0px;
                 border: none;
             }
-            QTableWidget::item:selected { 
-                background-color: #00e676; 
-                color: black; 
+            QTableWidget::item:selected {
+                background-color: #00e676;
+                color: black;
             }
         """)
         l.addWidget(table)
@@ -2723,8 +2783,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # DİKKAT: QPushButton stilini buraya ekledik!
         frame.setStyleSheet("""
             QFrame {
-                background-color: rgba(30, 30, 30, 180); 
-                border: 1px solid #546e7a; 
+                background-color: rgba(30, 30, 30, 180);
+                border: 1px solid #546e7a;
                 border-radius: 6px;
                 margin-top: 4px;
             }
@@ -2773,15 +2833,15 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl_header.setAlignment(QtCore.Qt.AlignCenter)
         # Başlık stili (Override edilmemesi için spesifik yazdık)
         lbl_header.setStyleSheet("""
-            background-color: #37474f; 
-            color: #eceff1; 
-            font-size: 10px; 
-            font-weight: bold; 
+            background-color: #37474f;
+            color: #eceff1;
+            font-size: 10px;
+            font-weight: bold;
             letter-spacing: 1px;
             padding: 4px;
             border: none;
             border-bottom: 1px solid #546e7a;
-            border-top-left-radius: 5px; 
+            border-top-left-radius: 5px;
             border-top-right-radius: 5px;
         """)
         l_main.addWidget(lbl_header)
@@ -2870,22 +2930,22 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return f"""
             QPushButton {{
-                background-color: {bg_color}; 
-                color: white; 
-                font-weight: bold; 
-                border: 2px solid {border_color}; 
+                background-color: {bg_color};
+                color: white;
+                font-weight: bold;
+                border: 2px solid {border_color};
                 border-radius: 4px;
                 padding: 4px;
                 min-width: 24px;
                 min-height: 20px;
             }}
             QPushButton:hover {{
-                background-color: {hover_color}; 
-                border: 2px solid white; 
+                background-color: {hover_color};
+                border: 2px solid white;
                 color: white;
             }}
             QPushButton:pressed {{
-                background-color: {bg_color}; 
+                background-color: {bg_color};
                 border: 2px solid {bg_color};
                 padding-top: 6px;
                 padding-left: 6px;
@@ -3394,16 +3454,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs_course.setStyleSheet(f"""
             QTabBar::tab {{
-                background: #455a64; 
-                color: white; 
+                background: #455a64;
+                color: white;
                 padding: 8px 20px;
                 margin: 2px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
             }}
             QTabBar::tab:selected {{
-                background: #ffeb3b; 
-                color: black; 
+                background: #ffeb3b;
+                color: black;
                 font-weight: bold;
             }}
         """)
