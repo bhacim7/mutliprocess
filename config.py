@@ -6,7 +6,7 @@
 NAV_MODE = "GPS"
 STREAM = True
 GCS_IP = "192.168.1.105"
-RECORD_VIDEO = True
+RECORD_VIDEO = False
 SHOW_LOCAL_WINDOW = False
 
 # --- HARDWARE SPECS ---
@@ -22,8 +22,8 @@ FRONT_SAG_MOTOR = 2
 FRONT_STEER_SERVO = 7
 
 BASE_PWM = 1500
-CRUISE_PWM = 300
-T3_SPEED_PWM = 100
+CRUISE_PWM = 250
+T3_SPEED_PWM = 200
 
 STEER_MAX_PWM = 1900
 STEER_MIN_PWM = 1100
@@ -51,7 +51,7 @@ CAM_RES = 2
 CAM_FPS = 30
 CAM_HFOV = 110.0
 YOLO_CONFIDENCE = 0.40
-MODEL_PATH = "/home/arge/PycharmProjects/PythonProject/best (1).engine"
+MODEL_PATH = "/home/arge/PycharmProjects/PythonProject/best (2).engine"
 Kp_PIXEL = 0.3
 Kd_PIXEL = 0.1
 
@@ -101,6 +101,6 @@ T3_MID_LAT = 40.8096887
 T3_MID_LON = 29.2622795
 
 TASK3_KAMIKAZE_COLOR = "green"  # Options: "red", "green", "black"
-TASK3_INVERT_STEERING = True  # Toggle if boat turns away from target
+TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 
 MEVCUT_GOREV = "TASK1_STATE_ENTER"
