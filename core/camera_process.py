@@ -351,7 +351,7 @@ def camera_worker(shared_state, hf_data):
 
                 # 3. YOLO INFERENCE
                 conf_val = getattr(cfg, 'YOLO_CONFIDENCE', 0.50)
-                results = model(frame, conf=conf_val, imgsz=640, verbose=False)[0]
+                results = model(frame, conf=conf_val, imgsz=[544, 960], verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
 
                 # Fetch necessary shared state vars for calculation
@@ -455,11 +455,11 @@ def camera_worker(shared_state, hf_data):
                                     4: "Green"
                                 }
 
-                                #box_color = color_map.get(cid, (255, 255, 255))
-                                #label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                                box_color = color_map.get(cid, (255, 255, 255))
+                                label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                #cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                #cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                                cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
                 shared_state['vision_detected_objects'] = current_frame_objects
@@ -498,7 +498,7 @@ def camera_worker(shared_state, hf_data):
                 c_magenta = (255, 0, 255)
 
                 # 3. YAZI ÇİZİMİ (GÖLGELİ METİN - MAKSİMUM FPS)
-                """def draw_text(text, x, y, text_color):
+                def draw_text(text, x, y, text_color):
                     # Draw black shadow slightly offset
                     #cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
                     # Draw main text
@@ -553,7 +553,7 @@ def camera_worker(shared_state, hf_data):
                 draw_text(f" {t_lat:.6f}, {t_lon:.6f}", x_r, y_r, c_orange);
                 y_r += 30
                 draw_text(f"SENSOR_SAGLIK: GOOD", x_r, y_r, c_orange);
-                y_r += 30"""
+                y_r += 30
                 # -----------------------------------------------
 
                 # 4. VIDEO RECORDING
