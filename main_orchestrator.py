@@ -161,7 +161,7 @@ def main():
                     # Identify the correct target and args based on the name
                     if p.name == "NavProcess":
                         target = nav_worker
-                        args = (shared_state, command_queue, hf_data)
+                        args = (shared_state, command_queue, hf_data, lidar_queue)
                     elif p.name == "TelemProcess":
                         target = telem_worker
                         args = (shared_state, command_queue, hf_data)
@@ -170,7 +170,7 @@ def main():
                         args = (shared_state, hf_data)
                     elif p.name == "LidarProcess":
                         target = lidar_worker
-                        args = (shared_state,)
+                        args = (shared_state, lidar_queue)
                     else:
                         continue
 
