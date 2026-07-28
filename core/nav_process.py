@@ -102,7 +102,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         return
 
     # 2. Local Costmap Variables
-    COSTMAP_SIZE_PX = (800, 800)
+    # Expand global map to 400x400 meters to prevent driving off the edge,
+    # while preserving the entire mapped course for post-mission export.
+    COSTMAP_SIZE_PX = (4000, 4000)
     COSTMAP_RES_M_PER_PX = 0.10
     costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
     costmap_center_m = (0, 0)

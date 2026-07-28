@@ -17,7 +17,8 @@ def get_inflated_nav_map(raw_costmap, ignore_green=False, ignore_yellow=False):
     """
     Prepares map for A* by inflating obstacles to account for robot radius.
     """
-    if raw_costmap is None: return None, None
+    if raw_costmap is None or raw_costmap.size == 0:
+        return None, None
 
     nav_map = raw_costmap.copy()
 
