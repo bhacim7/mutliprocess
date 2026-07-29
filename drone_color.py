@@ -3,7 +3,8 @@
 import cv2
 import numpy as np
 import time
-from pymavlink import mavutil
+import serial
+import json
 import os
 import Jetson.GPIO as GPIO
 
@@ -16,15 +17,13 @@ TRIGGER_PIN = 17
 TELEMETRY_PORT = "/dev/ttyUSB0"
 TELEMETRY_BAUD = 57600
 
-# Create MAVLink connection. Does not stop the code from running in case of an error.
+# Create Serial connection. Does not stop the code from running in case of an error.
 master = None
 try:
-    master = mavutil.mavlink_connection(TELEMETRY_PORT, baud=TELEMETRY_BAUD)
-    print("Waiting for MAVLink connection...")
-    master.wait_heartbeat(timeout=5)
-    print("MAVLink connection established successfully.")
+    master = serial.Serial(TELEMETRY_PORT, TELEMETRY_BAUD, timeout=1)
+    print("Serial connection established successfully.")
 except Exception as e:
-    print(f"MAVLink connection failed: {e}")
+    print(f"Serial connection failed: {e}")
     master = None
 
 # --- Camera and Image Settings ---
@@ -91,12 +90,15 @@ def detect_color(roi):
     else:
         return "BELIRSIZ", 0.0
 
-def send_mavlink_message(label, conf):
-    """Sends a MAVLink STATUSTEXT message with the detected color and confidence."""
-    if master is None:
+def send_serial_message(label):
+    """Sends a JSON message with the detected color."""
+    if master is None or not master.is_open:
         return
-    message = f"Detected: {label} (Confidence: {conf:.2f})"
-    master.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, message.encode())
+    msg = {"id": 3, "drone_color": label}
+    try:
+        master.write((json.dumps(msg) + "\n").encode('utf-8'))
+    except Exception as e:
+        print(f"Failed to send serial message: {e}")
 
 # --- Main Loop & GPIO Setup ---
 global pulse_width_us, pulse_start_time
@@ -180,7 +182,7 @@ try:
             last_detected_conf = current_conf
 
         if current_status == "AKTİF":
-            send_mavlink_message(last_detected_color, last_detected_conf)
+            send_serial_message(last_detected_color)
 
         # Temiz ve hızlı ekran yenileme (ANSI escape kodları ile)
         print("\033[H\033[J", end="")
@@ -192,10 +194,10 @@ try:
         print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
         print(f"Pulse Width (µs): {pulse_width_us:.2f}")
         
-        if master:
-            print(f"MAVLink Connection: OK ({TELEMETRY_PORT})")
+        if master and master.is_open:
+            print(f"Serial Connection: OK ({TELEMETRY_PORT})")
         else:
-            print(f"MAVLink Connection: ERROR")
+            print(f"Serial Connection: ERROR")
 
         print(f"\nRC Trigger Status: {current_status}")
 
