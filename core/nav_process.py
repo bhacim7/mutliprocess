@@ -241,6 +241,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         elif val is False:
                             shared_state['manual_mode'] = False
                             print("[NAV_PROCESS] 🤖 Switched to AUTO mode.")
+                    elif cmd_str == "set_target_color":
+                        color = cmd.get("color")
+                        if color:
+                            shared_state['drone_target_color'] = color
+                            print(f"[NAV_PROCESS] 🎯 Received target color from GCS: {color}")
             except:
                 pass
 
@@ -391,6 +396,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 if mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
                     found_target = False
                     target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
+                    if getattr(cfg, 'DRONE_ACTIVE', False):
+                        drone_color = shared_state.get('drone_target_color')
+                        if drone_color:
+                            target_color = drone_color.lower()
+
                     target_cid = 0
                     if target_color == "yellow": target_cid = 1
                     elif target_color == "black": target_cid = 2

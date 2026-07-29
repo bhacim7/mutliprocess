@@ -295,6 +295,68 @@ def normalize_gps_dict(gps_raw):
     return None
 
 
+from pymavlink import mavutil
+import re
+
+# -------------------- IHA (Drone) MAVLink Worker --------------------
+class DroneWorker(QThread):
+    target_color = Signal(str)
+    status = Signal(str)
+    link = Signal(bool)
+
+    def __init__(self, port: str, baud: int = 57600):
+        super().__init__()
+        self.port = port
+        self.baud = baud
+        self._stop = False
+        self.master = None
+
+    def configure(self, port: str, baud: int):
+        self.port = port
+        self.baud = baud
+
+    def run(self):
+        while not self._stop:
+            if self.master is None:
+                try:
+                    self.master = mavutil.mavlink_connection(self.port, baud=self.baud)
+                    self.status.emit(f"Drone MAVLink açıldı: {self.port}")
+                    self.link.emit(True)
+                except Exception as e:
+                    self.status.emit(f"Drone MAVLink hatası: {e}")
+                    self.link.emit(False)
+                    self.master = None
+                    time.sleep(2.0)
+                    continue
+
+            try:
+                msg = self.master.recv_match(type='STATUSTEXT', blocking=True, timeout=1.0)
+                if msg:
+                    text = msg.text
+                    # "Detected: red (Confidence: 0.95)"
+                    if text.startswith("Detected:"):
+                        match = re.search(r"Detected:\s*([a-zA-Z0-9_]+)", text)
+                        if match:
+                            color = match.group(1).lower()
+                            # Convert Turkish labels to English mapping if necessary
+                            if color == "kirmizi": color = "red"
+                            elif color == "yesil": color = "green"
+                            elif color == "siyah": color = "black"
+                            elif color == "sari": color = "yellow"
+                            elif color == "belirsiz": continue
+                            self.target_color.emit(color)
+            except Exception as e:
+                self.link.emit(False)
+                self.master = None
+                self.status.emit(f"Drone bağlantı koptu: {e}")
+                time.sleep(1.0)
+
+    def stop(self):
+        self._stop = True
+        if self.master:
+            self.master.close()
+        self.wait()
+
 # -------------------- Serial Worker (Düzeltilmiş & Hızlandırılmış) --------------------
 class SerialWorker(QThread):
     packet = Signal(dict)
@@ -2358,7 +2420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         course_grp = QtWidgets.QGroupBox("Parkur");
         cl = QtWidgets.QVBoxLayout(course_grp)
         self.tabs_course = QtWidgets.QTabWidget();
-        self.tabs_course.setFixedHeight(120)
+        self.tabs_course.setFixedHeight(85)
         for name in ["A", "B", "C"]:
             w = QtWidgets.QWidget()
             v_tab = QtWidgets.QVBoxLayout(w)
@@ -2414,6 +2476,36 @@ class MainWindow(QtWidgets.QMainWindow):
             # --- ÖNEMLİ: Butonu da sözlüğe ekliyoruz ki rengini değiştirebilelim ---
             self.course_ui[name] = {"sp_row": sr, "sp_col": sc, "btn": b_sel}
         cl.addWidget(self.tabs_course)
+
+        # --- İHA BÖLÜMÜ ---
+        iha_grp = QtWidgets.QGroupBox("İHA")
+        il = QtWidgets.QVBoxLayout(iha_grp)
+
+        # İHA Bağlantı
+        ih_conn_lay = QtWidgets.QHBoxLayout()
+        self.lbl_iha_link = QtWidgets.QLabel("●")
+        self.lbl_iha_link.setStyleSheet("color: red; font-size: 16px;")
+
+        # Combo ve Bağlan butonu
+        self.cb_iha_port = QtWidgets.QComboBox()
+        self.btn_iha_conn = QtWidgets.QPushButton("Bağlan")
+        self.btn_iha_conn.setCheckable(True)
+        self.btn_iha_conn.clicked.connect(self._toggle_iha_connection)
+
+        ih_conn_lay.addWidget(self.lbl_iha_link)
+        ih_conn_lay.addWidget(self.cb_iha_port)
+        ih_conn_lay.addWidget(self.btn_iha_conn)
+        il.addLayout(ih_conn_lay)
+
+        # Hedef Renk Gösterimi
+        ih_color_lay = QtWidgets.QHBoxLayout()
+        ih_color_lay.addWidget(QtWidgets.QLabel("Hedef Renk:"))
+        self.lbl_drone_color = QtWidgets.QLabel("BEKLENİYOR")
+        self.lbl_drone_color.setStyleSheet("font-weight: bold;")
+        ih_color_lay.addWidget(self.lbl_drone_color)
+        il.addLayout(ih_color_lay)
+
+        cl.addWidget(iha_grp)
         bot_lay.addWidget(course_grp)
 
         splitter.addWidget(center_widget)
@@ -3374,6 +3466,39 @@ class MainWindow(QtWidgets.QMainWindow):
         ports = [p.device for p in serial.tools.list_ports.comports()] or ["COM3"]
         self.cmb_port_1.clear()
         self.cmb_port_1.addItems(ports)
+        if hasattr(self, 'cb_iha_port'):
+            self.cb_iha_port.clear()
+            self.cb_iha_port.addItems(ports)
+
+    def _toggle_iha_connection(self):
+        if not hasattr(self, 'iha_worker'):
+            self.iha_worker = None
+
+        if self.btn_iha_conn.isChecked():
+            port = self.cb_iha_port.currentText().strip()
+            self.iha_worker = DroneWorker(port, 57600)
+            self.iha_worker.status.connect(self.on_status)
+            self.iha_worker.link.connect(self._on_iha_link)
+            self.iha_worker.target_color.connect(self._on_iha_color)
+            self.iha_worker.start()
+            self.btn_iha_conn.setText("Kes")
+        else:
+            if self.iha_worker:
+                self.iha_worker.stop()
+                self.iha_worker = None
+            self.btn_iha_conn.setText("Bağlan")
+            self._on_iha_link(False)
+
+    def _on_iha_link(self, connected: bool):
+        color = "#00e676" if connected else "red"
+        self.lbl_iha_link.setStyleSheet(f"color: {color}; font-size: 16px;")
+
+    def _on_iha_color(self, color: str):
+        self.lbl_drone_color.setText(color.upper())
+        if hasattr(self, 'worker_1') and self.worker_1:
+            # GCS to Boat command
+            cmd = {"cmd": "set_target_color", "color": color}
+            self.worker_1.queue_send(cmd)
 
     def _toggle(self):
         if not self._connected:
