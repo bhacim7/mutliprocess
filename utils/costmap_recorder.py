@@ -161,6 +161,8 @@ class CostmapRecorder:
                         color = (50, 50, 50)
                     elif 'yellow' in label.lower() or 'sari' in label.lower():
                         color = (0, 255, 255)
+                    elif 'orange' in label.lower() or 'turuncu' in label.lower():
+                        color = (0, 165, 255) # BGR
 
                     cv2.circle(self.img, (obj_x_px, obj_y_px), 3, color, -1)
 
