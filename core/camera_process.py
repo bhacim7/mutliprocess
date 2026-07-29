@@ -66,7 +66,7 @@ class AsyncStreamer(threading.Thread):
 
     def run(self):
         """Arka planda sürekli kuyruktan frame alıp Wi-Fi üzerinden yollar."""
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]  # Kalite %40
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40]  # Kalite %40
 
         while self.running:
             try:
@@ -76,7 +76,7 @@ class AsyncStreamer(threading.Thread):
                 if self.client_socket:
                     try:
                         # Görüntüyü küçült ve sıkıştır (Bu işlem artık ana kamerayı yavaşlatmaz!)
-                        stream_frame = cv2.resize(frame, (860, 540))
+                        stream_frame = cv2.resize(frame, (640, 360))
                         ret, buffer = cv2.imencode('.jpg', stream_frame, encode_param)
 
                         if ret:
@@ -239,7 +239,7 @@ def camera_worker(shared_state, hf_data):
     init_params = sl.InitParameters()
     init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.camera_fps = getattr(cfg, 'CAM_FPS', 30)
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
+    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init_params.coordinate_units = sl.UNIT.METER
 
     err = zed.open(init_params)
@@ -351,7 +351,7 @@ def camera_worker(shared_state, hf_data):
 
                 # 3. YOLO INFERENCE
                 conf_val = getattr(cfg, 'YOLO_CONFIDENCE', 0.50)
-                results = model(frame, conf=conf_val, imgsz=[544, 960], verbose=False)[0]
+                results = model(frame, conf=conf_val, imgsz=1024, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
 
                 # Fetch necessary shared state vars for calculation

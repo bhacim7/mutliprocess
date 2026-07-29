@@ -3,12 +3,10 @@ import math
 import time
 import threading
 
-
 class USVController:
     """
     Interface to communicate with the Flight Controller (e.g., OrangeCube) via PyMavlink.
     """
-
     def __init__(self, port="/dev/ttyACM0", baud=57600):
         self.port = port
         self.baud = baud
@@ -44,7 +42,7 @@ class USVController:
                 self.master.target_system,
                 self.master.target_component,
                 mavutil.mavlink.MAV_DATA_STREAM_ALL,
-                5,  # 5 Hz hızında iste
+                5, # 5 Hz hızında iste
                 1  # 1 = Başlat
             )
             print("[USVController] Data stream requested (ALL @ 5Hz).")
@@ -58,7 +56,7 @@ class USVController:
                 if not msg:
                     break
                 self.msg_dict[msg.get_type()] = msg
-            time.sleep(0.01)  # CPU'yu boğmamak için ufak gecikme
+            time.sleep(0.01) # CPU'yu boğmamak için ufak gecikme
 
     def stop_listener(self):
         """Thread'i güvenli şekilde durdurur."""
@@ -86,7 +84,7 @@ class USVController:
         """Returns compass heading in degrees."""
         msg = self.msg_dict.get('GLOBAL_POSITION_INT')
         if msg:
-            return msg.hdg / 100.0  # cdeg to degrees
+            return msg.hdg / 100.0 # cdeg to degrees
 
         # Fallback
         msg_vfr = self.msg_dict.get('VFR_HUD')

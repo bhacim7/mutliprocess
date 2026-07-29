@@ -101,26 +101,73 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         print(f"[NAV_PROCESS][ERROR] Failed to init USV Controller: {e}")
         return
 
-    # 2. Local Costmap Variables
-    # Expand global map to 400x400 meters to prevent driving off the edge,
-    # while preserving the entire mapped course for post-mission export.
-    COSTMAP_SIZE_PX = (4000, 4000)
+    # 2. Infinite Costmap Variables
     COSTMAP_RES_M_PER_PX = 0.10
-    costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
-    display_costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
+
+    # Start with 80x80m (800x800 px). It will dynamically expand.
+    # costmap_img is 1-channel for A*, display is 3-channel BGR for export
+    costmap_img = np.full((800, 800), 127, dtype=np.uint8)
+    display_costmap_img = np.full((800, 800, 3), 255, dtype=np.uint8)
     costmap_center_m = (0, 0)
     costmap_ready = True
 
+    # Track where (0,0) world coordinates sit in the pixel array
+    origin_offset_x = 400
+    origin_offset_y = 400
+
+    def expand_map_if_needed(req_px, req_py):
+        """Dynamically expands the map arrays if a coordinate falls outside current bounds."""
+        nonlocal costmap_img, display_costmap_img, origin_offset_x, origin_offset_y
+        h, w = costmap_img.shape
+
+        # Calculate how much to expand
+        # Instead of expanding exactly to the pixel, expand in chunks of 400px (40m)
+        # to prevent continuous O(N^2) memory reallocation on every frame
+        chunk = 400
+        pad_left = max(0, (-req_px // chunk + 1) * chunk) if req_px < 0 else 0
+        pad_right = max(0, ((req_px - w) // chunk + 1) * chunk) if req_px >= w else 0
+        pad_top = max(0, (-req_py // chunk + 1) * chunk) if req_py < 0 else 0
+        pad_bottom = max(0, ((req_py - h) // chunk + 1) * chunk) if req_py >= h else 0
+
+        if pad_left == 0 and pad_right == 0 and pad_top == 0 and pad_bottom == 0:
+            return # No expansion needed
+
+        new_w = w + pad_left + pad_right
+        new_h = h + pad_top + pad_bottom
+
+        # Create new arrays
+        new_costmap = np.full((new_h, new_w), 127, dtype=np.uint8)
+        new_display = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
+
+        # Copy old data into new arrays
+        new_costmap[pad_top:pad_top+h, pad_left:pad_left+w] = costmap_img
+        new_display[pad_top:pad_top+h, pad_left:pad_left+w] = display_costmap_img
+
+        costmap_img = new_costmap
+        display_costmap_img = new_display
+
+        # Update origin offset since the old array shifted inside the new one
+        origin_offset_x += pad_left
+        origin_offset_y += pad_top
+
     def world_to_pixel(world_x, world_y):
-        cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
+        """Converts physical meters (from start point) to array pixel indices."""
         dx_m = world_x - costmap_center_m[0]
         dy_m = world_y - costmap_center_m[1]
-        px = int(cw + (dx_m / COSTMAP_RES_M_PER_PX))
-        py = int(ch - (dy_m / COSTMAP_RES_M_PER_PX))
-        h, w = COSTMAP_SIZE_PX
-        if 0 <= px < w and 0 <= py < h:
-            return (px, py)
-        return None
+
+        # Calculate raw pixel coordinate
+        px = int(origin_offset_x + (dx_m / COSTMAP_RES_M_PER_PX))
+        py = int(origin_offset_y - (dy_m / COSTMAP_RES_M_PER_PX)) # Y is inverted in images
+
+        # Expand map if the point is out of bounds
+        expand_map_if_needed(px, py)
+
+        # After potential expansion, the origin offset might have shifted!
+        # Re-calculate to get the definitive safe pixel coordinate.
+        safe_px = int(origin_offset_x + (dx_m / COSTMAP_RES_M_PER_PX))
+        safe_py = int(origin_offset_y - (dy_m / COSTMAP_RES_M_PER_PX))
+
+        return (safe_px, safe_py)
 
     # 3. State Machine Variables
     # PID Control Variables for Direct Drive
@@ -298,12 +345,22 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                         p_virtual = world_to_pixel(obj_world_x, obj_world_y)
                         if p_virtual:
+                            # Map cid to actual BGR color for the judges' map
+                            # 0: Red, 1: Yellow, 2: Black, 3: Orange, 4: Green
+                            cid = obj.get('cid')
+                            bgr_color = (0,0,0) # Default Black
+                            if cid == 0: bgr_color = (0, 0, 255) # Red
+                            elif cid == 1: bgr_color = (0, 255, 255) # Yellow
+                            elif cid == 2: bgr_color = (0, 0, 0) # Black
+                            elif cid == 3: bgr_color = (0, 165, 255) # Orange
+                            elif cid == 4: bgr_color = (0, 255, 0) # Green
+
                             # 1. ALWAYS draw on the Display Map (for final export to judges)
-                            cv2.circle(display_costmap_img, p_virtual, 6, 0, -1)
+                            cv2.circle(display_costmap_img, p_virtual, 6, bgr_color, -1)
 
                             # 2. Draw on the A* Navigation Map ONLY if it's an actual obstacle
                             # (cid 1 = Yellow, cid 3 = Orange). Ignore red/green channel gates.
-                            is_obstacle = obj.get('cid') in [1, 3]
+                            is_obstacle = cid in [1, 3]
                             if is_obstacle:
                                 cv2.circle(costmap_img, p_virtual, 6, 0, -1)
 
@@ -321,7 +378,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 }
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
-                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
+                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                     if task_state == "TASK1_STATE_ENTER":
                         task_state = "TASK1_STATE_MID"
                     elif task_state == "TASK1_STATE_MID":
@@ -342,7 +399,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
                         task_state = next_state
                     return task_state, t_lat, t_lon
 
@@ -663,14 +720,15 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             crop_radius_m = 10.0  # Only look at a 20m x 20m window around the boat
                             crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
 
-                            cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
-                            rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
-                            ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+                            cw, ch = origin_offset_x, origin_offset_y
+                            rx_px, ry_px = world_to_pixel(robot_x, robot_y)
+
+                            h_map, w_map = costmap_img.shape
 
                             x_min = max(0, rx_px - crop_radius_px)
-                            x_max = min(COSTMAP_SIZE_PX[0], rx_px + crop_radius_px)
+                            x_max = min(w_map, rx_px + crop_radius_px)
                             y_min = max(0, ry_px - crop_radius_px)
-                            y_max = min(COSTMAP_SIZE_PX[1], ry_px + crop_radius_px)
+                            y_max = min(h_map, ry_px + crop_radius_px)
 
                             cropped_costmap = costmap_img[y_min:y_max, x_min:x_max]
                             cropped_center_m = (
@@ -806,12 +864,25 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 filename = f"costmap_final_{ts}.png"
 
                 # Optionally, draw a marker for the boat's final position before saving
-                cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
-                rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
-                ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+                rx_px, ry_px = world_to_pixel(robot_x, robot_y)
                 cv2.drawMarker(display_costmap_img, (rx_px, ry_px), (0, 0, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
-                cv2.imwrite(filename, display_costmap_img)
+                # Dynamically crop the massive map down to just the areas we explored to save space
+                coords = cv2.findNonZero((display_costmap_img != 255).any(axis=-1).astype(np.uint8))
+                if coords is not None:
+                    x, y, w, h = cv2.boundingRect(coords)
+                    # Add 100px (10m) padding
+                    pad = 100
+                    h_map, w_map = display_costmap_img.shape[:2]
+                    x_start = max(0, x - pad)
+                    y_start = max(0, y - pad)
+                    x_end = min(w_map, x + w + pad)
+                    y_end = min(h_map, y + h + pad)
+                    final_img = display_costmap_img[y_start:y_end, x_start:x_end]
+                else:
+                    final_img = display_costmap_img
+
+                cv2.imwrite(filename, final_img)
                 print(f"[NAV_PROCESS] Successfully exported final costmap to {filename}")
             except Exception as e:
                 print(f"[NAV_PROCESS] Failed to export costmap: {e}")
