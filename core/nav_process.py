@@ -321,7 +321,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 }
 
                 t_lat, t_lon = targets.get(task_state, (None, None))
-                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                if t_lat and nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
                     if task_state == "TASK1_STATE_ENTER":
                         task_state = "TASK1_STATE_MID"
                     elif task_state == "TASK1_STATE_MID":
@@ -342,7 +342,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 if task_state in targets:
                     t_lat, t_lon, next_state = targets[task_state]
-                    if nav.haversine(lat, lon, t_lat, t_lon) < 2.0:
+                    if nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
                         task_state = next_state
                     return task_state, t_lat, t_lon
 

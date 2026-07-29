@@ -11,10 +11,12 @@ from core.lidar_process import lidar_worker
 from core.nav_process import nav_worker
 from core.telem_process import telem_worker
 
+
 def signal_handler(sig, frame):
     """Catches OS kill signals."""
     print("\n[ORCHESTRATOR] Kill signal received. Securing system...")
     sys.exit(0)
+
 
 def pre_flight_check(shared_state, hf_data):
     """Blocks execution until critical sensors come online in the worker processes."""
@@ -49,6 +51,7 @@ def pre_flight_check(shared_state, hf_data):
         print("=" * 60)
         shared_state['mission_started'] = True
 
+
 def main():
     print("=" * 50)
     print("🚀 RoboBoat 2026 - IDA System Orchestrator Starting...")
@@ -69,10 +72,10 @@ def main():
     shared_state = manager.dict({
         # Global Control Flags
         'shutdown': False,
-        'mission_started': False, # <--- Starts False, blocks motors until pre-flight passes
-        'manual_mode': False,
+        'mission_started': False,  # <--- Starts False, blocks motors until pre-flight passes
+        'manual_mode': True,
         'current_task': 'TASK_1',
-        
+
         'target_dist': 0.0,
         'adviced_course': 0.0,
         'angle_error': 0.0,
@@ -90,11 +93,11 @@ def main():
         'lidar_left_dist': float('inf'),
         'lidar_center_dist': float('inf'),
         'lidar_right_dist': float('inf'),
-        'lidar_wave_stable': True, # Pitch/Roll stability flag
-        'lidar_points': [], # Downsampled lightweight points for mapping
+        'lidar_wave_stable': True,  # Pitch/Roll stability flag
+        'lidar_points': [],  # Downsampled lightweight points for mapping
 
         # Vision Process Output (Metadata Only)
-        'vision_detected_objects': [], # List of dicts: {'type': x, 'color': y, 'lat': z, 'lon': w, 'dist': d}
+        'vision_detected_objects': [],  # List of dicts: {'type': x, 'color': y, 'lat': z, 'lon': w, 'dist': d}
         'vision_frame_ready': False,
 
         # Motor State (For telemetry & debugging)
@@ -118,7 +121,7 @@ def main():
     # 3. QUEUES FOR IPC
     command_queue = mp.Queue()
     # --- 4-A UPDATE: Queue for heavy Lidar points ---
-    lidar_queue = mp.Queue(maxsize=10) # Small maxsize to prevent memory bloat if nav lags
+    lidar_queue = mp.Queue(maxsize=10)  # Small maxsize to prevent memory bloat if nav lags
 
     # 4. DEFINE PROCESSES
     processes = []
@@ -194,6 +197,7 @@ def main():
                 p.terminate()
 
     print("[ORCHESTRATOR] System shutdown complete. Have a good day Captain.")
+
 
 if __name__ == '__main__':
     mp.set_start_method('spawn')
