@@ -11,6 +11,7 @@ import utils.planner as planner
 from utils.navigasyon import calculate_obj_gps
 
 import queue
+from utils.costmap_recorder import CostmapRecorder
 
 
 def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
@@ -157,6 +158,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     t3_original_heading = None
     t3_search_move_target = None
 
+    costmap_recorder = None
+    if getattr(cfg, 'RECORD_COSTMAP', False):
+        costmap_recorder = CostmapRecorder()
+        costmap_recorder.register_exit_handlers()
+
     try:
         while not shared_state['shutdown']:
             start_time = time.time()
@@ -273,6 +279,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             # -----------------------------------------------------------
 
             vision_objects = shared_state.get('vision_detected_objects', [])
+
+            # --- UPDATE SEPARATE COSTMAP RECORDER ---
+            if costmap_recorder is not None:
+                # Use current raw gps location to feed global costmap
+                costmap_recorder.update(ida_enlem, ida_boylam, vision_objects)
 
             # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
             # Most logic has been moved to lidar_process (4-B Update)
@@ -790,6 +801,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         print(f"[NAV_PROCESS][ERROR] Brain crashed: {e}")
     finally:
         print("[NAV_PROCESS] Shutting down...")
+        if costmap_recorder is not None:
+            costmap_recorder.save()
         try:
             apply_motor_mixer(controller, 1500, 0)
 
