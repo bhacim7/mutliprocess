@@ -22,6 +22,7 @@ from datetime import datetime
 import numpy as np
 import socket
 import struct
+import config as cfg
 
 def res_path(name: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))  # onefile için _MEIPASS
@@ -2353,12 +2354,64 @@ class MainWindow(QtWidgets.QMainWindow):
         gl.addWidget(self.chk_fence_active, 1, 0, 1, 2)
         bot_lay.addWidget(geo_box)
 
+        # Drone (İHA) Alanı
+        iha_box = QtWidgets.QGroupBox("İHA (Drone)")
+        iha_l = QtWidgets.QVBoxLayout(iha_box)
+
+        # İHA Bağlantı Durumu ve LED
+        h_iha_conn = QtWidgets.QHBoxLayout()
+        lbl_iha_title = QtWidgets.QLabel("Durum:")
+        lbl_iha_title.setStyleSheet("color: #cfd8dc; font-weight: bold; font-size: 11px;")
+        self.iha_led = QtWidgets.QLabel()
+        self.iha_led.setFixedSize(16, 16)
+        self.iha_led.setStyleSheet("background-color:#37474f; border-radius:8px;")
+        h_iha_conn.addWidget(lbl_iha_title)
+        h_iha_conn.addWidget(self.iha_led)
+        h_iha_conn.addStretch()
+
+        # Drone Aktif Checkbox
+        self.chk_drone_active = QtWidgets.QCheckBox("Drone Dinle")
+        self.chk_drone_active.setStyleSheet("color:#00e5ff; font-weight:bold;")
+        self.chk_drone_active.setChecked(getattr(cfg, 'DRONE_ACTIVE', False))
+        self.chk_drone_active.stateChanged.connect(self._on_drone_active_changed)
+
+        # Hedef Renk Gösterimi
+        h_iha_color = QtWidgets.QHBoxLayout()
+        lbl_color_title = QtWidgets.QLabel("Hedef Renk:")
+        lbl_color_title.setStyleSheet("color: #cfd8dc; font-weight: bold; font-size: 11px;")
+
+        default_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')
+        tr_default = default_color.upper()
+        if default_color == 'red': tr_default = "KIRMIZI"
+        elif default_color == 'green': tr_default = "YESIL"
+        elif default_color == 'black': tr_default = "SIYAH"
+
+        self.lbl_iha_color = QtWidgets.QLabel(f"Varsayılan: {tr_default}")
+        self.lbl_iha_color.setStyleSheet("""
+            color: #00e676;
+            font-weight: bold;
+            font-size: 12px;
+            background-color: rgba(0, 0, 0, 40);
+            border-radius: 3px;
+            padding: 2px;
+        """)
+        h_iha_color.addWidget(lbl_color_title)
+        h_iha_color.addWidget(self.lbl_iha_color)
+        h_iha_color.addStretch()
+
+        iha_l.addLayout(h_iha_conn)
+        iha_l.addWidget(self.chk_drone_active)
+        iha_l.addLayout(h_iha_color)
+        iha_l.addStretch()
+        bot_lay.addWidget(iha_box)
+
         # Parkur Izgaraları (A-B-C)
         self.course_ui = {}
         course_grp = QtWidgets.QGroupBox("Parkur");
         cl = QtWidgets.QVBoxLayout(course_grp)
         self.tabs_course = QtWidgets.QTabWidget();
         self.tabs_course.setFixedHeight(120)
+        course_grp.setMaximumWidth(400)
         for name in ["A", "B", "C"]:
             w = QtWidgets.QWidget()
             v_tab = QtWidgets.QVBoxLayout(w)
@@ -2428,6 +2481,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.heartbeat_timer = QtCore.QTimer(self);
         self.heartbeat_timer.timeout.connect(self._on_hb_timeout);
         self.heartbeat_timer.start(2000)
+
+        self.drone_heartbeat_timer = QtCore.QTimer(self)
+        self.drone_heartbeat_timer.timeout.connect(self._on_drone_hb_timeout)
+        self.drone_heartbeat_timer.start(2000)
         # Araçlardan gelen "teyit edilmiş" noktaları tutan hafıza
         self.verified_mission_1 = []
         self.verified_mission_2 = []
@@ -2956,10 +3013,37 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(dict)
     def on_packet(self, d: dict):
         bid = int(d.get("id", 1))  # <--- ÇÖZÜM: Kesinlikle tam sayıya (1 veya 2) çevir!
+
+        # İHA (Drone) paketi ise işle ve dön
+        if bid == 3:
+            drone_color_tr = d.get("drone_color", "BELIRSIZ")
+
+            # LED yanıp sönme efekti ve timer reset
+            self.iha_led.setStyleSheet("background-color:#00e676; border-radius:8px;")
+            QtCore.QTimer.singleShot(100, lambda: self.iha_led.setStyleSheet("background-color:#1b5e20; border-radius:8px;"))
+            if hasattr(self, 'drone_heartbeat_timer'):
+                self.drone_heartbeat_timer.start(2500)
+
+            if self.chk_drone_active.isChecked():
+                self.lbl_iha_color.setText(drone_color_tr)
+
+                # Türkçe rengi İngilizceye çevir
+                mapped_color = "red"
+                if drone_color_tr == "KIRMIZI": mapped_color = "red"
+                elif drone_color_tr == "YESIL": mapped_color = "green"
+                elif drone_color_tr == "SIYAH": mapped_color = "black"
+
+                # Tekneye (IDA 1) yeni hedef rengi gönder. State-tracking to avoid redundant messages.
+                if not hasattr(self, 'last_sent_drone_color') or self.last_sent_drone_color != mapped_color:
+                    if self.worker_1:
+                        self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": mapped_color})
+                        self.last_sent_drone_color = mapped_color
+            return
+
         task_str = d.get("task", "")
 
         # LED
-        led = self.usv1_led if bid == 1 else self.usv2_led
+        led = self.usv1_led if bid == 1 else getattr(self, 'usv2_led', self.usv1_led)
         led.setStyleSheet("background-color:#00e676; border-radius:10px;")
         QtCore.QTimer.singleShot(100, lambda: led.setStyleSheet("background-color:#1b5e20; border-radius:10px;"))
         self.heartbeat_timer.start(2500)
@@ -3367,8 +3451,40 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.btn_fence_draw.setText("Çiz"); self.map.finish_fence_drawing()
 
+    def _on_drone_active_changed(self, state):
+        if not self.chk_drone_active.isChecked():
+            # Kullanıcı checkbox'ı kapattıysa, varsayılan rengi göster
+            default_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')
+            tr_default = default_color.upper()
+            if default_color == 'red': tr_default = "KIRMIZI"
+            elif default_color == 'green': tr_default = "YESIL"
+            elif default_color == 'black': tr_default = "SIYAH"
+
+            self.lbl_iha_color.setText(f"Varsayılan: {tr_default}")
+
+            # Tekneye (IDA 1) varsayılan hedef rengi gönder ki sıfırlansın
+            if self.worker_1:
+                self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": default_color.lower()})
+                self.last_sent_drone_color = default_color.lower()
+
     def _on_hb_timeout(self):
         self.usv1_led.setStyleSheet("background-color:#b71c1c; border-radius:10px;")
+
+    def _on_drone_hb_timeout(self):
+        self.iha_led.setStyleSheet("background-color:#b71c1c; border-radius:8px;")
+        # Drone bağlantısı koparsa varsayılan renge dön
+        if getattr(self, 'chk_drone_active', None) and self.chk_drone_active.isChecked():
+            default_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')
+            tr_default = default_color.upper()
+            if default_color == 'red': tr_default = "KIRMIZI"
+            elif default_color == 'green': tr_default = "YESIL"
+            elif default_color == 'black': tr_default = "SIYAH"
+
+            self.lbl_iha_color.setText(f"Varsayılan: {tr_default}")
+
+            if self.worker_1 and getattr(self, 'last_sent_drone_color', None) != default_color.lower():
+                self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": default_color.lower()})
+                self.last_sent_drone_color = default_color.lower()
 
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()] or ["COM3"]
