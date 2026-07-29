@@ -424,42 +424,41 @@ def camera_worker(shared_state, hf_data):
                             final_id, f_lat, f_lon = obj_manager.update_and_get_id(obj_lat, obj_lon, r_type, r_color)
                             t_ctx = TASK_CONTEXT_MAP.get(mevcut_gorev, ProtoEnum.TASK_NONE)
 
-                            if t_ctx != ProtoEnum.TASK_NONE:
-                                current_frame_objects.append({
-                                    "type": r_type,
-                                    "color": r_color,
-                                    "lat": f_lat,
-                                    "lon": f_lon,
-                                    "dist": dist_m,
-                                    "id": final_id,
-                                    "ctx": t_ctx,
-                                    "cid": cid,
-                                    "cx": cx,
-                                    "cy": cy,
-                                    "area": (x2 - x1) * (y2 - y1)
-                                })
+                            current_frame_objects.append({
+                                "type": r_type,
+                                "color": r_color,
+                                "lat": f_lat,
+                                "lon": f_lon,
+                                "dist": dist_m,
+                                "id": final_id,
+                                "ctx": t_ctx,
+                                "cid": cid,
+                                "cx": cx,
+                                "cy": cy,
+                                "area": (x2 - x1) * (y2 - y1)
+                            })
 
-                                # Draw Bounding Box and Label
-                                color_map = {
-                                    0: (0, 0, 255),  # Red
-                                    1: (0, 255, 255),  # Yellow
-                                    2: (0, 0, 0),  # Black
-                                    3: (0, 165, 255),  # Orange
-                                    4: (0, 255, 0)  # Green
-                                }
-                                label_map = {
-                                    0: "Red",
-                                    1: "Yellow",
-                                    2: "Black",
-                                    3: "Orange",
-                                    4: "Green"
-                                }
+                            # Draw Bounding Box and Label
+                            color_map = {
+                                0: (0, 0, 255),  # Red
+                                1: (0, 255, 255),  # Yellow
+                                2: (0, 0, 0),  # Black
+                                3: (0, 165, 255),  # Orange
+                                4: (0, 255, 0)  # Green
+                            }
+                            label_map = {
+                                0: "Red",
+                                1: "Yellow",
+                                2: "Black",
+                                3: "Orange",
+                                4: "Green"
+                            }
 
-                                 box_color = color_map.get(cid, (255, 255, 255))
-                                 label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
+                            box_color = color_map.get(cid, (255, 255, 255))
+                            label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
-                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                            cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
                 shared_state['vision_detected_objects'] = current_frame_objects
                 shared_state['vision_detected_objects'] = current_frame_objects

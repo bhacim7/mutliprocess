@@ -107,6 +107,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     COSTMAP_SIZE_PX = (4000, 4000)
     COSTMAP_RES_M_PER_PX = 0.10
     costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
+    display_costmap_img = np.full(COSTMAP_SIZE_PX, 127, dtype=np.uint8)
     costmap_center_m = (0, 0)
     costmap_ready = True
 
@@ -280,13 +281,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             # If lidar is completely disabled or dead, we still need a blank map to draw vision objects on
             if not getattr(cfg, 'ENABLE_LIDAR', True):
                 costmap_img.fill(127)
+                # Display map is strictly vision based for now, never overwritten by lidar arrays
+                # (unless lidar_worker is updated to push separated matrices)
 
             if vision_objects and costmap_ready:
                 # If we are using vision-only or fused, draw vision objects on whatever map we have
                 for obj in vision_objects:
-                    if "TASK2" in mevcut_gorev and obj.get('cid') not in [1, 3]:
-                        continue
-
                     dist_m = obj.get('dist', 0)
                     if 0 < dist_m < 15.0:
                         pixel_offset = (obj.get('cx', 1280 / 2) - (1280 / 2)) / 1280.0
@@ -298,7 +298,14 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                         p_virtual = world_to_pixel(obj_world_x, obj_world_y)
                         if p_virtual:
-                            cv2.circle(costmap_img, p_virtual, 6, 0, -1)
+                            # 1. ALWAYS draw on the Display Map (for final export to judges)
+                            cv2.circle(display_costmap_img, p_virtual, 6, 0, -1)
+
+                            # 2. Draw on the A* Navigation Map ONLY if it's an actual obstacle
+                            # (cid 1 = Yellow, cid 3 = Orange). Ignore red/green channel gates.
+                            is_obstacle = obj.get('cid') in [1, 3]
+                            if is_obstacle:
+                                cv2.circle(costmap_img, p_virtual, 6, 0, -1)
 
             # --- E. FULL STATE MACHINE ---
             # 3-A UPDATE: Refactored modular state machine
@@ -790,6 +797,25 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         print(f"[NAV_PROCESS][ERROR] Brain crashed: {e}")
     finally:
         print("[NAV_PROCESS] Shutting down...")
+
+        # --- COSTMAP EXPORT FOR JUDGES ---
+        if getattr(cfg, 'EXPORT_COSTMAP', False):
+            try:
+                import datetime
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"costmap_final_{ts}.png"
+
+                # Optionally, draw a marker for the boat's final position before saving
+                cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
+                rx_px = int(cw + ((robot_x - costmap_center_m[0]) / COSTMAP_RES_M_PER_PX))
+                ry_px = int(ch - ((robot_y - costmap_center_m[1]) / COSTMAP_RES_M_PER_PX))
+                cv2.drawMarker(display_costmap_img, (rx_px, ry_px), (0, 0, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+
+                cv2.imwrite(filename, display_costmap_img)
+                print(f"[NAV_PROCESS] Successfully exported final costmap to {filename}")
+            except Exception as e:
+                print(f"[NAV_PROCESS] Failed to export costmap: {e}")
+
         try:
             apply_motor_mixer(controller, 1500, 0)
 
