@@ -104,4 +104,6 @@ T3_MID_LON = 29.2622795
 TASK3_KAMIKAZE_COLOR = "green"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 
+DRONE_ACTIVE = True
+
 MEVCUT_GOREV = "TASK1_STATE_ENTER"

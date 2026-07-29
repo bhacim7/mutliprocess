@@ -2334,7 +2334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map.gps_selected.connect(self._on_map_gps_selected)
         vc.addWidget(self.map)
 
-        # 3. Ortak Alt (Geofence, Jüri, Parkur)
+        # 3. Ortak Alt (Geofence, Jüri, Parkur, IHA)
         bot_lay = QtWidgets.QHBoxLayout();
         vc.addLayout(bot_lay)
 
@@ -2359,6 +2359,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cl = QtWidgets.QVBoxLayout(course_grp)
         self.tabs_course = QtWidgets.QTabWidget();
         self.tabs_course.setFixedHeight(120)
+        self.tabs_course.setMinimumWidth(250)
         for name in ["A", "B", "C"]:
             w = QtWidgets.QWidget()
             v_tab = QtWidgets.QVBoxLayout(w)
@@ -2416,6 +2417,42 @@ class MainWindow(QtWidgets.QMainWindow):
         cl.addWidget(self.tabs_course)
         bot_lay.addWidget(course_grp)
 
+        # IHA (Drone) Menüsü
+        iha_box = QtWidgets.QGroupBox("İHA")
+        il = QtWidgets.QVBoxLayout(iha_box)
+
+        # İHA Başlık ve LED
+        h_iha = QtWidgets.QHBoxLayout()
+        lbl_iha = QtWidgets.QLabel("İHA DURUM")
+        lbl_iha.setStyleSheet("""
+            color: #ff1744;
+            font-weight: bold;
+            font-size: 10pt;
+            background-color: rgba(40, 40, 40, 160);
+            padding: 2px 6px;
+            border-radius: 4px;
+        """)
+        h_iha.addWidget(lbl_iha)
+
+        self.drone_led = QtWidgets.QLabel()
+        self.drone_led.setFixedSize(16, 16)
+        self.drone_led.setStyleSheet("background-color:#b71c1c; border-radius:8px;") # Kırmızı = Bağlı Değil
+        h_iha.addWidget(self.drone_led, alignment=Qt.AlignRight)
+        il.addLayout(h_iha)
+
+        # İHA Hedef Renk
+        h_renk = QtWidgets.QHBoxLayout()
+        h_renk.addWidget(QtWidgets.QLabel("Hedef Renk:"))
+        self.drone_color_lbl = QtWidgets.QLabel("Bekleniyor")
+        self.drone_color_lbl.setStyleSheet("font-weight: bold; color: yellow;")
+        h_renk.addWidget(self.drone_color_lbl)
+        il.addLayout(h_renk)
+
+        # Boşluğu doldurmak için spacer
+        il.addStretch(1)
+
+        bot_lay.addWidget(iha_box)
+
         splitter.addWidget(center_widget)
 
         # Splitter Oranları
@@ -2428,6 +2465,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.heartbeat_timer = QtCore.QTimer(self);
         self.heartbeat_timer.timeout.connect(self._on_hb_timeout);
         self.heartbeat_timer.start(2000)
+
+        self.drone_hb_timer = QtCore.QTimer(self)
+        self.drone_hb_timer.timeout.connect(self._on_drone_hb_timeout)
+
         # Araçlardan gelen "teyit edilmiş" noktaları tutan hafıza
         self.verified_mission_1 = []
         self.verified_mission_2 = []
@@ -2956,16 +2997,36 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(dict)
     def on_packet(self, d: dict):
         bid = int(d.get("id", 1))  # <--- ÇÖZÜM: Kesinlikle tam sayıya (1 veya 2) çevir!
+
+        # Drone (İHA) Telemetrisi Kontrolü
+        if bid == 3:
+            # Drone LED efekti
+            self.drone_led.setStyleSheet("background-color:#00e676; border-radius:8px;")
+            QtCore.QTimer.singleShot(100, lambda: self.drone_led.setStyleSheet("background-color:#1b5e20; border-radius:8px;"))
+            self.drone_hb_timer.start(2500)
+
+            drone_color = d.get("drone_color", "BELIRSIZ")
+            self.drone_color_lbl.setText(drone_color)
+
+            # İngilizceye çevir ve komut yolla
+            color_map = {"KIRMIZI": "red", "YESIL": "green", "SIYAH": "black", "SARI": "yellow"}
+            if drone_color in color_map:
+                eng_color = color_map[drone_color]
+                if self.worker_1:
+                    self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": eng_color})
+            return
+
         task_str = d.get("task", "")
 
         # LED
-        led = self.usv1_led if bid == 1 else self.usv2_led
-        led.setStyleSheet("background-color:#00e676; border-radius:10px;")
-        QtCore.QTimer.singleShot(100, lambda: led.setStyleSheet("background-color:#1b5e20; border-radius:10px;"))
-        self.heartbeat_timer.start(2500)
+        led = self.usv1_led if bid == 1 else getattr(self, "usv2_led", self.usv1_led)
+        if led:
+            led.setStyleSheet("background-color:#00e676; border-radius:10px;")
+            QtCore.QTimer.singleShot(100, lambda: led.setStyleSheet("background-color:#1b5e20; border-radius:10px;"))
+            self.heartbeat_timer.start(2500)
 
         # UI Update
-        ui = self.usv1_ui if bid == 1 else self.usv2_ui
+        ui = self.usv1_ui if bid == 1 else getattr(self, "usv2_ui", self.usv1_ui)
         # Eğer pakette görev listesi varsa hafızaya al ve haritayı güncelle
 
         # Anahtar ismini kendi protokolüne göre değiştirebilirsin: "mission_list", "points" vs.
@@ -3369,6 +3430,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_hb_timeout(self):
         self.usv1_led.setStyleSheet("background-color:#b71c1c; border-radius:10px;")
+
+    def _on_drone_hb_timeout(self):
+        self.drone_led.setStyleSheet("background-color:#b71c1c; border-radius:8px;")
+        self.drone_color_lbl.setText("Bağlantı Koptu")
 
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()] or ["COM3"]
