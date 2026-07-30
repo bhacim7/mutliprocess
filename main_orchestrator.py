@@ -151,16 +151,33 @@ def main():
     pre_flight_check(shared_state, hf_data)
 
     # 6. WATCHDOG LOOP
+    # Heartbeat keys published per-process, and how long a missing/stale heartbeat is tolerated
+    # before we treat an is_alive()==True process as wedged. is_alive() alone cannot detect a
+    # process blocked on a hung call (e.g. a serial write) - it only detects a dead process.
+    HEARTBEAT_KEYS = {"NavProcess": "nav_heartbeat", "TelemProcess": "telem_heartbeat"}
+    HEARTBEAT_TIMEOUT_S = 5.0
+
     try:
         while True:
             if shared_state['shutdown']:
                 print("[ORCHESTRATOR] Shutdown command detected!")
                 break
 
-            # Watchdog: Check if all processes are alive, restart if necessary
+            # Watchdog: Check if all processes are alive AND still making progress; restart if not
             for i, p in enumerate(processes):
-                if not p.is_alive():
-                    print(f"[ORCHESTRATOR][WARNING] Process {p.name} (PID: {p.pid}) has died unexpectedly!")
+                is_wedged = False
+                hb_key = HEARTBEAT_KEYS.get(p.name)
+                if hb_key and p.is_alive():
+                    last_hb = shared_state.get(hb_key)
+                    if last_hb is not None and (time.time() - last_hb) > HEARTBEAT_TIMEOUT_S:
+                        is_wedged = True
+                        print(f"[ORCHESTRATOR][WARNING] {p.name} (PID: {p.pid}) is alive but heartbeat "
+                              f"is stale ({time.time() - last_hb:.1f}s) - treating as wedged!")
+                        p.terminate()  # is_alive() is True, so it won't be caught below without this
+                        p.join(timeout=2.0)
+
+                if not p.is_alive() or is_wedged:
+                    print(f"[ORCHESTRATOR][WARNING] Process {p.name} (PID: {p.pid}) has died or was wedged!")
                     # Identify the correct target and args based on the name
                     if p.name == "NavProcess":
                         target = nav_worker

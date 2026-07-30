@@ -10,7 +10,9 @@ class TelemetrySender:
         self.baud = baud
         self.ser = None
         try:
-            self.ser = serial.Serial(port, baud, timeout=1)
+            # write_timeout bounds ser.write() too - without it, a link glitch blocks forever
+            # even though send() below already wraps the call in try/except.
+            self.ser = serial.Serial(port, baud, timeout=1, write_timeout=0.5)
             print(f"[TelemetrySender] Initialized on {port} @ {baud}")
         except Exception as e:
             print(f"[TelemetrySender] Error opening {port}: {e}")

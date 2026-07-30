@@ -18,6 +18,17 @@ class USVController:
         print(f"[USVController] Initializing on {port} at {baud} baud. Waiting for connection...")
         try:
             self.master = mavutil.mavlink_connection(port, baud=baud)
+
+            # Without this, pyserial's underlying write() blocks forever if the link glitches
+            # (buffer full / device unresponsive), which freezes the entire single-threaded
+            # nav loop - stuck heading/distance/PWM, no watchdog recovery since the process
+            # is still technically alive. Cap it so a bad write raises instead of hanging.
+            try:
+                self.master.port.write_timeout = 0.2
+                self.master.port.timeout = 0.2
+            except Exception:
+                pass
+
             print("[USVController] Connected to MAVLINK. Waiting for heartbeat...")
             self.master.wait_heartbeat()
             print("[USVController] Heartbeat found!")
@@ -103,15 +114,22 @@ class USVController:
         """Commands the hardware to set a specific PWM on a servo channel."""
         self.pwms[channel] = pwm
         if self.master:
-            self.master.mav.command_long_send(
-                self.master.target_system,
-                self.master.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                0,
-                channel,
-                pwm,
-                0, 0, 0, 0, 0
-            )
+            try:
+                self.master.mav.command_long_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0,
+                    channel,
+                    pwm,
+                    0, 0, 0, 0, 0
+                )
+            except Exception as e:
+                # A bounded write_timeout means we land here instead of hanging the nav loop.
+                # Don't re-raise: the caller (nav_worker) needs to keep looping so its
+                # heartbeat stays fresh and the watchdog doesn't have to kill+restart it
+                # just because one servo write glitched.
+                print(f"[USVController][WARNING] set_servo({channel}) write failed: {e}")
 
     def set_mode(self, mode_name):
         """Changes the vehicle flight mode."""

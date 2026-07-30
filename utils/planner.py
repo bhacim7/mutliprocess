@@ -125,7 +125,8 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
     start = w2p(*start_world)
     raw_goal = w2p(*end_world)
 
-    if not start or not raw_goal: return None
+    # Note: w2p() always returns a 2-tuple, so a plain truthiness check here can never catch
+    # anything - out-of-window goals are handled explicitly below via the clamp instead.
 
     # Safety Clamp: Ensure goal is strictly within the map boundaries.
     # If the target is pushed outside the cropped window (e.g. 50m target on a 20m window),
