@@ -303,18 +303,21 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     if "TASK2" in mevcut_gorev and obj.get('cid') not in [1, 3]:
                         continue
 
-                    dist_m = obj.get('dist', 0)
-                    if 0 < dist_m < 15.0:
-                        pixel_offset = (obj.get('cx', 1280 / 2) - (1280 / 2)) / 1280.0
-                        angle_offset = -pixel_offset * math.radians(getattr(cfg, 'CAM_HFOV', 110.0))
-                        obj_global_angle = robot_yaw + angle_offset
+                    obj_lat = obj.get('lat')
+                    obj_lon = obj.get('lon')
+                    
+                    if obj_lat and obj_lon and ida_enlem != 0:
+                        real_dist = nav.haversine(ida_enlem, ida_boylam, obj_lat, obj_lon)
+                        real_bearing = nav.calculate_bearing(ida_enlem, ida_boylam, obj_lat, obj_lon)
+                        
+                        if 0 < real_dist < 15.0:
+                            angle_in_world = math.radians(real_bearing)
+                            obj_world_x = robot_x + (real_dist * math.cos(angle_in_world))
+                            obj_world_y = robot_y + (real_dist * math.sin(angle_in_world))
 
-                        obj_world_x = robot_x + (dist_m * math.cos(obj_global_angle))
-                        obj_world_y = robot_y + (dist_m * math.sin(obj_global_angle))
-
-                        p_virtual = world_to_pixel(obj_world_x, obj_world_y)
-                        if p_virtual:
-                            cv2.circle(costmap_img, p_virtual, 6, 0, -1)
+                            p_virtual = world_to_pixel(obj_world_x, obj_world_y)
+                            if p_virtual:
+                                cv2.circle(costmap_img, p_virtual, 6, 0, -1)
 
             # --- E. FULL STATE MACHINE ---
             # 3-A UPDATE: Refactored modular state machine
@@ -607,7 +610,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             tx_world, ty_world = None, None
             if costmap_ready and target_lat is not None:
                 hybrid_local_target = None  # Reset
-                gps_lookahead = 1.5
+                gps_lookahead = 10.0
                 tx_world = robot_x + (gps_lookahead * math.cos(robot_yaw + math.radians(-aci_farki)))
                 ty_world = robot_y + (gps_lookahead * math.sin(robot_yaw + math.radians(-aci_farki)))
 
@@ -675,7 +678,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         if use_astar_planner:
                             # Run Planner
                             # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
-                            crop_radius_m = 10.0  # Only look at a 20m x 20m window around the boat
+                            crop_radius_m = 20.0  # Only look at a 20m x 20m window around the boat
                             crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
 
                             cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
