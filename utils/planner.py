@@ -273,13 +273,38 @@ def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, p
 
     # 3. Calculate steering error (Alpha)
     tx, ty = target_pt
-    alpha = math.atan2(ty - ry, tx - rx) - ryaw
+
+    # In this codebase, the A* grid (rx, ry) is built using math.cos/sin on raw compass bearings.
+    # Therefore, we can reverse this by using math.atan2 to get the angle in radians,
+    # but since it was built with compass logic (0 = North, clockwise),
+    # the atan2 result directly corresponds to a math.radians(compass_bearing).
+    # Since ryaw is passed as math.radians(magnetic_heading), we can just subtract them.
+    # WAIT - standard atan2(y, x) gives 0 for East, positive Counter-Clockwise.
+    # If the map was built using math.cos(compass_bearing) and math.sin(compass_bearing):
+    # - compass_bearing = 0 (North): cos(0)=1, sin(0)=0 -> (x=1, y=0) -> mapped to East on the grid.
+    # - compass_bearing = 90 (East): cos(90)=0, sin(90)=1 -> (x=0, y=1) -> mapped to North on the grid.
+    # This means math.atan2(ty - ry, tx - rx) gives the original math.radians(compass_bearing)!
+
+    target_bearing_rad = math.atan2(ty - ry, tx - rx)
+    alpha = target_bearing_rad - ryaw
 
     # Normalize alpha to [-pi, pi]
     alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
 
-    # Convert to Degrees for PID (invert to match legacy logic: Pos Err -> Turn Right)
-    heading_err = -math.degrees(alpha)
+    # Convert to Degrees for PID
+    # (Since alpha is target - current, positive alpha means target is to the right if compass is clockwise.
+    # Let's verify: compass 90, boat 0 -> alpha +90. We want to turn right.
+    # Legacy PID logic: positive heading_err turns right.
+    # Wait, the old code had `heading_err = -math.degrees(alpha)`. Let's remove the negative sign if alpha is already correct.)
+
+    # Old code had: heading_err = -math.degrees(alpha).
+    # Let's check signed_angle_difference in navigasyon.py: diff = (angle2 - angle1 + 180) % 360 - 180
+    # where angle2 is target, angle1 is current. Positive diff means target is to the right.
+    # We will use exactly that logic to be absolutely safe and consistent with Direct Drive PID.
+    target_bearing_deg = math.degrees(target_bearing_rad) % 360
+    current_heading_deg = math.degrees(ryaw) % 360
+
+    heading_err = (target_bearing_deg - current_heading_deg + 180) % 360 - 180
 
     # 4. PID calculation
     kp = getattr(cfg, 'PURE_PURSUIT_KP', 2.0)
