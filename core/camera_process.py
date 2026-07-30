@@ -461,8 +461,20 @@ def camera_worker(shared_state, hf_data):
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
-                shared_state['vision_detected_objects'] = current_frame_objects
-                shared_state['vision_detected_objects'] = current_frame_objects
+                memory_objects = []
+                for obj in obj_manager.memory:
+                    t_ctx = TASK_CONTEXT_MAP.get(mevcut_gorev, ProtoEnum.TASK_NONE)
+                    memory_objects.append({
+                        "type": obj.get('type'),
+                        "color": obj.get('color'),
+                        "lat": obj.get('lat'),
+                        "lon": obj.get('lon'),
+                        "id": obj.get('id'),
+                        "ctx": t_ctx,
+                        "cid": obj.get('color') - 1 if obj.get('color') > 0 else 0
+                    })
+                
+                shared_state['vision_detected_objects'] = memory_objects
 
                 import datetime
 
