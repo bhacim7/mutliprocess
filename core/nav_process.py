@@ -612,8 +612,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             if costmap_ready and target_lat is not None:
                 hybrid_local_target = None  # Reset
                 # Project the actual GPS target into the local world map
-                # We cap the distance at 50m so it fits within the cropped costmap
-                projection_dist = min(hedefe_mesafe, 50.0)
+                # We cap the distance at 15m so it fits securely within the 20m cropped costmap window!
+                projection_dist = min(hedefe_mesafe, 15.0)
 
                 # The local costmap is built using raw compass bearings mapped directly into math.cos/sin.
                 # We must plot the target exactly the same way we plot the vision obstacles.

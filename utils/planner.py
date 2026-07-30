@@ -123,14 +123,26 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
         return (x, y)
 
     start = w2p(*start_world)
-    goal = w2p(*end_world)
+    raw_goal = w2p(*end_world)
 
-    if not start or not goal: return None
+    if not start or not raw_goal: return None
+
+    # Safety Clamp: Ensure goal is strictly within the map boundaries.
+    # If the target is pushed outside the cropped window (e.g. 50m target on a 20m window),
+    # clamp it to the edge so A* doesn't get stuck in a full-grid search for an impossible point.
+    clamped_goal_x = max(0, min(size_px[0] - 1, raw_goal[0]))
+    clamped_goal_y = max(0, min(size_px[1] - 1, raw_goal[1]))
+    goal = (clamped_goal_x, clamped_goal_y)
+
+    # Check if start is inside obstacle (safety fallback)
+    if 0 <= start[0] < size_px[0] and 0 <= start[1] < size_px[1]:
+        if nav_map[start[1], start[0]] == 0:
+            # If boat is inside an obstacle, A* cannot escape. Return None to trigger fallback behavior (e.g. PID)
+            return None
 
     # Check if goal is inside obstacle. If so, fallback logic could be applied here
-    if 0 <= goal[0] < size_px[0] and 0 <= goal[1] < size_px[1]:
-        if nav_map[goal[1], goal[0]] == 0:
-            return None # Goal is unreachable
+    if nav_map[goal[1], goal[0]] == 0:
+        return None # Goal is unreachable
 
     open_set = []
     heapq.heappush(open_set, (0, start))
