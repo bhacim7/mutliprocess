@@ -413,6 +413,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                     for obj in vision_objects:
                         if obj.get('cid') == target_cid:
+                            cx_val = obj.get('cx')
+                            if cx_val is None:
+                                # No fresh pixel data for this tracked object this frame
+                                # (defensive: avoids KeyError if 'cx' was never populated)
+                                continue
+
                             found_target = True
                             dist_m = obj.get('dist', 10.0)
 
@@ -420,7 +426,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             # Prevent GPS PID from interfering by setting targets to None
                             target_lat, target_lon = None, None
 
-                            pixel_error = obj['cx'] - (1280 / 2) # Assuming 1280 width (ZED HD720)
+                            pixel_error = cx_val - (1280 / 2) # Assuming 1280 width (ZED HD720)
 
                             # Simple P controller for pixel error to steering PWM
                             kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
