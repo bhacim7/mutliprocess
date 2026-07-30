@@ -12,7 +12,7 @@ SHOW_LOCAL_WINDOW = False
 
 # --- HARDWARE SPECS ---
 ROBOT_RADIUS_M = 0.6
-INFLATION_MARGIN_M = 0.8 # Legacy value
+INFLATION_MARGIN_M = 1.2 # Legacy value
 MAX_TILT_ANGLE = 5.0
 
 # --- PINS / CHANNELS ---
