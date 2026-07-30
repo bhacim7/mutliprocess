@@ -535,6 +535,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     # Reset start_lat so we can capture it
                     start_lat = None
                     start_lon = None
+                    
 
                 # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
                 # This prevents the boat from drawing a line from the coast of Africa.
@@ -718,7 +719,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         # If we have an A* path (Task 2 only), follow it with Pure Pursuit
                         if current_path:
                             base_pwm = getattr(cfg, 'BASE_PWM', 1500)
-                            if mevcut_gorev.startswith("T3_"): base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+                            if mevcut_gorev.startswith("T3_") or "TASK3" in mevcut_gorev:
+                                base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
+                            else:
+                                base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
 
                             # Pure pursuit now returns base_speed and steering_correction instead of left/right pwms
                             p_base, p_steer, raw_target, current_error, pruned_path = planner.pure_pursuit_control(
