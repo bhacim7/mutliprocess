@@ -670,11 +670,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         else:
                             apply_motor_mixer(controller, 1500, -dinamik_spot_pwm)
                     else:
-                        current_path = None
-
                         # Failsafe: Use A* for Task 2 always, or for all tasks if LOS guidance is explicitly disabled.
                         # Do NOT use A* during the specific TASK3_SEARCH_KAMIKAZE phase as it relies on specific local waypoints.
                         use_astar_planner = ("TASK2" in mevcut_gorev) or (not getattr(cfg, 'ENABLE_LOS_GUIDANCE', True) and mevcut_gorev != "TASK3_SEARCH_KAMIKAZE")
+
+                        if not use_astar_planner:
+                            current_path = None
 
                         if use_astar_planner:
                             # Run Planner
