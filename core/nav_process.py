@@ -614,14 +614,13 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # Project the actual GPS target into the local world map
                 # We cap the distance at 50m so it fits within the cropped costmap
                 projection_dist = min(hedefe_mesafe, 50.0)
-                # Convert the true global bearing to the target into the local coordinate frame's math angle.
-                # In our local frame: robot_yaw is the heading in radians.
-                # The relative angle to the target is the signed angle difference.
-                relative_angle_deg = nav.signed_angle_difference(magnetic_heading, adviced_course)
-                target_angle_rad = robot_yaw + math.radians(relative_angle_deg)
 
-                tx_world = robot_x + (projection_dist * math.cos(target_angle_rad))
-                ty_world = robot_y + (projection_dist * math.sin(target_angle_rad))
+                # The local costmap is built using raw compass bearings mapped directly into math.cos/sin.
+                # We must plot the target exactly the same way we plot the vision obstacles.
+                angle_in_world = math.radians(adviced_course)
+
+                tx_world = robot_x + (projection_dist * math.cos(angle_in_world))
+                ty_world = robot_y + (projection_dist * math.sin(angle_in_world))
 
             # --- G. CONTROL LOGIC & MOTORS ---
             if manual_mode or not mission_started:
