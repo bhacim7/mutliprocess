@@ -110,7 +110,12 @@ class ObjectMemoryManager:
         self.id_counter = 1
         self.MERGE_DISTANCE = 2.5  # 2.5 meters merge distance
 
-    def update_and_get_id(self, lat, lon, obj_type, color):
+    def update_and_get_id(self, lat, lon, obj_type, color, cid=None, cx=None, cy=None, obj_dist=None, area=None):
+        """
+        cid/cx/cy/obj_dist/area are PER-FRAME (transient) values from the current detection.
+        They are refreshed on every sighting so Task3's visual servoing always reads the
+        latest pixel/distance data, while lat/lon/color/id remain the persistent GPS memory.
+        """
         current_time = time.time()
         best_match = None
         min_dist = float('inf')
@@ -146,6 +151,14 @@ class ObjectMemoryManager:
             best_match['lat'] = best_match['lat'] * 0.8 + lat * 0.2
             best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
             best_match['last_seen'] = current_time
+
+            # Refresh transient per-frame fields (NOT smoothed - always the latest reading)
+            best_match['cid'] = cid
+            best_match['cx'] = cx
+            best_match['cy'] = cy
+            best_match['dist'] = obj_dist
+            best_match['area'] = area
+
             return best_match['id'], best_match['lat'], best_match['lon']
         else:
             new_id = self.id_counter
@@ -158,7 +171,12 @@ class ObjectMemoryManager:
                 'color': color,
                 'last_seen': current_time,
                 'v_lat': 0.0,
-                'v_lon': 0.0
+                'v_lon': 0.0,
+                'cid': cid,
+                'cx': cx,
+                'cy': cy,
+                'dist': obj_dist,
+                'area': area,
             })
             return new_id, lat, lon
 
@@ -421,7 +439,11 @@ def camera_worker(shared_state, hf_data):
 
                             obj_lat, obj_lon = calculate_obj_gps(ida_enlem, ida_boylam, dist_m, obj_bearing)
 
-                            final_id, f_lat, f_lon = obj_manager.update_and_get_id(obj_lat, obj_lon, r_type, r_color)
+                            final_id, f_lat, f_lon = obj_manager.update_and_get_id(
+                                obj_lat, obj_lon, r_type, r_color,
+                                cid=cid, cx=cx, cy=cy, obj_dist=dist_m,
+                                area=(x2 - x1) * (y2 - y1)
+                            )
                             t_ctx = TASK_CONTEXT_MAP.get(mevcut_gorev, ProtoEnum.TASK_NONE)
 
                             if t_ctx != ProtoEnum.TASK_NONE:
@@ -461,6 +483,11 @@ def camera_worker(shared_state, hf_data):
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                                 cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                 # Push lightweight metadata to shared state
+                # NOTE: "cid" below is the RAW YOLO/data.yaml class id (0=red,1=yellow,2=black,
+                # 3=orange,4=green) stored verbatim in memory by update_and_get_id(). Do NOT
+                # recompute it from 'color' here - that produced a shifted mapping (color-1)
+                # that no longer matched the convention used by Task2's costmap filter and
+                # Task3's target_cid selection in nav_process.py.
                 memory_objects = []
                 for obj in obj_manager.memory:
                     t_ctx = TASK_CONTEXT_MAP.get(mevcut_gorev, ProtoEnum.TASK_NONE)
@@ -471,7 +498,11 @@ def camera_worker(shared_state, hf_data):
                         "lon": obj.get('lon'),
                         "id": obj.get('id'),
                         "ctx": t_ctx,
-                        "cid": obj.get('color') - 1 if obj.get('color') > 0 else 0
+                        "cid": obj.get('cid'),
+                        "cx": obj.get('cx'),
+                        "cy": obj.get('cy'),
+                        "dist": obj.get('dist', 10.0),
+                        "area": obj.get('area', 0),
                     })
                 
                 shared_state['vision_detected_objects'] = memory_objects
