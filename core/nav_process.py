@@ -535,6 +535,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     # Reset start_lat so we can capture it
                     start_lat = None
                     start_lon = None
+                    current_path = None  # Discard old A* path when target changes
                     
 
                 # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
