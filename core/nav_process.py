@@ -613,8 +613,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             if costmap_ready and target_lat is not None:
                 hybrid_local_target = None  # Reset
                 # Project the actual GPS target into the local world map
-                # We cap the distance at 15m so it fits securely within the 20m cropped costmap window!
-                projection_dist = min(hedefe_mesafe, 15.0)
+                # Cap distance so the projected point always fits inside the local A* crop window
+                # (cfg.A_STAR_CROP_RADIUS_M is the SAME constant used below to build that window -
+                # keeping these tied together is what prevents the out-of-bounds-goal freeze from
+                # silently coming back if the crop radius is ever retuned).
+                _a_star_crop_radius_m = getattr(cfg, 'A_STAR_CROP_RADIUS_M', 20.0)
+                projection_dist = min(hedefe_mesafe, _a_star_crop_radius_m * 0.75)
 
                 # The local costmap is built using raw compass bearings mapped directly into math.cos/sin.
                 # We must plot the target exactly the same way we plot the vision obstacles.
@@ -688,7 +692,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         if use_astar_planner:
                             # Run Planner
                             # --- 1-C UPDATE: Costmap Cropping for Faster A* ---
-                            crop_radius_m = 20.0  # Only look at a 20m x 20m window around the boat
+                            crop_radius_m = getattr(cfg, 'A_STAR_CROP_RADIUS_M', 20.0)  # Only look at a window around the boat; kept in sync with the projection clamp above
                             crop_radius_px = int(crop_radius_m / COSTMAP_RES_M_PER_PX)
 
                             cw, ch = COSTMAP_SIZE_PX[0] // 2, COSTMAP_SIZE_PX[1] // 2
@@ -820,6 +824,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
             shared_state['motor_pwm_front_left'] = controller.get_servo_pwm(getattr(cfg, 'FRONT_SOL_MOTOR', 2))
             shared_state['motor_pwm_front_right'] = controller.get_servo_pwm(getattr(cfg, 'FRONT_SAG_MOTOR', 4))
             shared_state['motor_pwm_steer'] = controller.get_servo_pwm(getattr(cfg, 'FRONT_STEER_SERVO', 5))
+
+            # Heartbeat: p.is_alive() in the orchestrator watchdog only detects a dead process,
+            # not one blocked on a hung call (e.g. a serial write). This timestamp lets the
+            # watchdog notice "alive but not making progress" and force a restart.
+            shared_state['nav_heartbeat'] = time.time()
 
             elapsed = time.time() - start_time
             if elapsed < 0.02: time.sleep(0.02 - elapsed)

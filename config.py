@@ -79,6 +79,7 @@ PURE_PURSUIT_KP = 5.5
 PURE_PURSUIT_KD = 2.5
 A_STAR_HEURISTIC_WEIGHT = 2.5
 COSTMAP_RES_M_PER_PX = 0.10
+A_STAR_CROP_RADIUS_M = 20.0  # Local A* window radius. Target projection below is derived from this.
 
 # --- TASK WAYPOINTS (Legacy values from IDA1) ---
 T1_GATE_ENTER_LAT =40.8090735

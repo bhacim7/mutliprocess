@@ -89,6 +89,8 @@ def telem_worker(shared_state, command_queue, hf_data):
                 tx.send(payload)
                 shared_state['send_telemetry'] = False
 
+            shared_state['telem_heartbeat'] = time.time()
+
             # Sleep to maintain frequency (~20Hz loop for polling responsiveness)
             elapsed = time.time() - start_time
             if elapsed < 0.05:
