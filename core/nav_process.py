@@ -736,7 +736,13 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             # ------------------------------------------------
 
                         # If we have an A* path (Task 2 only), follow it with Pure Pursuit
-                        if current_path:
+                        # NOTE: a path pruned down to 1 point is still "truthy" in Python, but
+                        # pure_pursuit_control() treats len(path)<2 as "no path" and returns
+                        # zero steering while handing the SAME 1-point path back unchanged.
+                        # That used to leave the boat frozen on whatever heading it had at the
+                        # moment the path collapsed - no correction, no replan, no PID fallback,
+                        # forever. Require at least 2 points before trusting Pure Pursuit.
+                        if current_path and len(current_path) >= 2:
                             base_pwm = getattr(cfg, 'BASE_PWM', 1500)
                             if mevcut_gorev.startswith("T3_") or "TASK3" in mevcut_gorev:
                                 base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
@@ -758,6 +764,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                         # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                         else:
+                            current_path = None  # Force a fresh A* attempt on the next plan_timer cycle
                             if target_lat is not None and target_lon is not None:
                                 # Always use Direct Drive PID (and spot turns) as a fallback when A* has no path
                                 # This prevents the boat from freezing if A* inflation blocks the target
