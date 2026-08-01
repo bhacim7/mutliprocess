@@ -100,7 +100,7 @@ class CostmapRecorder:
 
         # Using haversine to get distance and bearing
         dist = nav.haversine(self.start_lat, self.start_lon, lat, lon)
-        bearing = nav.bearing(self.start_lat, self.start_lon, lat, lon)
+        bearing = nav.calculate_bearing(self.start_lat, self.start_lon, lat, lon)
 
         bearing_rad = math.radians(bearing)
 
@@ -143,7 +143,6 @@ class CostmapRecorder:
                 # obj is usually a dict with lat, lon, and label
                 obj_lat = obj.get('lat')
                 obj_lon = obj.get('lon')
-                label = obj.get('label', 'unknown')
 
                 if obj_lat and obj_lon:
                     obj_x_m, obj_y_m = self._latlon_to_meter(obj_lat, obj_lon)
@@ -152,17 +151,23 @@ class CostmapRecorder:
                     self._expand_image_if_needed(obj_x_px, obj_y_px)
                     obj_x_px, obj_y_px = self._meter_to_px(obj_x_m, obj_y_m)
 
-                    color = (128, 128, 128) # Gray for unknown
-                    if 'red' in label.lower() or 'kirmizi' in label.lower():
-                        color = (0, 0, 255) # BGR
-                    elif 'green' in label.lower() or 'yesil' in label.lower():
-                        color = (0, 255, 0)
-                    elif 'black' in label.lower() or 'siyah' in label.lower():
-                        color = (50, 50, 50)
-                    elif 'yellow' in label.lower() or 'sari' in label.lower():
+                    # NOTE: objects coming from camera_process.py's shared_state payload never
+                    # had a 'label' field - only 'cid' (raw YOLO/data.yaml class id:
+                    # 0=red,1=yellow,2=black,3=orange,4=green). The old label-string lookup
+                    # below always fell through to "unknown"/gray for every single object.
+                    cid_val = obj.get('cid')
+                    label = obj.get('label', '')
+                    color = (128, 128, 128)  # Gray for unknown
+                    if cid_val == 0 or 'red' in label.lower() or 'kirmizi' in label.lower():
+                        color = (0, 0, 255)  # BGR
+                    elif cid_val == 1 or 'yellow' in label.lower() or 'sari' in label.lower():
                         color = (0, 255, 255)
-                    elif 'orange' in label.lower() or 'turuncu' in label.lower():
-                        color = (0, 165, 255) # BGR
+                    elif cid_val == 2 or 'black' in label.lower() or 'siyah' in label.lower():
+                        color = (50, 50, 50)
+                    elif cid_val == 3 or 'orange' in label.lower() or 'turuncu' in label.lower():
+                        color = (0, 165, 255)  # BGR
+                    elif cid_val == 4 or 'green' in label.lower() or 'yesil' in label.lower():
+                        color = (0, 255, 0)
 
                     cv2.circle(self.img, (obj_x_px, obj_y_px), 3, color, -1)
 
