@@ -1,10 +1,25 @@
 import math
+import time
 import numpy as np
 import cv2
 import heapq
 
 import config as cfg
 import utils.navigasyon as nav
+
+# Nominal nav loop period. The PID/PP derivative and integral terms are scaled by
+# (dt / NOMINAL_DT) so that a loop that runs slower than 50 Hz (e.g. the cycle where
+# A* runs) does not silently change the effective KD/KI. At dt == NOMINAL_DT the
+# behaviour is identical to the old un-normalised code, so existing config gains
+# stay valid.
+NOMINAL_DT = 0.02
+
+
+def dt_scale(dt):
+    if dt is None or dt <= 0.0:
+        return 1.0
+    return min(5.0, max(0.2, dt / NOMINAL_DT))
+
 
 # --- UTILITY & HYBRID ---
 def get_hybrid_point(robot_x, robot_y, robot_yaw, aci_farki, step_dist=2.0):
@@ -13,7 +28,7 @@ def get_hybrid_point(robot_x, robot_y, robot_yaw, aci_farki, step_dist=2.0):
     ty = robot_y + (step_dist * math.sin(target_angle))
     return tx, ty
 
-def get_inflated_nav_map(raw_costmap, ignore_green=False, ignore_yellow=False):
+def get_inflated_nav_map(raw_costmap):
     """
     Prepares map for A* by inflating obstacles to account for robot radius.
     """
@@ -37,6 +52,33 @@ def get_inflated_nav_map(raw_costmap, ignore_green=False, ignore_yellow=False):
 
     return nav_map, inflated_obstacles
 
+
+def _segment_is_clear(nav_map, p1, p2):
+    """
+    O(L) obstacle check along a pixel segment. Samples one pixel per unit of the
+    dominant axis instead of rasterising the line into a full-size mask and scanning
+    the whole image (which cost ~160k element ops per call and made string_pulling
+    the single most expensive thing in the planning cycle).
+    """
+    h, w = nav_map.shape[:2]
+
+    x0, y0 = float(p1[0]), float(p1[1])
+    x1, y1 = float(p2[0]), float(p2[1])
+
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    if n < 2:
+        n = 2
+
+    xi = np.rint(np.linspace(x0, x1, n)).astype(np.int32)
+    yi = np.rint(np.linspace(y0, y1, n)).astype(np.int32)
+
+    # Leaving the planning window is treated as blocked (we cannot vouch for it).
+    if xi.min() < 0 or yi.min() < 0 or xi.max() >= w or yi.max() >= h:
+        return False
+
+    return not np.any(nav_map[yi, xi] == 0)
+
+
 def check_line_of_sight(start, end, nav_map, center_m, res, size_px):
     """
     Raycast on the grid to check if a straight line between start and end is obstacle-free.
@@ -57,16 +99,9 @@ def check_line_of_sight(start, end, nav_map, center_m, res, size_px):
     p1 = w2p(start[0], start[1])
     p2 = w2p(end[0], end[1])
 
-    if not p1 or not p2: return False
+    if p1 is None or p2 is None: return False
 
-    # Create empty mask to draw the line
-    line_mask = np.zeros_like(nav_map)
-    cv2.line(line_mask, p1, p2, 255, 1)
-
-    # Check collision: where line_mask is 255 AND nav_map is 0 (obstacle)
-    collision = np.logical_and(line_mask == 255, nav_map == 0)
-
-    return not np.any(collision)
+    return _segment_is_clear(nav_map, p1, p2)
 
 
 # --- A* PATH PLANNING ---
@@ -102,10 +137,84 @@ def string_pulling(path, nav_map, center_m, res, size_px):
 
     return smoothed_path
 
-def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_to_goal_line=0.0, heuristic_weight=2.5, cone_deg=180.0):
+
+def _find_free_cell(nav_map, cell, max_radius_px):
+    """
+    Nearest free cell to `cell`, searched outward in Chebyshev rings.
+
+    With ROBOT_RADIUS_M + INFLATION_MARGIN_M = 2.1 m of inflation, ANY obstacle within
+    2.1 m swallows the boat's own cell, and A* used to return None right when the
+    obstacle was closest - handing control to the obstacle-blind PID at the worst
+    possible moment. Relocating the search start (rather than punching a free disc
+    around the boat, which can leave it on an isolated island of free cells with no
+    way out) keeps the planner useful in exactly that situation.
+    """
+    h, w = nav_map.shape[:2]
+    cx, cy = int(cell[0]), int(cell[1])
+
+    if 0 <= cx < w and 0 <= cy < h and nav_map[cy, cx] != 0:
+        return (cx, cy)
+
+    for r in range(1, int(max_radius_px) + 1):
+        best = None
+        best_d2 = None
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if max(abs(dx), abs(dy)) != r:
+                    continue  # only the new ring
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < h and nav_map[y, x] != 0:
+                    d2 = dx * dx + dy * dy
+                    if best_d2 is None or d2 < best_d2:
+                        best_d2 = d2
+                        best = (x, y)
+        if best is not None:
+            return best
+    return None
+
+
+def _nudge_goal_to_free(goal, start, nav_map):
+    """
+    If the goal cell sits inside an inflated obstacle, walk back along the goal->start
+    line and take the first free cell. Without this, a target that happens to be behind
+    (or on) a buoy makes A* give up entirely and hand control to the obstacle-blind PID.
+    Returns None if the whole segment is blocked.
+    """
+    h, w = nav_map.shape[:2]
+    if nav_map[goal[1], goal[0]] != 0:
+        return goal
+
+    x0, y0 = float(goal[0]), float(goal[1])
+    x1, y1 = float(start[0]), float(start[1])
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    if n < 2:
+        return None
+
+    xi = np.rint(np.linspace(x0, x1, n)).astype(np.int32)
+    yi = np.rint(np.linspace(y0, y1, n)).astype(np.int32)
+    np.clip(xi, 0, w - 1, out=xi)
+    np.clip(yi, 0, h - 1, out=yi)
+
+    free = np.nonzero(nav_map[yi, xi] != 0)[0]
+    if free.size == 0:
+        return None
+    k = int(free[0])
+    return (int(xi[k]), int(yi[k]))
+
+
+def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
+                  heuristic_weight=2.5, max_expansions=20000, time_budget_s=0.06,
+                  goal_tolerance_px=3):
     """
     A* algorithm implementation over the local costmap grid.
     Returns list of world coordinates (x,y).
+
+    max_expansions / time_budget_s bound the search. A 20m crop at 0.10 m/px is a
+    400x400 = 160k cell grid; on an unreachable goal an unbounded pure-Python A*
+    sweeps the whole grid and blocks the single-threaded nav loop for seconds - long
+    enough for the orchestrator watchdog (5s) to SIGTERM the process, which skips the
+    `finally` that neutralises the motors. Giving up early and falling back to the PID
+    is always the safer outcome.
     """
     if nav_map is None: return None
 
@@ -125,64 +234,71 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
     start = w2p(*start_world)
     raw_goal = w2p(*end_world)
 
-    # Note: w2p() always returns a 2-tuple, so a plain truthiness check here can never catch
-    # anything - out-of-window goals are handled explicitly below via the clamp instead.
-
     # Safety Clamp: Ensure goal is strictly within the map boundaries.
     # If the target is pushed outside the cropped window (e.g. 50m target on a 20m window),
     # clamp it to the edge so A* doesn't get stuck in a full-grid search for an impossible point.
-    clamped_goal_x = max(0, min(size_px[0] - 1, raw_goal[0]))
-    clamped_goal_y = max(0, min(size_px[1] - 1, raw_goal[1]))
-    goal = (clamped_goal_x, clamped_goal_y)
+    goal = (max(0, min(size_px[0] - 1, raw_goal[0])),
+            max(0, min(size_px[1] - 1, raw_goal[1])))
 
-    # Check if start is inside obstacle (safety fallback)
-    if 0 <= start[0] < size_px[0] and 0 <= start[1] < size_px[1]:
-        if nav_map[start[1], start[0]] == 0:
-            # If boat is inside an obstacle, A* cannot escape. Return None to trigger fallback behavior (e.g. PID)
-            return None
+    # Start must be inside the window for the search to make sense.
+    if not (0 <= start[0] < size_px[0] and 0 <= start[1] < size_px[1]):
+        return None
 
-    # Check if goal is inside obstacle. If so, fallback logic could be applied here
-    if nav_map[goal[1], goal[0]] == 0:
-        return None # Goal is unreachable
+    # Boat inside an inflated obstacle: plan from the nearest free cell instead of
+    # giving up (see _find_free_cell). Search out to a bit past the inflation radius.
+    inflation_px = int((getattr(cfg, 'ROBOT_RADIUS_M', 0.25) +
+                        getattr(cfg, 'INFLATION_MARGIN_M', 0.25)) / res) + 4
+    start = _find_free_cell(nav_map, start, inflation_px)
+    if start is None:
+        return None
 
-    open_set = []
-    heapq.heappush(open_set, (0, start))
+    goal = _nudge_goal_to_free(goal, start, nav_map)
+    if goal is None:
+        return None  # Goal (and everything between it and us) is unreachable
+
+    tol_sq = goal_tolerance_px * goal_tolerance_px
+    deadline = time.time() + time_budget_s
 
     came_from = {}
     g_score = {start: 0}
     f_score = {start: heuristic(start, goal, heuristic_weight)}
 
-    # Vector calculation for bias
-    dx_line = goal[0] - start[0]
-    dy_line = goal[1] - start[1]
-    line_length = math.sqrt(dx_line**2 + dy_line**2)
-
-    if line_length > 0:
-        norm_line_x = dx_line / line_length
-        norm_line_y = dy_line / line_length
-    else:
-        norm_line_x, norm_line_y = 0, 0
-
     # 8-way movement (dx, dy)
     neighbors = [(0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
 
-    # Direction tracking for kinematic penalty (heading change)
-    # Store (f_score, (px, py), (dx_from_parent, dy_from_parent))
+    # Direction tracking for kinematic penalty (heading change).
+    # Entry format: (f_score, (px, py), (dx_from_parent, dy_from_parent))
     open_set = []
-    heapq.heappush(open_set, (0, start, (0, 0)))
+    heapq.heappush(open_set, (f_score[start], start, (0, 0)))
+
+    expansions = 0
 
     while open_set:
-        _, current, prev_dir = heapq.heappop(open_set)
+        current_f, current, prev_dir = heapq.heappop(open_set)
 
-        if current == goal:
+        # Skip stale heap entries: a cell can be pushed several times with different
+        # arrival directions, and only the cheapest one is worth expanding.
+        if current_f > f_score.get(current, float('inf')) + 1e-9:
+            continue
+
+        dgx = current[0] - goal[0]
+        dgy = current[1] - goal[1]
+        if (dgx * dgx + dgy * dgy) <= tol_sq:
             path = []
-            while current in came_from:
-                path.append(p2w(current[0], current[1]))
-                current = came_from[current]
+            node = current
+            while node in came_from:
+                path.append(p2w(node[0], node[1]))
+                node = came_from[node]
             path.append(p2w(start[0], start[1]))
             path.reverse()
             # Apply path smoothing post-processing
             return string_pulling(path, nav_map, center_m, res, size_px)
+
+        expansions += 1
+        if expansions >= max_expansions:
+            return None
+        if (expansions & 0x3FF) == 0 and time.time() > deadline:
+            return None
 
         for dx, dy in neighbors:
             neighbor = (current[0] + dx, current[1] + dy)
@@ -194,140 +310,158 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px, bias_
                 # Cost is 1 for straight, 1.414 for diagonal
                 step_cost = 1 if dx == 0 or dy == 0 else 1.414
 
-                # Apply bias penalty if it strays from straight line
-                if bias_to_goal_line > 0 and line_length > 0:
-                    vec_nx = neighbor[0] - start[0]
-                    vec_ny = neighbor[1] - start[1]
-                    cross_product = abs(vec_nx * norm_line_y - vec_ny * norm_line_x)
-                    step_cost += (cross_product * bias_to_goal_line)
-
-                # --- 1-A UPDATE: Kinematic Constraint Penalty ---
-                kinematic_penalty = 0.0
+                # --- Kinematic Constraint Penalty ---
+                # NOTE: this makes the true state space (cell, arrival direction) while
+                # g_score/came_from are keyed by cell only, so the penalty biases the
+                # search without being strictly enforced. It is kept because it visibly
+                # reduces zigzag; string_pulling below does the rest.
                 if prev_dir != (0, 0):
-                    # Calculate angle difference between previous direction and current direction
                     dot_product = prev_dir[0]*dx + prev_dir[1]*dy
                     mag_prev = math.sqrt(prev_dir[0]**2 + prev_dir[1]**2)
                     mag_curr = math.sqrt(dx**2 + dy**2)
                     if mag_prev > 0 and mag_curr > 0:
-                        cos_angle = np.clip(dot_product / (mag_prev * mag_curr), -1.0, 1.0)
+                        cos_angle = min(1.0, max(-1.0, dot_product / (mag_prev * mag_curr)))
                         angle_diff = math.degrees(math.acos(cos_angle))
 
                         # Penalize sharp turns (e.g., > 45 degrees)
                         if angle_diff > 45.0:
-                            kinematic_penalty += (angle_diff * 0.1)  # Tunable weight
+                            step_cost += (angle_diff * 0.1)  # Tunable weight
                         if angle_diff >= 90.0:
-                            kinematic_penalty += 5.0 # Heavy penalty for reversals/right angles
-
-                step_cost += kinematic_penalty
+                            step_cost += 5.0 # Heavy penalty for reversals/right angles
                 # ------------------------------------------------
 
                 tentative_g_score = g_score[current] + step_cost
 
-                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                if tentative_g_score < g_score.get(neighbor, float('inf')):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = tentative_g_score + heuristic(neighbor, goal, heuristic_weight)
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor, (dx, dy)))
+                    f_n = tentative_g_score + heuristic(neighbor, goal, heuristic_weight)
+                    f_score[neighbor] = f_n
+                    heapq.heappush(open_set, (f_n, neighbor, (dx, dy)))
 
     return None # No path found
 
 # --- PURE PURSUIT CONTROLLER ---
-def find_lookahead_point(x, y, path, lookahead_dist):
+def _circle_segment_intersection(cx, cy, r, p1, p2):
+    """Furthest intersection of the lookahead circle with segment p1->p2, or None."""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    a = dx * dx + dy * dy
+    if a < 1e-9:
+        return None
+
+    fx = p1[0] - cx
+    fy = p1[1] - cy
+    b = 2.0 * (fx * dx + fy * dy)
+    c = fx * fx + fy * fy - r * r
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return None
+
+    disc = math.sqrt(disc)
+    for t in (((-b + disc) / (2.0 * a)), ((-b - disc) / (2.0 * a))):
+        if 0.0 <= t <= 1.0:
+            return (p1[0] + t * dx, p1[1] + t * dy)
+    return None
+
+
+def find_lookahead_point(x, y, path, lookahead_dist, start_idx=0):
     """
-    Finds the furthest point on the path within the lookahead circle.
+    Returns (target_point, segment_index).
+
+    The target is the actual intersection of the lookahead circle with the path, so
+    the effective lookahead really is `lookahead_dist`. The previous version returned
+    "the furthest node inside the circle, plus one", which - after string_pulling
+    leaves nodes metres apart - made the effective lookahead essentially arbitrary.
+
+    start_idx makes progress monotonic: the search never looks behind the segment we
+    already committed to, so the boat cannot latch onto a piece of path it has passed.
     """
-    if not path: return None
+    n = len(path)
+    if n == 0:
+        return None, start_idx
+    if n == 1:
+        return path[0], 0
 
-    target_idx = -1
-    for i in range(len(path) - 1, -1, -1):
-        pt = path[i]
-        dist = math.sqrt((pt[0] - x)**2 + (pt[1] - y)**2)
-        if dist <= lookahead_dist:
-            target_idx = i
-            break
+    start_idx = max(0, min(start_idx, n - 1))
 
-    # If no point is within lookahead, we target the first point if it's further away,
-    # or the closest point to the lookahead circle
-    if target_idx == -1:
-        # Fallback to closest point
-        min_d = float('inf')
-        for i, pt in enumerate(path):
-            dist = math.sqrt((pt[0] - x)**2 + (pt[1] - y)**2)
-            if dist < min_d:
-                min_d = dist
-                target_idx = i
+    # 1. Closest node at or after our committed progress point
+    closest_idx = start_idx
+    min_d2 = float('inf')
+    for i in range(start_idx, n):
+        d2 = (path[i][0] - x) ** 2 + (path[i][1] - y) ** 2
+        if d2 < min_d2:
+            min_d2 = d2
+            closest_idx = i
 
-    # Try to interpolate between target_idx and target_idx+1 to exactly hit lookahead circle
-    # (Simplified approach: just take the next point if available)
-    if target_idx < len(path) - 1:
-        target_idx += 1
+    # 2. Blown off the path entirely - steer back to the nearest point first
+    if min_d2 > lookahead_dist * lookahead_dist:
+        return path[closest_idx], closest_idx
 
-    return path[target_idx], target_idx
+    # 3. First segment (walking forward) that crosses the lookahead circle
+    for i in range(closest_idx, n - 1):
+        hit = _circle_segment_intersection(x, y, lookahead_dist, path[i], path[i + 1])
+        if hit is not None:
+            return hit, i
 
-def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0, base_speed=1500, prev_error=0):
+    # 4. Whole remaining path is inside the circle - aim at the end of it
+    return path[n - 1], n - 1
+
+
+def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0.0, base_speed=1500,
+                         prev_error=0.0, dt=NOMINAL_DT, start_idx=0):
     """
-    Executes the Pure Pursuit algorithm to generate Base Speed and Steering Correction (Yaw Effort).
-    Dynamic lookahead based on speed.
+    Executes the Pure Pursuit algorithm to generate Base Speed and Steering Correction.
+
+    current_speed is the ground speed in m/s (NOT a PWM offset - feeding PWM here pinned
+    the lookahead at its max and killed the speed-adaptive behaviour entirely).
+
+    Returns (base_speed, correction, target_pt, heading_err, next_start_idx).
+    The path itself is never modified: progress is carried in next_start_idx. Destructively
+    pruning the path used to collapse it to a single point on the first call, which failed
+    the caller's len(path) >= 2 test and silently handed control back to the Direct-Drive
+    PID for 4 out of every 5 cycles.
     """
-    if not path or len(path) < 2:
-        return base_speed, 0, None, 0.0, path
+    if not path:
+        return base_speed, 0, None, 0.0, start_idx
 
     # 1. Dynamic Lookahead Distance
     min_ld = getattr(cfg, 'PURE_PURSUIT_MIN_LOOKAHEAD', 1.0)
     max_ld = getattr(cfg, 'PURE_PURSUIT_MAX_LOOKAHEAD', 3.0)
     k_ld = getattr(cfg, 'PURE_PURSUIT_K_SPEED', 0.5) # Lookahead multiplier
 
-    lookahead_dist = np.clip(current_speed * k_ld, min_ld, max_ld)
+    lookahead_dist = float(np.clip(float(current_speed) * k_ld, min_ld, max_ld))
 
     # 2. Find target point
-    target_pt, t_idx = find_lookahead_point(rx, ry, path, lookahead_dist)
+    target_pt, t_idx = find_lookahead_point(rx, ry, path, lookahead_dist, start_idx)
     if target_pt is None:
-        return base_speed, 0, None, 0.0, path
+        return base_speed, 0, None, 0.0, start_idx
 
-    # 3. Calculate steering error (Alpha)
+    # 3. Calculate steering error
     tx, ty = target_pt
 
-    # In this codebase, the A* grid (rx, ry) is built using math.cos/sin on raw compass bearings.
-    # Therefore, we can reverse this by using math.atan2 to get the angle in radians,
-    # but since it was built with compass logic (0 = North, clockwise),
-    # the atan2 result directly corresponds to a math.radians(compass_bearing).
-    # Since ryaw is passed as math.radians(magnetic_heading), we can just subtract them.
-    # WAIT - standard atan2(y, x) gives 0 for East, positive Counter-Clockwise.
-    # If the map was built using math.cos(compass_bearing) and math.sin(compass_bearing):
-    # - compass_bearing = 0 (North): cos(0)=1, sin(0)=0 -> (x=1, y=0) -> mapped to East on the grid.
-    # - compass_bearing = 90 (East): cos(90)=0, sin(90)=1 -> (x=0, y=1) -> mapped to North on the grid.
-    # This means math.atan2(ty - ry, tx - rx) gives the original math.radians(compass_bearing)!
+    # Degenerate target (we are sitting exactly on it): atan2(0, 0) would report a bearing
+    # of due North and command a bogus turn. Hold the current heading instead.
+    if math.hypot(tx - rx, ty - ry) < 1e-3:
+        return base_speed, 0, target_pt, 0.0, t_idx
 
-    target_bearing_rad = math.atan2(ty - ry, tx - rx)
-    alpha = target_bearing_rad - ryaw
-
-    # Normalize alpha to [-pi, pi]
-    alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
-
-    # Convert to Degrees for PID
-    # (Since alpha is target - current, positive alpha means target is to the right if compass is clockwise.
-    # Let's verify: compass 90, boat 0 -> alpha +90. We want to turn right.
-    # Legacy PID logic: positive heading_err turns right.
-    # Wait, the old code had `heading_err = -math.degrees(alpha)`. Let's remove the negative sign if alpha is already correct.)
-
-    # Old code had: heading_err = -math.degrees(alpha).
-    # Let's check signed_angle_difference in navigasyon.py: diff = (angle2 - angle1 + 180) % 360 - 180
-    # where angle2 is target, angle1 is current. Positive diff means target is to the right.
-    # We will use exactly that logic to be absolutely safe and consistent with Direct Drive PID.
-    target_bearing_deg = math.degrees(target_bearing_rad) % 360
+    # The world frame here is x = North, y = East (built from cos/sin of raw compass
+    # bearings), so atan2(dy, dx) yields the compass bearing to the target directly.
+    target_bearing_deg = math.degrees(math.atan2(ty - ry, tx - rx)) % 360
     current_heading_deg = math.degrees(ryaw) % 360
 
+    # Same convention as navigasyon.signed_angle_difference(current, target):
+    # positive means the target is to the right.
     heading_err = (target_bearing_deg - current_heading_deg + 180) % 360 - 180
 
-    # 4. PID calculation
+    # 4. PD calculation (dt-normalised - see NOMINAL_DT)
     kp = getattr(cfg, 'PURE_PURSUIT_KP', 2.0)
     kd = getattr(cfg, 'PURE_PURSUIT_KD', 0.5)
 
+    scale = dt_scale(dt)
     P = heading_err * kp
-    D = (heading_err - prev_error) * kd
+    D = ((heading_err - prev_error) / scale) * kd
     correction = P + D
 
-    # Prune path: remove points we have already passed
-    pruned_path = path[t_idx:] if t_idx < len(path) else path[-1:]
-
-    return base_speed, correction, target_pt, heading_err, pruned_path
+    return base_speed, correction, target_pt, heading_err, t_idx

@@ -3,6 +3,23 @@ import math
 import time
 import threading
 
+import config as cfg
+
+
+def _output_channels():
+    """
+    The servo channels this vehicle actually drives, taken from config.
+    Hardcoding 1..5 here left the real channels (SOL_MOTOR=6 and FRONT_STEER_SERVO=7)
+    out of the disarm sweep, so they held their last commanded PWM on shutdown.
+    """
+    names = ('SOL_MOTOR', 'SAG_MOTOR', 'FRONT_SOL_MOTOR', 'FRONT_SAG_MOTOR', 'FRONT_STEER_SERVO')
+    channels = []
+    for n in names:
+        ch = getattr(cfg, n, None)
+        if ch is not None and ch not in channels:
+            channels.append(int(ch))
+    return channels or [1, 2, 3, 4, 5]
+
 
 class USVController:
     """
@@ -12,8 +29,9 @@ class USVController:
     def __init__(self, port="/dev/ttyACM0", baud=57600):
         self.port = port
         self.baud = baud
-        # Rear Left=1, Front Left=2, Rear Right=3, Front Right=4, Steer=5
-        self.pwms = {1: 1500, 2: 1500, 3: 1500, 4: 1500, 5: 1500}
+        # Channel assignment lives in config.py (SOL_MOTOR / SAG_MOTOR / FRONT_* / STEER).
+        self.channels = _output_channels()
+        self.pwms = {ch: 1500 for ch in self.channels}
 
         print(f"[USVController] Initializing on {port} at {baud} baud. Waiting for connection...")
         try:
@@ -30,7 +48,12 @@ class USVController:
                 pass
 
             print("[USVController] Connected to MAVLINK. Waiting for heartbeat...")
-            self.master.wait_heartbeat()
+            # Bounded wait. An unbounded wait_heartbeat() blocks the nav process forever
+            # if the FC link is down - and because the orchestrator watchdog restarts nav
+            # by re-running this constructor, a dead link turned into an endless
+            # kill/restart/hang cycle with no telemetry explaining why.
+            if self.master.wait_heartbeat(timeout=10) is None:
+                raise RuntimeError("No MAVLink heartbeat within 10s")
             print("[USVController] Heartbeat found!")
 
             # Arka planda dinlenecek mesajlar için veri yapısı
@@ -94,16 +117,22 @@ class USVController:
         return 0.0
 
     def get_heading(self):
-        """Returns compass heading in degrees."""
+        """
+        Returns compass heading in degrees, or None if the FC has not reported one.
+
+        Returning 0.0 for "no data" was indistinguishable from a genuine due-North
+        heading: with HEADING_SOURCE='FC' the nav process fed that straight into
+        magnetic_heading and steered as if the boat were pointing North.
+        """
         msg = self.msg_dict.get('GLOBAL_POSITION_INT')
-        if msg:
+        if msg and msg.hdg != 65535:  # 65535 = UINT16_MAX = "unknown" per the MAVLink spec
             return msg.hdg / 100.0  # cdeg to degrees
 
         # Fallback
         msg_vfr = self.msg_dict.get('VFR_HUD')
         if msg_vfr:
             return float(msg_vfr.heading)
-        return 0.0
+        return None
 
     def get_servo_pwm(self, channel):
         """Returns the last commanded PWM for a given channel."""
@@ -157,7 +186,7 @@ class USVController:
     def disarm_vehicle(self):
         """Disarms the thrusters for safety."""
         print("[USVController] Vehicle disarming...")
-        for channel in [1, 2, 3, 4, 5]:
+        for channel in self.channels:
             self.set_servo(channel, 1500)
 
         if self.master:

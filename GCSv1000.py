@@ -3008,9 +3008,12 @@ class MainWindow(QtWidgets.QMainWindow):
             drone_color = d.get("drone_color", "BELIRSIZ")
             self.drone_color_lbl.setText(drone_color)
 
-            # İngilizceye çevir ve komut yolla
+            # İngilizceye çevir ve komut yolla.
+            # Sadece renk DEĞİŞTİĞİNDE gönder: drone her karede paket yolluyordu ve
+            # bu, aynı telsiz hattında tekneye saniyede onlarca gereksiz komut demekti.
             color_map = {"KIRMIZI": "red", "YESIL": "green", "SIYAH": "black", "SARI": "yellow"}
-            if drone_color in color_map:
+            if drone_color in color_map and drone_color != getattr(self, "_last_drone_color", None):
+                self._last_drone_color = drone_color
                 eng_color = color_map[drone_color]
                 if self.worker_1:
                     self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": eng_color})
@@ -3455,9 +3458,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker_1.start()
 
             # POLLING
+            # 100 ms (10 Hz) asked the boat for a full telemetry packet faster than a
+            # 57600 baud radio link can carry one, so the serial buffers backed up and
+            # the shared command channel (emergency stop included) got slower and slower.
+            # 500 ms is still a responsive UI and leaves headroom for commands.
             self._polling_timer = QtCore.QTimer(self)
             self._polling_timer.timeout.connect(self._perform_polling)
-            self._polling_timer.start(100)
+            self._polling_timer.start(500)
 
             self._connected = True
             self.btn_connect.setText("BAĞLI")

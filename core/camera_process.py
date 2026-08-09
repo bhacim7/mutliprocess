@@ -281,6 +281,23 @@ def camera_worker(shared_state, hf_data):
     height = camera_info.camera_configuration.resolution.height
     hfov_rad = math.radians(getattr(cfg, 'CAM_HFOV', 110.0))
 
+    # Bearing projection uses the factory intrinsics (focal length + principal point).
+    # The old `pixel_offset * hfov` was a linear approximation of a tangent relationship:
+    # at HFOV=110 deg, a detection half way to the image edge came out at 27.5 deg when
+    # the true angle is atan(0.5*tan(55 deg)) = 35.5 deg - an 8 deg error, ~1.4 m of
+    # lateral placement error at 10 m.
+    try:
+        _left_cam = camera_info.camera_configuration.calibration_parameters.left_cam
+        cam_fx = float(_left_cam.fx)
+        cam_cx = float(_left_cam.cx)
+        print(f"[CAM_PROCESS] Using ZED intrinsics: fx={cam_fx:.1f}, cx={cam_cx:.1f}")
+    except Exception as e:
+        # Fall back to the configured HFOV, but still with the correct tangent geometry.
+        cam_fx = (width / 2.0) / math.tan(hfov_rad / 2.0)
+        cam_cx = width / 2.0
+        print(f"[CAM_PROCESS][WARNING] ZED intrinsics unavailable ({e}); "
+              f"derived fx={cam_fx:.1f} from CAM_HFOV={math.degrees(hfov_rad):.0f}")
+
     image = sl.Mat()
     depth = sl.Mat()
     sensors_data = sl.SensorsData()
@@ -432,9 +449,14 @@ def camera_worker(shared_state, hf_data):
                             dist_m = float('inf')  # Invalid depth
 
                         if not np.isnan(dist_m) and not np.isinf(dist_m) and 0.5 < dist_m < 15.0:
-                            pixel_offset = (cx - (width / 2)) / width
-                            angle_offset_rad = -pixel_offset * hfov_rad
-                            angle_offset_deg = math.degrees(angle_offset_rad)
+                            # Sign: cx > cam_cx means the object is on the RIGHT of the image,
+                            # i.e. to starboard, i.e. a LARGER compass bearing. The previous
+                            # `-pixel_offset` negated this and mirrored every detection about
+                            # the boat's heading axis - obstacles were written into the costmap
+                            # (and drawn on the GCS map) on the wrong side, so A* dodged the
+                            # wrong way. Note Task 3's visual servoing below already used the
+                            # opposite (correct) sign, so the two disagreed with each other.
+                            angle_offset_deg = math.degrees(math.atan((cx - cam_cx) / cam_fx))
                             obj_bearing = (magnetic_heading + angle_offset_deg) % 360
 
                             obj_lat, obj_lon = calculate_obj_gps(ida_enlem, ida_boylam, dist_m, obj_bearing)
@@ -481,7 +503,8 @@ def camera_worker(shared_state, hf_data):
                                 label_text = f"{label_map.get(cid, 'Unknown')} {dist_m:.1f}m"
 
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                                cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                                cv2.putText(frame, label_text, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            box_color, 2)
                 # Push lightweight metadata to shared state
                 # NOTE: "cid" below is the RAW YOLO/data.yaml class id (0=red,1=yellow,2=black,
                 # 3=orange,4=green) stored verbatim in memory by update_and_get_id(). Do NOT
@@ -503,8 +526,12 @@ def camera_worker(shared_state, hf_data):
                         "cy": obj.get('cy'),
                         "dist": obj.get('dist', 10.0),
                         "area": obj.get('area', 0),
+                        # Entries linger in memory for 5s after the object was last actually
+                        # seen. Consumers that steer on 'cx' (Task 3 visual servoing) must be
+                        # able to tell a fresh detection from a 5-second-old one.
+                        "last_seen": obj.get('last_seen', 0.0),
                     })
-                
+
                 shared_state['vision_detected_objects'] = memory_objects
 
                 import datetime
@@ -543,7 +570,7 @@ def camera_worker(shared_state, hf_data):
                 # 3. YAZI ÇİZİMİ (GÖLGELİ METİN - MAKSİMUM FPS)
                 def draw_text(text, x, y, text_color):
                     # Draw black shadow slightly offset
-                    #cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
+                    # cv2.putText(frame, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1)
                     # Draw main text
                     cv2.putText(frame, text, (x, y), font, scale, text_color, thick)
 
