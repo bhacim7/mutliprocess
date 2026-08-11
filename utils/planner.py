@@ -142,8 +142,8 @@ def _find_free_cell(nav_map, cell, max_radius_px):
     """
     Nearest free cell to `cell`, searched outward in Chebyshev rings.
 
-    With ROBOT_RADIUS_M + INFLATION_MARGIN_M = 2.1 m of inflation, ANY obstacle within
-    2.1 m swallows the boat's own cell, and A* used to return None right when the
+    ANY obstacle within ROBOT_RADIUS_M + INFLATION_MARGIN_M (currently 0.95 m) swallows
+    the boat's own cell, and A* used to return None right when the
     obstacle was closest - handing control to the obstacle-blind PID at the worst
     possible moment. Relocating the search start (rather than punching a free disc
     around the boat, which can leave it on an isolated island of free cells with no
@@ -203,7 +203,7 @@ def _nudge_goal_to_free(goal, start, nav_map):
 
 
 def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
-                  heuristic_weight=2.5, max_expansions=20000, time_budget_s=0.06,
+                  heuristic_weight=2.5, max_expansions=20000, time_budget_s=None,
                   goal_tolerance_px=3):
     """
     A* algorithm implementation over the local costmap grid.
@@ -217,6 +217,9 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
     is always the safer outcome.
     """
     if nav_map is None: return None
+
+    if time_budget_s is None:
+        time_budget_s = getattr(cfg, 'A_STAR_TIME_BUDGET_S', 0.12)
 
     # Helper for world <-> pixel
     def w2p(x, y):
@@ -342,41 +345,60 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
     return None # No path found
 
 # --- PURE PURSUIT CONTROLLER ---
-def _circle_segment_intersection(cx, cy, r, p1, p2):
-    """Furthest intersection of the lookahead circle with segment p1->p2, or None."""
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    a = dx * dx + dy * dy
-    if a < 1e-9:
-        return None
+def _closest_point_on_segment(px, py, ax, ay, bx, by):
+    """Perpendicular foot of (px,py) on segment a->b, clamped to the segment.
 
-    fx = p1[0] - cx
-    fy = p1[1] - cy
-    b = 2.0 * (fx * dx + fy * dy)
-    c = fx * fx + fy * fy - r * r
+    Returns (cx, cy, d2).
+    """
+    dx = bx - ax
+    dy = by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 < 1e-12:
+        return ax, ay, (px - ax) ** 2 + (py - ay) ** 2
 
-    disc = b * b - 4.0 * a * c
-    if disc < 0.0:
-        return None
+    t = ((px - ax) * dx + (py - ay) * dy) / seg2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
 
-    disc = math.sqrt(disc)
-    for t in (((-b + disc) / (2.0 * a)), ((-b - disc) / (2.0 * a))):
-        if 0.0 <= t <= 1.0:
-            return (p1[0] + t * dx, p1[1] + t * dy)
-    return None
+    cx = ax + t * dx
+    cy = ay + t * dy
+    return cx, cy, (px - cx) ** 2 + (py - cy) ** 2
 
 
 def find_lookahead_point(x, y, path, lookahead_dist, start_idx=0):
     """
     Returns (target_point, segment_index).
 
-    The target is the actual intersection of the lookahead circle with the path, so
-    the effective lookahead really is `lookahead_dist`. The previous version returned
-    "the furthest node inside the circle, plus one", which - after string_pulling
-    leaves nodes metres apart - made the effective lookahead essentially arbitrary.
+    Projects the boat onto the path POLYLINE - the perpendicular foot on the closest
+    *segment*, not the closest *node* - and then walks `lookahead_dist` forward along
+    the path from that projection.
 
-    start_idx makes progress monotonic: the search never looks behind the segment we
-    already committed to, so the boat cannot latch onto a piece of path it has passed.
+    Why this rewrite matters (this was the primary cause of the observed circling):
+
+    The previous implementation returned `path[closest_idx]` whenever the boat was
+    further than `lookahead_dist` from the path:
+
+        if min_d2 > lookahead_dist ** 2:
+            return path[closest_idx], closest_idx
+
+    With the lookahead pinned at its 0.8 m floor (get_horizontal_speed() always read
+    0.0, see MainSystem2) and string_pulling leaving nodes metres apart, that branch
+    fired on almost every cycle. The "closest node" can sit BESIDE or BEHIND the boat,
+    which hands the controller an instantaneous 90-180 deg heading error, saturates the
+    mixer, and spins the boat. Flight data at 23:47:59 shows exactly this: the GPS
+    bearing error was +4 deg while the mixer was railed hard left (1100/1900), i.e. the
+    controller's internal error was about -73 deg. That 77 deg discrepancy came from the
+    path node, not the target.
+
+    Projecting onto the segment makes a backwards target geometrically impossible: the
+    foot of the perpendicular always lies on the path ahead of or beside us, and the
+    lookahead point is then strictly forward of it along the path.
+
+    start_idx keeps progress monotonic - the search never looks behind the segment we
+    already committed to. The returned index is the *projection's* segment (not the
+    lookahead point's), so progress advances with the boat rather than jumping ahead.
     """
     n = len(path)
     if n == 0:
@@ -384,29 +406,38 @@ def find_lookahead_point(x, y, path, lookahead_dist, start_idx=0):
     if n == 1:
         return path[0], 0
 
-    start_idx = max(0, min(start_idx, n - 1))
+    start_idx = max(0, min(start_idx, n - 2))
 
-    # 1. Closest node at or after our committed progress point
-    closest_idx = start_idx
-    min_d2 = float('inf')
-    for i in range(start_idx, n):
-        d2 = (path[i][0] - x) ** 2 + (path[i][1] - y) ** 2
-        if d2 < min_d2:
-            min_d2 = d2
-            closest_idx = i
+    # 1. Closest point on any segment at or after our committed progress point.
+    proj_idx = start_idx
+    proj = (path[start_idx][0], path[start_idx][1])
+    best_d2 = float('inf')
+    for i in range(start_idx, n - 1):
+        cx, cy, d2 = _closest_point_on_segment(
+            x, y, path[i][0], path[i][1], path[i + 1][0], path[i + 1][1])
+        if d2 < best_d2:
+            best_d2 = d2
+            proj_idx = i
+            proj = (cx, cy)
 
-    # 2. Blown off the path entirely - steer back to the nearest point first
-    if min_d2 > lookahead_dist * lookahead_dist:
-        return path[closest_idx], closest_idx
+    # 2. Walk `lookahead_dist` forward along the polyline from that projection.
+    remaining = float(lookahead_dist)
+    cx, cy = proj
+    i = proj_idx
+    while i < n - 1:
+        nx, ny = path[i + 1]
+        seg_len = math.hypot(nx - cx, ny - cy)
+        if seg_len >= remaining:
+            if seg_len < 1e-9:
+                return (nx, ny), proj_idx
+            r = remaining / seg_len
+            return (cx + (nx - cx) * r, cy + (ny - cy) * r), proj_idx
+        remaining -= seg_len
+        cx, cy = nx, ny
+        i += 1
 
-    # 3. First segment (walking forward) that crosses the lookahead circle
-    for i in range(closest_idx, n - 1):
-        hit = _circle_segment_intersection(x, y, lookahead_dist, path[i], path[i + 1])
-        if hit is not None:
-            return hit, i
-
-    # 4. Whole remaining path is inside the circle - aim at the end of it
-    return path[n - 1], n - 1
+    # 3. Ran off the end of the path - aim at its final node.
+    return path[n - 1], proj_idx
 
 
 def pure_pursuit_control(rx, ry, ryaw, path, current_speed=0.0, base_speed=1500,

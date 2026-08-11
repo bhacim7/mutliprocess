@@ -79,8 +79,17 @@ def main():
         'target_dist': 0.0,
         'adviced_course': 0.0,
         'angle_error': 0.0,
+        'control_error': 0.0,
         'target_lat': 0.0,
         'target_lon': 0.0,
+        'horizontal_speed': 0.0,
+        'camera_fps': 0,
+
+        # Live mission waypoints, published by nav_process (which owns the `set_gps`
+        # command). With the 'spawn' start method each worker imports its own copy of
+        # config.py, so telem_process cannot see nav's cfg mutations - this is the only
+        # channel that carries operator-set points across process boundaries.
+        'mission_points': {},
 
         # Sensors & Tracking
         'fc_heading': 0.0,

@@ -32,6 +32,8 @@ class USVController:
         # Channel assignment lives in config.py (SOL_MOTOR / SAG_MOTOR / FRONT_* / STEER).
         self.channels = _output_channels()
         self.pwms = {ch: 1500 for ch in self.channels}
+        # Last time each channel was actually transmitted (see set_servo's rate limiting).
+        self._last_servo_tx = {ch: 0.0 for ch in self.channels}
 
         print(f"[USVController] Initializing on {port} at {baud} baud. Waiting for connection...")
         try:
@@ -108,13 +110,54 @@ class USVController:
         return 0.0, 0.0
 
     def get_horizontal_speed(self):
-        """Returns ground speed in m/s."""
+        """
+        Returns ground speed in m/s, or None if no source reported one.
+
+        This used to read LOCAL_POSITION_NED only. ArduRover does not stream that message
+        in the default set, so the call returned 0.0 on every single cycle - the HUD showed
+        "HIZ: 0.0" for the whole mission and, worse, Pure Pursuit's speed-adaptive lookahead
+        collapsed to its PURE_PURSUIT_MIN_LOOKAHEAD floor (0.8 m) permanently. At ~1.8 m/s
+        that is a 0.45 s horizon, which is what made the path follower so twitchy.
+
+        Returning None rather than 0.0 for "no data" lets the caller tell a genuinely
+        stationary boat apart from a missing message.
+        """
+        # 1. VFR_HUD carries ground speed directly and is in the default stream set.
+        msg = self.msg_dict.get('VFR_HUD')
+        if msg is not None:
+            try:
+                spd = float(msg.groundspeed)
+                if spd == spd and abs(spd) < 100.0:  # NaN guard + sanity
+                    return abs(spd)
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        # 2. GPS_RAW_INT.vel is ground speed in cm/s (65535 = unknown per the MAVLink spec).
+        msg = self.msg_dict.get('GPS_RAW_INT')
+        if msg is not None:
+            try:
+                if msg.vel != 65535:
+                    return msg.vel / 100.0
+            except (AttributeError, TypeError):
+                pass
+
+        # 3. GLOBAL_POSITION_INT vx/vy are cm/s in the NED frame.
+        msg = self.msg_dict.get('GLOBAL_POSITION_INT')
+        if msg is not None:
+            try:
+                return math.hypot(msg.vx, msg.vy) / 100.0
+            except (AttributeError, TypeError):
+                pass
+
+        # 4. Last resort - the original source, in case a different FC does stream it.
         msg = self.msg_dict.get('LOCAL_POSITION_NED')
-        if msg:
-            vx = msg.vx
-            vy = msg.vy
-            return math.sqrt(vx ** 2 + vy ** 2)
-        return 0.0
+        if msg is not None:
+            try:
+                return math.hypot(msg.vx, msg.vy)
+            except (AttributeError, TypeError):
+                pass
+
+        return None
 
     def get_heading(self):
         """
@@ -139,9 +182,42 @@ class USVController:
         # Seri portu meşgul etmemek için doğrudan önbellekteki (cache) PWM'i döndürüyoruz
         return self.pwms.get(channel, 1500)
 
-    def set_servo(self, channel, pwm):
-        """Commands the hardware to set a specific PWM on a servo channel."""
+    def set_servo(self, channel, pwm, force=False):
+        """
+        Commands the hardware to set a specific PWM on a servo channel.
+
+        `force=True` bypasses the rate limiting below - use it for anything safety
+        critical (disarm, emergency neutralise) where the command MUST go out even if
+        the cached value already matches.
+
+        Rate limiting: the nav loop drives 5 channels every cycle. At the old 50 Hz that
+        was 250 COMMAND_LONG/s, and ArduPilot answers every one of them with a
+        COMMAND_ACK - enough to starve its scheduler and delay the telemetry streams.
+        Measured effect in flight: GPS_RAW_INT stalled for ~1.5 s (the HUD position and
+        HEDEFE_MESAFE froze) while the 50 Hz control loop kept integrating on stale data.
+
+        DO_SET_SERVO latches on the FC, so re-sending an unchanged value is pure waste.
+        Skip writes smaller than SERVO_MIN_PWM_DELTA, but always refresh at least every
+        SERVO_REFRESH_S so a dropped command cannot leave a channel stuck.
+        """
+        pwm = int(pwm)
+        now = time.time()
+
+        prev = self.pwms.get(channel)
+        last_tx = self._last_servo_tx.get(channel, 0.0)
+        min_delta = getattr(cfg, 'SERVO_MIN_PWM_DELTA', 3)
+        refresh_s = getattr(cfg, 'SERVO_REFRESH_S', 0.5)
+
         self.pwms[channel] = pwm
+
+        if (not force
+                and prev is not None
+                and abs(pwm - prev) < min_delta
+                and (now - last_tx) < refresh_s):
+            return
+
+        self._last_servo_tx[channel] = now
+
         if self.master:
             try:
                 self.master.mav.command_long_send(
@@ -187,7 +263,8 @@ class USVController:
         """Disarms the thrusters for safety."""
         print("[USVController] Vehicle disarming...")
         for channel in self.channels:
-            self.set_servo(channel, 1500)
+            # force: never let set_servo's rate limiting swallow a neutralise command.
+            self.set_servo(channel, 1500, force=True)
 
         if self.master:
             self.master.mav.command_long_send(

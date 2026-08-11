@@ -25,41 +25,47 @@ def telem_worker(shared_state, command_queue, hf_data):
 
     my_id = 1
 
-    # --- Bandwidth budget ---------------------------------------------------
-    # The GCS polls report_status and the reply used to carry the whole object memory
-    # plus all 8 mission waypoints on EVERY packet: 2-4 KB each. A 57600 baud radio
-    # link tops out around 5.7 KB/s, so at the GCS's poll rate this asked for several
-    # times the available bandwidth. The write buffer backs up, TelemetrySender's
-    # write_timeout starts raising, and the COMMAND channel (which shares this link,
-    # emergency stop included) degrades along with it.
-    MAX_OBJECTS_IN_PAYLOAD = 8
-    last_gps_points = None
-    last_gps_points_sent = 0.0
-    GPS_POINTS_REFRESH_S = 10.0   # also resend periodically so a GCS that reconnects catches up
+    # --- Waypoint block state (see the GÖREV_NOKTALARI handling below) ---
+    waypoint_refresh_s = float(getattr(cfg, 'TELEM_WAYPOINT_REFRESH_S', 10.0))
+    last_waypoints_sent = None
+    last_waypoints_ts = 0.0
 
-    def compact_objects(objs):
-        """Nearest few detections, rounded, with only the fields the GCS renders."""
+    # Config-file defaults, used only until nav_process publishes the live set.
+    _CFG_WAYPOINT_ATTRS = (
+        ("GPS1", "T1_GATE_ENTER_LAT", "T1_GATE_ENTER_LON"),
+        ("GPS2", "T1_GATE_MID_LAT", "T1_GATE_MID_LON"),
+        ("GPS3", "T1_GATE_EXIT_LAT", "T1_GATE_EXIT_LON"),
+        ("GPS4", "T2_ZONE_ENTRY_LAT", "T2_ZONE_ENTRY_LON"),
+        ("GPS5", "T2_ZONE_MID_LAT", "T2_ZONE_MID_LON"),
+        ("GPS6", "T2_ZONE_END_LAT", "T2_ZONE_END_LON"),
+        ("GPS7", "T3_START_LAT", "T3_START_LON"),
+        ("GPS8", "T3_MID_LAT", "T3_MID_LON"),
+    )
+
+    def current_waypoints():
+        """
+        Live waypoint set as {"GPS1": (lat, lon), ...}.
+
+        Reads shared_state first: `set_gps` is handled inside nav_process and mutates THAT
+        process's cfg module. Because the orchestrator uses mp.set_start_method('spawn'),
+        this process has its own independent copy of config.py that never sees those
+        updates - so reading cfg here echoed the config-file defaults back to the GCS while
+        the boat was actually steering to the operator's points.
+        """
+        pts = shared_state.get('mission_points')
+        if isinstance(pts, dict) and pts:
+            return {k: (float(v[0]), float(v[1])) for k, v in pts.items()}
+        return {name: (float(getattr(cfg, la, 0.0)), float(getattr(cfg, lo, 0.0)))
+                for name, la, lo in _CFG_WAYPOINT_ATTRS}
+
+    def r(value, digits, default=0.0):
+        """Round for the wire. json.dumps writes floats with repr(), i.e. 17 significant
+        digits - '40.809465000000004' costs 18 bytes to say 1 cm. 7 decimals of latitude is
+        ~1.1 cm, which is far below GPS noise."""
         try:
-            usable = [o for o in objs if o.get('lat') and o.get('lon')]
-            usable.sort(key=lambda o: o.get('dist') if o.get('dist') is not None else 1e9)
-        except Exception:
-            usable = list(objs)[:MAX_OBJECTS_IN_PAYLOAD]
-
-        out = []
-        for o in usable[:MAX_OBJECTS_IN_PAYLOAD]:
-            try:
-                out.append({
-                    "id": o.get('id'),
-                    "cid": o.get('cid'),
-                    "type": o.get('type'),
-                    "color": o.get('color'),
-                    "lat": round(float(o.get('lat', 0.0)), 7),
-                    "lon": round(float(o.get('lon', 0.0)), 7),
-                    "dist": round(float(o.get('dist') or 0.0), 1),
-                })
-            except (TypeError, ValueError):
-                continue
-        return out
+            return round(float(value), digits)
+        except (TypeError, ValueError):
+            return default
 
     # 2. Main Loop
     try:
@@ -76,7 +82,9 @@ def telem_worker(shared_state, command_queue, hf_data):
             pwm_fl = shared_state.get('motor_pwm_front_left', 1500)
             pwm_fr = shared_state.get('motor_pwm_front_right', 1500)
             pwm_steer = shared_state.get('motor_pwm_steer', 1500)
-            objects = shared_state.get('vision_detected_objects', [])
+            # 'vision_detected_objects' is no longer read here. It is the heaviest entry in
+            # the Manager dict (a pickled list of 10-30 dicts) and this loop was unpickling
+            # it 20x/s only to serialise it into a packet the GCS never looked at.
             manual_mode = shared_state.get('manual_mode', False)
 
 
@@ -86,18 +94,11 @@ def telem_worker(shared_state, command_queue, hf_data):
             # --- TELEMETRY BROADCAST ---
 
             if shared_state.get('send_telemetry', False):
-                gps_points = {
-                    "id": my_id,
-                    "GPS1": {"lat": float(getattr(cfg, "T1_GATE_ENTER_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_ENTER_LON", 0.0))},
-                    "GPS2": {"lat": float(getattr(cfg, "T1_GATE_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_MID_LON", 0.0))},
-                    "GPS3": {"lat": float(getattr(cfg, "T1_GATE_EXIT_LAT", 0.0)), "lon": float(getattr(cfg, "T1_GATE_EXIT_LON", 0.0))},
-                    "GPS4": {"lat": float(getattr(cfg, "T2_ZONE_ENTRY_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_ENTRY_LON", 0.0))},
-                    "GPS5": {"lat": float(getattr(cfg, "T2_ZONE_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_MID_LON", 0.0))},
-                    "GPS6": {"lat": float(getattr(cfg, "T2_ZONE_END_LAT", 0.0)), "lon": float(getattr(cfg, "T2_ZONE_END_LON", 0.0))},
-                    "GPS7": {"lat": float(getattr(cfg, "T3_START_LAT", 0.0)), "lon": float(getattr(cfg, "T3_START_LON", 0.0))},
-                    "GPS8": {"lat": float(getattr(cfg, "T3_MID_LAT", 0.0)), "lon": float(getattr(cfg, "T3_MID_LON", 0.0))},
-                }
-
+                # --- Payload construction ---
+                # Field NAMES are deliberately unchanged: GCSv1000.on_packet() looks up
+                # 'pwm_L', 'spd', 'trg_hdg', 'MEVCUT_KONUM' and friends by name, so renaming
+                # them to save bytes would silently blank the whole GCS panel. All the size
+                # reduction comes from dropping dead weight and rounding instead.
                 payload = {
                     "id": my_id,
                     "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
@@ -106,29 +107,47 @@ def telem_worker(shared_state, command_queue, hf_data):
                     "pwm_FL": int(pwm_fl),
                     "pwm_FR": int(pwm_fr),
                     "pwm_STEER": int(pwm_steer),
-                    "spd": round(float(shared_state.get('horizontal_speed', 0.0)), 2),
-                    "hdg": f"{heading:.0f}" if heading is not None else "0",
-                    "trg_hdg": round(float(shared_state.get('adviced_course', 0.0)), 1),
-                    "err_ang": round(float(shared_state.get('angle_error', 0.0)), 1),
-                    "ctrl_err": round(float(shared_state.get('control_error', 0.0)), 1),
-                    "hlth": "GOOD", # Simplified for now, or read from shared state
+                    "spd": r(shared_state.get('horizontal_speed', 0.0), 2),
+                    "hdg": r(heading, 0) if heading is not None else 0,
+                    "trg_hdg": r(shared_state.get('adviced_course', 0.0), 1),
+                    "err_ang": r(shared_state.get('angle_error', 0.0), 1),
+                    "ctrl_err": r(shared_state.get('control_error', 0.0), 1),
+                    "hlth": "GOOD",  # Simplified for now, or read from shared state
                     "task": mevcut_gorev,
-                    "objects": compact_objects(objects),
-                    "MEVCUT_KONUM": {"lat": round(float(current_lat), 7), "lon": round(float(current_lon), 7)},
-                    "HEDEF_KONUM": {"lat": round(float(shared_state.get('target_lat', 0.0)), 7),
-                                    "lon": round(float(shared_state.get('target_lon', 0.0)), 7)},
-                    "dist": round(float(shared_state.get('target_dist', 0.0)), 1),
+                    "MEVCUT_KONUM": {"lat": r(current_lat, 7), "lon": r(current_lon, 7)},
+                    "HEDEF_KONUM": {"lat": r(shared_state.get('target_lat', 0.0), 7),
+                                    "lon": r(shared_state.get('target_lon', 0.0), 7)},
+                    "dist": r(shared_state.get('target_dist', 0.0), 1),
                     "mod": bool(manual_mode),
-                    "FPS": shared_state.get('camera_fps', 0),
+                    "FPS": int(shared_state.get('camera_fps', 0) or 0),
                 }
 
-                # The mission waypoints only change when the GCS uploads new ones, so
-                # re-sending ~450 bytes of them 10x/s was pure link tax.
-                if gps_points != last_gps_points or \
-                        (start_time - last_gps_points_sent) > GPS_POINTS_REFRESH_S:
-                    payload["GÖREV_NOKTALARI"] = gps_points
-                    last_gps_points = gps_points
-                    last_gps_points_sent = start_time
+                # 'objects' is deliberately NOT sent any more.
+                #
+                # It was the single biggest field in the packet - ~200 B per tracked buoy,
+                # and ObjectMemoryManager keeps every detection for 5 s, so the Task 2 buoy
+                # field routinely produced 10-30 entries. Measured: 2960 B at 10 objects,
+                # 4960 B at 20, against a hard 2880 B ceiling imposed by write_timeout at
+                # 57600 baud. Every one of those writes was truncated mid-JSON.
+                #
+                # And it was never read: GCSv1000 has no consumer for the key at all. Pure
+                # airtime. If the GCS ever needs detections, send a separate, trimmed,
+                # low-rate packet rather than reviving this field.
+
+                # Waypoints are ~513 B - over half the remaining packet. Send them only when
+                # they actually change, plus a slow refresh so a GCS that connects late (or
+                # missed the packet) still populates its map. on_packet() already guards its
+                # read with `if "GÖREV_NOKTALARI" in d`, so omitting it is safe.
+                wp = current_waypoints()
+                now_ts = time.time()
+                if wp != last_waypoints_sent or (now_ts - last_waypoints_ts) >= waypoint_refresh_s:
+                    payload["GÖREV_NOKTALARI"] = {
+                        "id": my_id,
+                        **{name: {"lat": r(lat, 7), "lon": r(lon, 7)}
+                           for name, (lat, lon) in wp.items()},
+                    }
+                    last_waypoints_sent = wp
+                    last_waypoints_ts = now_ts
 
                 tx.send(payload)
                 shared_state['send_telemetry'] = False

@@ -25,10 +25,24 @@ CH_FRONT_RIGHT = getattr(cfg, 'FRONT_SAG_MOTOR', 4)
 CH_STEER = getattr(cfg, 'FRONT_STEER_SERVO', 5)
 
 
-def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
+def _slew(target, prev, max_delta):
+    """Limit one channel's per-cycle change to +/- max_delta."""
+    if max_delta is None or max_delta <= 0 or prev is None:
+        return int(target)
+    if target > prev + max_delta:
+        return int(prev + max_delta)
+    if target < prev - max_delta:
+        return int(prev - max_delta)
+    return int(target)
+
+
+def apply_motor_mixer(controller, forward_pwm, yaw_pwm, slew=True):
     """
     Control Mixer: Distributes Forward Effort and Yaw Effort across 5 channels.
     Implements Steering Deadband for smooth turns and push-pull differential.
+
+    `slew=False` bypasses the rate limiter - use it for emergency braking and for the
+    SIGTERM neutralise, where an instantaneous command is the whole point.
     """
     base = getattr(cfg, 'BASE_PWM', 1500)
 
@@ -84,13 +98,30 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     rear_right = int(np.clip(rear_right, 1100, 1900))
     front_left = int(np.clip(front_left, 1100, 1900))
     front_right = int(np.clip(front_right, 1100, 1900))
+    steer_out = int(steer_out)
+
+    # --- Slew-rate limiting (cfg.MAX_PWM_CHANGE) ---
+    # This limit has been sitting in config.py unused since the beginning. Flight data
+    # shows why it matters: at 23:48:08 the mixer went 1100/1900 -> 1831/1528 -> 1900/1109
+    # in 0.25 s, an ~800 PWM reversal on every thruster inside a quarter second. That is
+    # not control, it is chatter - and with the hull's ~1 s yaw time constant the boat
+    # simply keeps rotating through it. The previous PWM is read back from the controller's
+    # own cache, so no extra state has to be threaded through here.
+    if slew:
+        max_delta = getattr(cfg, 'MAX_PWM_CHANGE', 60)
+        rear_left = _slew(rear_left, controller.get_servo_pwm(CH_REAR_LEFT), max_delta)
+        rear_right = _slew(rear_right, controller.get_servo_pwm(CH_REAR_RIGHT), max_delta)
+        front_left = _slew(front_left, controller.get_servo_pwm(CH_FRONT_LEFT), max_delta)
+        front_right = _slew(front_right, controller.get_servo_pwm(CH_FRONT_RIGHT), max_delta)
+        steer_out = _slew(steer_out, controller.get_servo_pwm(CH_STEER), max_delta)
 
     # Command the hardware
-    controller.set_servo(CH_REAR_LEFT, rear_left)
-    controller.set_servo(CH_REAR_RIGHT, rear_right)
-    controller.set_servo(CH_FRONT_LEFT, front_left)
-    controller.set_servo(CH_FRONT_RIGHT, front_right)
-    controller.set_servo(CH_STEER, int(steer_out))
+    force = not slew  # emergency / neutralise paths must not be rate limited downstream
+    controller.set_servo(CH_REAR_LEFT, rear_left, force=force)
+    controller.set_servo(CH_REAR_RIGHT, rear_right, force=force)
+    controller.set_servo(CH_FRONT_LEFT, front_left, force=force)
+    controller.set_servo(CH_FRONT_RIGHT, front_right, force=force)
+    controller.set_servo(CH_STEER, steer_out, force=force)
 
 
 def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
@@ -124,6 +155,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
     local_costmap = np.full((LOCAL_SIZE, LOCAL_SIZE), 127, dtype=np.uint8)
 
+    # Physical buoy footprint painted into the costmap. Safety margin is NOT included here -
+    # it belongs to the inflation step, which applies it with the correct geometry.
+    buoy_radius_px = max(1, int(round(getattr(cfg, 'BUOY_RADIUS_M', 0.25) / COSTMAP_RES_M_PER_PX)))
+
     # These follow whatever map we are currently holding. When lidar_process pushes a
     # costmap it comes with its own geometry (its own size, centred on world origin),
     # so they must not be hardcoded to the local map's constants.
@@ -131,6 +166,32 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     costmap_size_px = (LOCAL_SIZE, LOCAL_SIZE)   # (width, height)
     costmap_center_m = (0.0, 0.0)
     costmap_ready = True
+
+    def publish_mission_points():
+        """
+        Mirror the current waypoint set into shared_state.
+
+        `set_gps` below mutates this process's `cfg` module. With mp.set_start_method('spawn')
+        every worker imports its OWN copy of config.py, so telem_process never saw those
+        updates - it kept echoing the config-file defaults back to the GCS while nav steered
+        to the operator's points. Publishing them here is what makes the GCS display (and the
+        change-detection in telem_process) reflect reality.
+        """
+        try:
+            shared_state['mission_points'] = {
+                "GPS1": (float(cfg.T1_GATE_ENTER_LAT), float(cfg.T1_GATE_ENTER_LON)),
+                "GPS2": (float(cfg.T1_GATE_MID_LAT), float(cfg.T1_GATE_MID_LON)),
+                "GPS3": (float(cfg.T1_GATE_EXIT_LAT), float(cfg.T1_GATE_EXIT_LON)),
+                "GPS4": (float(cfg.T2_ZONE_ENTRY_LAT), float(cfg.T2_ZONE_ENTRY_LON)),
+                "GPS5": (float(cfg.T2_ZONE_MID_LAT), float(cfg.T2_ZONE_MID_LON)),
+                "GPS6": (float(cfg.T2_ZONE_END_LAT), float(cfg.T2_ZONE_END_LON)),
+                "GPS7": (float(cfg.T3_START_LAT), float(cfg.T3_START_LON)),
+                "GPS8": (float(cfg.T3_MID_LAT), float(cfg.T3_MID_LON)),
+            }
+        except Exception as e:
+            print(f"[NAV_PROCESS][WARNING] Could not publish mission points: {e}")
+
+    publish_mission_points()
 
     def world_to_pixel(world_x, world_y):
         w, h = costmap_size_px
@@ -148,8 +209,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     direct_drive_prev_error = 0.0
 
     current_path = None
+    current_path_ts = 0.0             # when current_path was produced (A_STAR_MAX_PATH_AGE_S)
     path_progress_idx = 0
     active_controller = None          # 'PP' or 'PID' - used to reset stale derivative state
+    pp_spot_turn_active = False       # hysteresis latch for the PP spot-turn guard
     plan_timer = 0
     prev_heading_error = 0.0
     hybrid_local_target = None
@@ -171,7 +234,24 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     robot_x, robot_y, robot_yaw = 0.0, 0.0, 0.0
 
     last_loop_time = time.time()
-    loop_dt = 0.02
+    NAV_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'NAV_LOOP_HZ', 25.0))
+    loop_dt = NAV_PERIOD_S
+
+    # --- IPC throttling (see cfg.VISION_READ_HZ / cfg.NAV_PUBLISH_HZ) ---
+    # shared_state is a multiprocessing.Manager dict: EVERY access is a pickle round trip
+    # over a socket. The nav loop was making ~25 of them per iteration at 50 Hz (~1250/s),
+    # and the single most expensive entry - 'vision_detected_objects', a list of 10-30
+    # dicts - was being unpickled on every single cycle. That cost is what pushed loop_dt
+    # around, and because dt_scale() rescales the D/I terms by loop_dt, the effective
+    # damping was changing from cycle to cycle. That is the direct cause of "sometimes it
+    # runs beautifully, sometimes it does not" on identical code.
+    VISION_READ_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'VISION_READ_HZ', 10.0))
+    PUBLISH_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'NAV_PUBLISH_HZ', 10.0))
+    last_vision_read = 0.0
+    last_publish = 0.0
+    vision_objects = []
+    lidar_enabled = getattr(cfg, 'ENABLE_LIDAR', True)
+    speed_mps = 0.0
 
     # Give up on the in-place spot turn after this long and let the normal controllers
     # take over, rather than pivoting forever on a bad heading.
@@ -202,7 +282,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     def _on_terminate(signum, frame):
         print("[NAV_PROCESS] SIGTERM received - neutralising thrusters.")
         try:
-            apply_motor_mixer(controller, 1500, 0)
+            apply_motor_mixer(controller, 1500, 0, slew=False)
             controller.disarm_vehicle()
         except Exception:
             pass
@@ -232,15 +312,18 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 hf_data['gps_lat'].value = ida_enlem
                 hf_data['gps_lon'].value = ida_boylam
 
-                # Fetch and store horizontal speed
+                # Fetch horizontal speed. Kept in a LOCAL variable - Pure Pursuit reads it
+                # every cycle and round-tripping it through the Manager dict just to read it
+                # back was pure overhead. It is published to shared_state at NAV_PUBLISH_HZ
+                # further down for the HUD/telemetry.
                 try:
-                    shared_state['horizontal_speed'] = controller.get_horizontal_speed()
-                except AttributeError:
+                    _spd = controller.get_horizontal_speed()
+                    if _spd is not None:
+                        speed_mps = float(_spd)
+                except (AttributeError, TypeError, ValueError):
                     pass  # Fallback if get_horizontal_speed doesn't exist on dummy controller
 
                 fc_hdg = controller.get_heading()
-                if fc_hdg is not None:
-                    shared_state['fc_heading'] = fc_hdg
 
                 # Compute actual magnetic_heading based on HEADING_SOURCE
                 zed_heading = shared_state.get('zed_heading', 0.0)
@@ -296,6 +379,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 cfg.T3_MID_LAT = lat;
                                 cfg.T3_MID_LON = lon
                             print(f"[NAV_PROCESS] Updated GPS Point {idx}")
+                            publish_mission_points()
                         elif cmd_str == "set_task":
                             new_task = cmd.get("task_name")
                             if new_task:
@@ -348,19 +432,27 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 robot_yaw = math.radians(magnetic_heading)
 
-                center_danger = shared_state.get('lidar_center_blocked', False)
-                left_d = shared_state.get('lidar_left_dist', float('inf'))
-                center_d = shared_state.get('lidar_center_dist', float('inf'))
-                right_d = shared_state.get('lidar_right_dist', float('inf'))
+                # With ENABLE_LIDAR off these four Manager-dict reads happen every cycle and
+                # can never be anything but their defaults - the lidar process is not even
+                # started (see main_orchestrator). Skip them entirely.
+                if lidar_enabled:
+                    center_danger = shared_state.get('lidar_center_blocked', False)
+                    left_d = shared_state.get('lidar_left_dist', float('inf'))
+                    center_d = shared_state.get('lidar_center_dist', float('inf'))
+                    right_d = shared_state.get('lidar_right_dist', float('inf'))
+                else:
+                    center_danger = False
+                    left_d = center_d = right_d = float('inf')
 
                 # --- 4-A UPDATE: Pull from Queue instead of shared_state ---
                 lidar_data = None
-                try:
-                    # Empty the queue, only keeping the absolute newest frame
-                    while True:
-                        lidar_data = lidar_queue.get_nowait()
-                except queue.Empty:
-                    pass
+                if lidar_enabled:
+                    try:
+                        # Empty the queue, only keeping the absolute newest frame
+                        while True:
+                            lidar_data = lidar_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
                 got_lidar_map = False
                 if lidar_data and isinstance(lidar_data, tuple) and len(lidar_data) == 2:
@@ -379,7 +471,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     lidar_ts = 0.0  # Fallback
                 # -----------------------------------------------------------
 
-                vision_objects = shared_state.get('vision_detected_objects', [])
+                # Throttled read - this is the heaviest Manager-dict entry by far.
+                # camera_process only refreshes it at the ZED frame rate anyway, so reading
+                # it 50x/s never produced new information.
+                if (start_time - last_vision_read) >= VISION_READ_PERIOD_S:
+                    last_vision_read = start_time
+                    vision_objects = shared_state.get('vision_detected_objects', [])
 
                 # --- UPDATE SEPARATE COSTMAP RECORDER ---
                 if costmap_recorder is not None:
@@ -418,7 +515,12 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 p_virtual = world_to_pixel(obj_world_x, obj_world_y)
                                 if p_virtual:
-                                    cv2.circle(costmap_img, p_virtual, 6, 0, -1)
+                                    # The radius used to be a hardcoded 6 px (0.60 m), which
+                                    # silently doubled as safety margin. It now represents the
+                                    # buoy's actual size; ALL clearance comes from the
+                                    # inflation step in planner.get_inflated_nav_map(), where
+                                    # the robot radius is applied with the correct geometry.
+                                    cv2.circle(costmap_img, p_virtual, buoy_radius_px, 0, -1)
 
                 # --- E. FULL STATE MACHINE ---
                 # 3-A UPDATE: Refactored modular state machine
@@ -684,6 +786,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         start_lat = None
                         start_lon = None
                         current_path = None  # Discard old A* path when target changes
+                        current_path_ts = 0.0
                         path_progress_idx = 0
 
                     # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
@@ -784,26 +887,29 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 else:
                     # 1. Reactive Avoidance (Vector-Assisted Braking)
                     if center_danger:
+                        # Emergency braking bypasses the slew limiter: an instantaneous
+                        # reversal is exactly what is wanted here.
                         if not acil_durum_aktif_mi:
                             shock_brake_pwm = cfg.BASE_PWM - getattr(cfg, 'shock_pwm', 250)
                             # Braking: Reverse thrust, hard steer away
                             avoid_turn = 400 if (left_d > right_d) else -400
-                            apply_motor_mixer(controller, shock_brake_pwm, avoid_turn)
+                            apply_motor_mixer(controller, shock_brake_pwm, avoid_turn, slew=False)
                             time.sleep(0.1)
                             acil_durum_aktif_mi = True
 
                         escape_pwm = cfg.BASE_PWM - getattr(cfg, 'ESCAPE_PWM', 300)
                         avoid_turn = 400 if (left_d > right_d) else -400
-                        apply_motor_mixer(controller, escape_pwm, avoid_turn)
+                        apply_motor_mixer(controller, escape_pwm, avoid_turn, slew=False)
                         time.sleep(0.4)
 
                         spot_turn_val = getattr(cfg, 'SPOT_TURN_PWM', 200)
                         if left_d > right_d:
-                            apply_motor_mixer(controller, cfg.BASE_PWM, -spot_turn_val)
+                            apply_motor_mixer(controller, cfg.BASE_PWM, -spot_turn_val, slew=False)
                         else:
-                            apply_motor_mixer(controller, cfg.BASE_PWM, spot_turn_val)
+                            apply_motor_mixer(controller, cfg.BASE_PWM, spot_turn_val, slew=False)
                         time.sleep(0.3)
                         current_path = None  # Force replan
+                        current_path_ts = 0.0
                         path_progress_idx = 0
 
                         # This branch blocks for ~0.8s and then `continue`s, skipping the
@@ -859,6 +965,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                             if not use_astar_planner:
                                 current_path = None
+                                current_path_ts = 0.0
                                 path_progress_idx = 0
 
                             if use_astar_planner:
@@ -887,9 +994,13 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 nav_map, _ = planner.get_inflated_nav_map(cropped_costmap)
 
-                                # Replan at ~10 Hz, or immediately if we have no path at all.
+                                # --- Planning is decoupled from control ---
+                                # A* runs every A_STAR_PLAN_DIVISOR cycles (5 Hz at 25 Hz
+                                # loop) with A_STAR_TIME_BUDGET_S; Pure Pursuit below runs
+                                # every cycle on the last good path.
+                                plan_divisor = max(1, int(getattr(cfg, 'A_STAR_PLAN_DIVISOR', 5)))
                                 plan_timer += 1
-                                if (plan_timer > 4 or not current_path) and tx_world is not None:
+                                if (plan_timer >= plan_divisor or not current_path) and tx_world is not None:
                                     plan_timer = 0
                                     new_path = None
                                     if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map,
@@ -904,7 +1015,26 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                             heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5))
                                     if new_path and len(new_path) >= 2:
                                         current_path = new_path
+                                        current_path_ts = time.time()
                                         path_progress_idx = 0
+                                    else:
+                                        # A* gave up (no route, expansion cap, or time budget).
+                                        # The old code left `current_path` untouched here, so
+                                        # the boat kept following a path planned from a pose it
+                                        # had long since left - and find_lookahead_point would
+                                        # then latch onto a node behind it. Dropping the path
+                                        # hands control to the Direct-Drive PID below: obstacle
+                                        # blind, but smooth, and far safer than a stale route.
+                                        current_path = None
+                                        current_path_ts = 0.0
+                                        path_progress_idx = 0
+
+                                # Never follow a path older than A_STAR_MAX_PATH_AGE_S.
+                                max_age = getattr(cfg, 'A_STAR_MAX_PATH_AGE_S', 0.6)
+                                if current_path and (time.time() - current_path_ts) > max_age:
+                                    current_path = None
+                                    current_path_ts = 0.0
+                                    path_progress_idx = 0
                                 # ------------------------------------------------
 
                             # Follow the planned path with Pure Pursuit.
@@ -916,24 +1046,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             # PID for 4 out of every 5 cycles - two controllers with different
                             # gains fighting each other, each with a stale prev_error.
                             if current_path and len(current_path) >= 2:
-                                base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                                cruise_offset = getattr(cfg, 'CRUISE_PWM', 80)
                                 if mevcut_gorev.startswith("T3_") or "TASK3" in mevcut_gorev:
-                                    base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
-                                else:
-                                    base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
+                                    cruise_offset = getattr(cfg, 'T3_SPEED_PWM', 100)
+                                base_pwm = getattr(cfg, 'BASE_PWM', 1500) + cruise_offset
 
                                 if active_controller != 'PP':
                                     prev_heading_error = 0.0   # avoid a derivative kick on handover
                                     active_controller = 'PP'
+                                    pp_spot_turn_active = False
 
                                 # Ground speed in m/s - NOT a PWM offset. Feeding PWM here pinned
                                 # the lookahead at PURE_PURSUIT_MAX_LOOKAHEAD permanently.
-                                speed_mps = shared_state.get('horizontal_speed', 0.0)
-                                try:
-                                    speed_mps = float(speed_mps)
-                                except (TypeError, ValueError):
-                                    speed_mps = 0.0
-
+                                # `speed_mps` is now a local updated once per cycle from the FC
+                                # (see section A) instead of a Manager-dict round trip.
                                 p_base, p_steer, raw_target, current_error, path_progress_idx = \
                                     planner.pure_pursuit_control(
                                         robot_x, robot_y, robot_yaw, current_path,
@@ -943,18 +1069,49 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 prev_heading_error = current_error
 
+                                # --- Throttle taper + spot-turn guard ---
+                                # The Direct-Drive PID branch below has always had
+                                # SPOT_TURN_THRESHOLD; the Pure Pursuit branch had nothing. So
+                                # the boat held full cruise thrust while commanding maximum
+                                # differential at 150 deg of heading error - which traces a
+                                # circle by construction. That is precisely what the 23:47:59 to
+                                # 23:48:08 flight segment shows.
+                                abs_err = abs(current_error)
+                                enter_deg = getattr(cfg, 'PP_SPOT_TURN_ENTER_DEG', 60.0)
+                                exit_deg = getattr(cfg, 'PP_SPOT_TURN_EXIT_DEG', 35.0)
+
+                                if pp_spot_turn_active:
+                                    if abs_err < exit_deg:
+                                        pp_spot_turn_active = False
+                                elif abs_err > enter_deg:
+                                    pp_spot_turn_active = True
+
+                                if pp_spot_turn_active:
+                                    # Pivot in place until we are pointing roughly the right way.
+                                    p_base = getattr(cfg, 'BASE_PWM', 1500)
+                                else:
+                                    # Smoothly bleed off forward thrust as the error grows, so the
+                                    # boat stops skidding sideways through its own turn.
+                                    taper_min = getattr(cfg, 'PP_THROTTLE_TAPER_MIN', 0.25)
+                                    taper = math.cos(math.radians(min(abs_err, 90.0)))
+                                    taper = max(taper_min, taper)
+                                    p_base = getattr(cfg, 'BASE_PWM', 1500) + (cruise_offset * taper)
+
                                 apply_motor_mixer(controller, p_base, p_steer)
 
                                 # Path consumed: force a fresh plan on the next cycle.
                                 end_pt = current_path[-1]
                                 if math.hypot(end_pt[0] - robot_x, end_pt[1] - robot_y) < 0.5:
                                     current_path = None
+                                    current_path_ts = 0.0
                                     path_progress_idx = 0
 
                             # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                             else:
                                 current_path = None  # Force a fresh A* attempt on the next plan_timer cycle
+                                current_path_ts = 0.0
                                 path_progress_idx = 0
+                                pp_spot_turn_active = False
                                 if target_lat is not None and target_lon is not None:
                                     # Always use Direct Drive PID (and spot turns) as a fallback when A* has no path
                                     # This prevents the boat from freezing if A* inflation blocks the target
@@ -1028,14 +1185,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     elif not skip_default_nav:
                         apply_motor_mixer(controller, 1500, 0)
 
-                # Record final PWMs
-                # Note: We rely on the USVController object stub tracking state,
-                # but we can push directly to shared_state for safety
-                shared_state['motor_pwm_left'] = controller.get_servo_pwm(CH_REAR_LEFT)
-                shared_state['motor_pwm_right'] = controller.get_servo_pwm(CH_REAR_RIGHT)
-                shared_state['motor_pwm_front_left'] = controller.get_servo_pwm(CH_FRONT_LEFT)
-                shared_state['motor_pwm_front_right'] = controller.get_servo_pwm(CH_FRONT_RIGHT)
-                shared_state['motor_pwm_steer'] = controller.get_servo_pwm(CH_STEER)
+                # Record final PWMs + speed for the HUD and the GCS.
+                # These are display-only: nothing in the control loop reads them back, so
+                # publishing them at 50 Hz was 6 pickled Manager-dict writes per cycle for
+                # values that are consumed by a 30 fps overlay and a 2 Hz telemetry link.
+                if (start_time - last_publish) >= PUBLISH_PERIOD_S:
+                    last_publish = start_time
+                    shared_state['motor_pwm_left'] = controller.get_servo_pwm(CH_REAR_LEFT)
+                    shared_state['motor_pwm_right'] = controller.get_servo_pwm(CH_REAR_RIGHT)
+                    shared_state['motor_pwm_front_left'] = controller.get_servo_pwm(CH_FRONT_LEFT)
+                    shared_state['motor_pwm_front_right'] = controller.get_servo_pwm(CH_FRONT_RIGHT)
+                    shared_state['motor_pwm_steer'] = controller.get_servo_pwm(CH_STEER)
+                    shared_state['horizontal_speed'] = speed_mps
+                    if fc_hdg is not None:
+                        shared_state['fc_heading'] = fc_hdg
 
                 # Heartbeat: p.is_alive() in the orchestrator watchdog only detects a dead process,
                 # not one blocked on a hung call (e.g. a serial write). This timestamp lets the
@@ -1049,14 +1212,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # until it was re-armed by hand from the RC. Neutralise, log, keep looping.
                 print(f"[NAV_PROCESS][ERROR] Iteration failed: {loop_err}")
                 try:
-                    apply_motor_mixer(controller, 1500, 0)
+                    apply_motor_mixer(controller, 1500, 0, slew=False)
                 except Exception:
                     pass
                 shared_state['nav_heartbeat'] = time.time()
 
 
+            # Loop rate is cfg.NAV_LOOP_HZ (25 Hz), down from a hardcoded 50 Hz. A USV's yaw
+            # time constant is 1-2 s, so 25 Hz is still 12-25x oversampled - but it halves the
+            # MAVLink command rate to the flight controller and the Manager-dict IPC traffic,
+            # both of which were measurably starving the rest of the system (camera FPS fell
+            # 30 -> 17 and GPS updates stalled for ~1.5 s during the failure window).
             elapsed = time.time() - start_time
-            if elapsed < 0.02: time.sleep(0.02 - elapsed)
+            if elapsed < NAV_PERIOD_S:
+                time.sleep(NAV_PERIOD_S - elapsed)
 
     except Exception as e:
         print(f"[NAV_PROCESS][ERROR] Brain crashed: {e}")
@@ -1065,7 +1234,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         if costmap_recorder is not None:
             costmap_recorder.save()
         try:
-            apply_motor_mixer(controller, 1500, 0)
+            apply_motor_mixer(controller, 1500, 0, slew=False)
 
             controller.disarm_vehicle()
         except:

@@ -103,6 +103,17 @@ class AsyncStreamer(threading.Thread):
         self.join()
 
 
+# Raw YOLO/data.yaml class id -> ProtoEnum colour. Single source of truth so the voted
+# class id and the reported colour can never drift apart.
+CID_TO_COLOR = {
+    0: 3,  # ProtoEnum.COLOR_RED
+    1: 1,  # ProtoEnum.COLOR_YELLOW
+    2: 2,  # ProtoEnum.COLOR_BLACK
+    3: 5,  # ProtoEnum.COLOR_ORANGE
+    4: 4,  # ProtoEnum.COLOR_GREEN
+}
+
+
 class ObjectMemoryManager:
     def __init__(self):
         # Format: [{'id': 1, 'lat': 0.0, 'lon': 0.0, 'type': 0, 'color': 0, 'last_seen': 0.0, 'v_lat': 0.0, 'v_lon': 0.0}]
@@ -112,9 +123,22 @@ class ObjectMemoryManager:
 
     def update_and_get_id(self, lat, lon, obj_type, color, cid=None, cx=None, cy=None, obj_dist=None, area=None):
         """
-        cid/cx/cy/obj_dist/area are PER-FRAME (transient) values from the current detection.
+        cx/cy/obj_dist/area are PER-FRAME (transient) values from the current detection.
         They are refreshed on every sighting so Task3's visual servoing always reads the
-        latest pixel/distance data, while lat/lon/color/id remain the persistent GPS memory.
+        latest pixel/distance data, while lat/lon/id remain the persistent GPS memory.
+
+        Colour (and therefore `cid`) is a VOTED attribute, not a matching key.
+
+        Matching used to require `obj['color'] == color` as well as position and type. In
+        backlit water a single frame where YOLO calls a yellow buoy orange (or vice versa)
+        then fails to match, allocates a NEW id, and leaves BOTH entries alive for the full
+        5 s memory window. Task 2's costmap filter accepts cid 1 and 3, so one real buoy
+        became two overlapping obstacles a couple of metres apart - which is exactly the
+        smeared cloud visible in final_costmap.png, and exactly the kind of jitter that
+        makes A* flip its avoidance side between replans.
+
+        Matching on position + type and voting on colour keeps one track per buoy and lets
+        the colour settle to whatever the detector says most of the time.
         """
         current_time = time.time()
         best_match = None
@@ -134,8 +158,8 @@ class ObjectMemoryManager:
             dx = (pred_lon - lon) * 85000
             dist = math.sqrt(dx * dx + dy * dy)
 
-            # Also check color and type for stricter matching
-            if dist < self.MERGE_DISTANCE and obj['type'] == obj_type and obj['color'] == color:
+            # Position + type only - colour is voted below, never a matching key.
+            if dist < self.MERGE_DISTANCE and obj['type'] == obj_type:
                 if dist < min_dist:
                     min_dist = dist
                     best_match = obj
@@ -152,8 +176,15 @@ class ObjectMemoryManager:
             best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
             best_match['last_seen'] = current_time
 
+            # Colour vote: the winning class id decides both 'cid' and 'color'.
+            if cid is not None:
+                votes = best_match.setdefault('cid_votes', {})
+                votes[cid] = votes.get(cid, 0) + 1
+                winner = max(votes, key=votes.get)
+                best_match['cid'] = winner
+                best_match['color'] = CID_TO_COLOR.get(winner, best_match.get('color', 0))
+
             # Refresh transient per-frame fields (NOT smoothed - always the latest reading)
-            best_match['cid'] = cid
             best_match['cx'] = cx
             best_match['cy'] = cy
             best_match['dist'] = obj_dist
@@ -173,6 +204,7 @@ class ObjectMemoryManager:
                 'v_lat': 0.0,
                 'v_lon': 0.0,
                 'cid': cid,
+                'cid_votes': {cid: 1} if cid is not None else {},
                 'cx': cx,
                 'cy': cy,
                 'dist': obj_dist,
