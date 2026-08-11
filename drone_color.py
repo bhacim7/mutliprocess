@@ -49,7 +49,8 @@ else:
     lower_green, upper_green = (36, 80, 80), (85, 255, 255)
     lower_black, upper_black = (0, 0, 0), (179, 80, 55)
 
-kernel = np.ones((5,5), np.uint8)
+kernel = np.ones((5, 5), np.uint8)
+
 
 def clean(mask):
     """Performs morphological operations (opening and closing) to clean noise."""
@@ -57,10 +58,11 @@ def clean(mask):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     return mask
 
+
 def detect_color(roi):
     """Detects the most dominant color (Black, Red, Green or Undefined) in the ROI."""
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
+
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     mask_black = cv2.inRange(hsv, lower_black, upper_black)
@@ -68,8 +70,8 @@ def detect_color(roi):
     mask_red = clean(mask_red)
     mask_green = clean(mask_green)
     mask_black = clean(mask_black)
-    
-    min_area = int(roi.shape[0]*roi.shape[1]*0.005)
+
+    min_area = int(roi.shape[0] * roi.shape[1] * 0.005)
 
     def max_contour_area(mask):
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -80,44 +82,77 @@ def detect_color(roi):
     red_area = max_contour_area(mask_red)
     green_area = max_contour_area(mask_green)
     black_area = max_contour_area(mask_black)
-    
+
     areas = {"KIRMIZI": red_area, "YESIL": green_area, "SIYAH": black_area}
     max_area_label = max(areas, key=areas.get)
     max_area_value = areas[max_area_label]
-    
+
     if max_area_value > min_area:
         return max_area_label, max_area_value / (roi.shape[0] * roi.shape[1])
     else:
         return "BELIRSIZ", 0.0
 
+
+last_sent_label = None
+last_sent_time = 0.0
+SEND_MIN_INTERVAL_S = 1.0   # heartbeat rate when the colour is unchanged
+
+
 def send_serial_message(label):
-    """Sends a JSON message with the detected color."""
+    """
+    Sends a JSON message with the detected color.
+
+    Rate limited: this used to fire on every camera frame (~30 Hz). The GCS forwards
+    each one to the boat as a set_target_color command, so a single telemetry link was
+    carrying ~60 extra packets a second on top of the boat's own telemetry. Send
+    immediately when the colour changes, otherwise only as a 1 Hz heartbeat.
+    """
+    global last_sent_label, last_sent_time
+
     if master is None or not master.is_open:
         return
+
+    now = time.time()
+    if label == last_sent_label and (now - last_sent_time) < SEND_MIN_INTERVAL_S:
+        return
+
     msg = {"id": 3, "drone_color": label}
     try:
         master.write((json.dumps(msg) + "\n").encode('utf-8'))
+        last_sent_label = label
+        last_sent_time = now
     except Exception as e:
         print(f"Failed to send serial message: {e}")
 
+
 # --- Main Loop & GPIO Setup ---
-global pulse_width_us, pulse_start_time
+global pulse_width_us, pulse_start_time, last_pulse_time
 pulse_width_us = 0.0
 pulse_start_time = 0.0
+last_pulse_time = 0.0
+
+# If no RC edge arrives for this long the signal is gone (transmitter off, cable out).
+# pulse_width_us only ever updates on a falling edge, so without this it FREEZES at its
+# last value - a link loss while active left the drone stuck transmitting forever.
+RC_SIGNAL_TIMEOUT_S = 0.5
 
 # Jetson GPIO Kurulumu
 GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM) # BCM pin numaralandırmasını kullan
+GPIO.setmode(GPIO.BCM)  # BCM pin numaralandırmasını kullan
 GPIO.setup(TRIGGER_PIN, GPIO.IN)
+
 
 # Pin olay işleyicisi (Interrupt Callback)
 def pin_edge_callback(channel):
-    global pulse_start_time, pulse_width_us
-    if GPIO.input(channel) == GPIO.HIGH: # Yükselen kenar (Activated)
-        pulse_start_time = time.time()
-    else: # Düşen kenar (Deactivated)
+    global pulse_start_time, pulse_width_us, last_pulse_time
+    now = time.time()
+    last_pulse_time = now
+    if GPIO.input(channel) == GPIO.HIGH:  # Yükselen kenar (Activated)
+        pulse_start_time = now
+    else:  # Düşen kenar (Deactivated)
         if pulse_start_time > 0:
-            pulse_width_us = (time.time() - pulse_start_time) * 1000000
+            pulse_width_us = (now - pulse_start_time) * 1000000
+
 
 # Hem yükselen hem düşen kenarda tetiklenecek şekilde ayarla
 GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_edge_callback)
@@ -133,8 +168,10 @@ last_status = "Boşta"
 last_detected_color = "BELIRSIZ"
 last_detected_conf = 0.0
 
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
+
 
 clear_screen()
 print("-------------------------------------")
@@ -144,6 +181,14 @@ print(f"RC Trigger Pin: GPIO {TRIGGER_PIN}")
 
 try:
     while True:
+        # RC failsafe: no edges for a while means there is no signal any more, so the
+        # last measured pulse width is stale and must not keep the system ACTIVE.
+        if last_pulse_time > 0.0 and (time.time() - last_pulse_time) > RC_SIGNAL_TIMEOUT_S:
+            pulse_width_us = 0.0
+            rc_link_ok = False
+        else:
+            rc_link_ok = last_pulse_time > 0.0
+
         # Check for state changes with a timer
         if pulse_width_us > ACTIVATION_THRESHOLD:
             if active_start_time is None:
@@ -157,26 +202,26 @@ try:
                 idle_start_time = time.time()
             if time.time() - idle_start_time >= TIMER_THRESHOLD:
                 current_status = "Boşta"
-                
+
         if current_status != last_status:
             last_status = current_status
-        
+
         ok, frame = cap.read()
         if not ok:
             print("\nCamera could not be read. Terminating program.")
             break
-            
+
         small_frame = cv2.resize(frame, (320, 240))
         h, w = small_frame.shape[:2]
         roi_ratio = 0.7
-        x0 = int((1-roi_ratio)/2 * w)
-        x1 = int((1+roi_ratio)/2 * w)
-        y0 = int((1-roi_ratio)/2 * h)
-        y1 = int((1+roi_ratio)/2 * h)
+        x0 = int((1 - roi_ratio) / 2 * w)
+        x1 = int((1 + roi_ratio) / 2 * w)
+        y0 = int((1 - roi_ratio) / 2 * h)
+        y1 = int((1 + roi_ratio) / 2 * h)
         roi = small_frame[y0:y1, x0:x1]
 
         current_color, current_conf = detect_color(roi)
-        
+
         if current_color != last_detected_color:
             last_detected_color = current_color
             last_detected_conf = current_conf
@@ -193,7 +238,8 @@ try:
         print(f"Confidence: {last_detected_conf:.3f}")
         print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
         print(f"Pulse Width (µs): {pulse_width_us:.2f}")
-        
+        print(f"RC Signal: {'OK' if rc_link_ok else 'NO SIGNAL'}")
+
         if master and master.is_open:
             print(f"Serial Connection: OK ({TELEMETRY_PORT})")
         else:
@@ -207,4 +253,4 @@ except KeyboardInterrupt:
     print("\nProgram terminated by user.")
 finally:
     cap.release()
-    GPIO.cleanup() # Program kapanırken pinleri güvenli hale getir
+    GPIO.cleanup()  # Program kapanırken pinleri güvenli hale getir

@@ -25,6 +25,42 @@ def telem_worker(shared_state, command_queue, hf_data):
 
     my_id = 1
 
+    # --- Bandwidth budget ---------------------------------------------------
+    # The GCS polls report_status and the reply used to carry the whole object memory
+    # plus all 8 mission waypoints on EVERY packet: 2-4 KB each. A 57600 baud radio
+    # link tops out around 5.7 KB/s, so at the GCS's poll rate this asked for several
+    # times the available bandwidth. The write buffer backs up, TelemetrySender's
+    # write_timeout starts raising, and the COMMAND channel (which shares this link,
+    # emergency stop included) degrades along with it.
+    MAX_OBJECTS_IN_PAYLOAD = 8
+    last_gps_points = None
+    last_gps_points_sent = 0.0
+    GPS_POINTS_REFRESH_S = 10.0   # also resend periodically so a GCS that reconnects catches up
+
+    def compact_objects(objs):
+        """Nearest few detections, rounded, with only the fields the GCS renders."""
+        try:
+            usable = [o for o in objs if o.get('lat') and o.get('lon')]
+            usable.sort(key=lambda o: o.get('dist') if o.get('dist') is not None else 1e9)
+        except Exception:
+            usable = list(objs)[:MAX_OBJECTS_IN_PAYLOAD]
+
+        out = []
+        for o in usable[:MAX_OBJECTS_IN_PAYLOAD]:
+            try:
+                out.append({
+                    "id": o.get('id'),
+                    "cid": o.get('cid'),
+                    "type": o.get('type'),
+                    "color": o.get('color'),
+                    "lat": round(float(o.get('lat', 0.0)), 7),
+                    "lon": round(float(o.get('lon', 0.0)), 7),
+                    "dist": round(float(o.get('dist') or 0.0), 1),
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
     # 2. Main Loop
     try:
         while not shared_state['shutdown']:
@@ -65,26 +101,34 @@ def telem_worker(shared_state, command_queue, hf_data):
                 payload = {
                     "id": my_id,
                     "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
-                    "pwm_L": pwm_l,
-                    "pwm_R": pwm_r,
-                    "pwm_FL": pwm_fl,
-                    "pwm_FR": pwm_fr,
-                    "pwm_STEER": pwm_steer,
-                    "spd": shared_state.get('horizontal_speed', 0.0),
+                    "pwm_L": int(pwm_l),
+                    "pwm_R": int(pwm_r),
+                    "pwm_FL": int(pwm_fl),
+                    "pwm_FR": int(pwm_fr),
+                    "pwm_STEER": int(pwm_steer),
+                    "spd": round(float(shared_state.get('horizontal_speed', 0.0)), 2),
                     "hdg": f"{heading:.0f}" if heading is not None else "0",
-                    "trg_hdg": shared_state.get('adviced_course', 0.0),
-                    "err_ang": shared_state.get('angle_error', 0.0),
-                    "ctrl_err": shared_state.get('control_error', 0.0),
+                    "trg_hdg": round(float(shared_state.get('adviced_course', 0.0)), 1),
+                    "err_ang": round(float(shared_state.get('angle_error', 0.0)), 1),
+                    "ctrl_err": round(float(shared_state.get('control_error', 0.0)), 1),
                     "hlth": "GOOD", # Simplified for now, or read from shared state
                     "task": mevcut_gorev,
-                    "objects": objects, # Lightweight dicts, safe to serialize
-                    "MEVCUT_KONUM": {"lat": current_lat, "lon": current_lon},
-                    "HEDEF_KONUM": {"lat": shared_state.get('target_lat', 0.0), "lon": shared_state.get('target_lon', 0.0)},
-                    "dist": shared_state.get('target_dist', 0.0),
+                    "objects": compact_objects(objects),
+                    "MEVCUT_KONUM": {"lat": round(float(current_lat), 7), "lon": round(float(current_lon), 7)},
+                    "HEDEF_KONUM": {"lat": round(float(shared_state.get('target_lat', 0.0)), 7),
+                                    "lon": round(float(shared_state.get('target_lon', 0.0)), 7)},
+                    "dist": round(float(shared_state.get('target_dist', 0.0)), 1),
                     "mod": bool(manual_mode),
                     "FPS": shared_state.get('camera_fps', 0),
-                    "GÖREV_NOKTALARI": gps_points
                 }
+
+                # The mission waypoints only change when the GCS uploads new ones, so
+                # re-sending ~450 bytes of them 10x/s was pure link tax.
+                if gps_points != last_gps_points or \
+                        (start_time - last_gps_points_sent) > GPS_POINTS_REFRESH_S:
+                    payload["GÖREV_NOKTALARI"] = gps_points
+                    last_gps_points = gps_points
+                    last_gps_points_sent = start_time
 
                 tx.send(payload)
                 shared_state['send_telemetry'] = False
