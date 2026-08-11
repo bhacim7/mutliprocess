@@ -70,6 +70,14 @@ LIDAR_OCCUPIED_GAIN = 80
 LIDAR_KORIDOR_KP = 30.0
 MAP_DECAY_AMOUNT = 1
 
+# --- POST-MISSION COSTMAP RECORDER (diagnostics only, no effect on control) ---
+# The old recorder stamped every 1 Hz sighting into a fixed 500 m canvas at 0.5 m/px and
+# never erased anything, so a single buoy smeared into a ~14 m blob and ~90% of the saved
+# PNG was empty black. It now records in metres and renders once, auto-fitting the canvas.
+COSTMAP_REC_RES_M_PER_PX = 0.2
+COSTMAP_REC_TRACK_HZ = 5.0    # boat track sampling - 1 Hz turned a 10 s circle into a decagon
+COSTMAP_REC_OBJECT_HZ = 1.0   # raw sighting sampling (feeds the noise-cloud layer)
+
 CAM_RES = 2
 CAM_FPS = 30
 CAM_HFOV = 110.0

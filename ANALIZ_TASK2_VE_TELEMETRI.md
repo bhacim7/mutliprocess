@@ -250,6 +250,31 @@ zararı o veriyor.
 
 > `final_costmap`, sorunun kendisi değil; sorunun çok iyi bir **röntgeni**.
 
+### DÜZELTME — ağırlıklar yanlış tahmin edilmişti
+
+Yukarıdaki üç sebebi saymıştım ama ağırlıklarını ölçünce baskın terim başka çıktı.
+Tek şamandıranın haritadaki leke çapı (gerçek çap 0,5 m):
+
+| Senaryo | Leke çapı |
+|---|---|
+| Eski kod | 14,4 m (29 px) |
+| Sadece madde 11 (renk oylaması) | 12,6 m — **yalnızca %12 iyileşme** |
+| + çizim yarıçapı düzeltilirse | 10,0 m |
+| + nesne başına tek nokta | **2,2 m** |
+
+Yani lekenin büyük kısmı **algı gürültüsü değil, çizim yönteminin kendisiydi**:
+
+1. **Birikme (baskın).** `update()` saniyede bir çalışıp hafızadaki *tüm* nesneleri yeniden
+   çiziyor, hiçbir şey silinmiyor. 60 s × ~15 nesne = **~900 daire**, gürültünün tamamı
+   haritaya kalıcı olarak kazınıyor.
+2. **Çizim yarıçapı 6 kat büyük.** `cv2.circle(..., 3, ...)` × 0,5 m/px = **3 m çap**.
+3. **Yol 1 Hz örnekleniyor.** 1,8 m/s'te 1,8 m'lik parçalar → 10 saniyelik daire
+   **10 köşeli bir çokgen** olarak çiziliyor.
+4. **Tuval sabit 500 m, parkur ~55 m** → kaydedilen PNG'nin **%99,7'si boş siyah**
+   (ölçüldü: 1000×1000 px tuvalde dolu alan 45×157 px).
+
+Bu dört madde de düzeltildi → [Bölüm 11](#11-costmap-recorder-yeniden-yazımı).
+
 ---
 
 ## 5. TELEMETRİ KAYBININ KÖK NEDENİ
@@ -814,6 +839,7 @@ Sonra **T5** (GCS polling dönüşümlü) → drone LED'i de kararlı yanmalı.
 | T3 | Float yuvarlama + kompakt ayraç | `telem_process.py`, `telem.py` | ✅ |
 | T4 | Boyut koruması + resync | `telem.py`, `config.py` | ✅ |
 | — | `mission_points` paylaşımlı bellek köprüsü | `nav_process.py`, `telem_process.py`, `main_orchestrator.py` | ✅ |
+| R1–R5 | Costmap recorder yeniden yazıldı ([Bölüm 11](#11-costmap-recorder-yeniden-yazımı)) | `costmap_recorder.py`, `config.py` | ✅ |
 
 **Ertelenen:** T5 (GCS dönüşümlü polling), 12 (turuncu sınır çizgi kısıtı),
 13 (pusula doğrulama), 14 (derinlik eleme).
@@ -895,3 +921,60 @@ A\*'ın hiç yol bulamaması, engel-kör PID'e düşmek demektir — mevcut duru
 4. **Şamandıra yanından geçiş:** `DUMEN_PWM` uçlara **hiç dayanmamalı**.
 5. **Aynı senaryoyu 3 kez tekrarla:** `FPS` sürekli 30 kalmalı, `IDA_KONUM` donmamalı,
    üç denemede de **benzer** iz çizilmeli.
+6. **Görev sonunda terminaldeki `[COSTMAP]` saçılma satırlarını okuyun** (bkz. Bölüm 11) —
+   bu, ertelenen 13/14 maddeleri için ihtiyacınız olan ölçüm.
+
+---
+
+## 11. COSTMAP RECORDER YENİDEN YAZIMI
+
+`utils/costmap_recorder.py` **tamamen yeniden yazıldı.** Uçuş kontrolüne dokunmaz,
+yalnızca görev sonrası teşhis üretir; API'si (`CostmapRecorder()`, `register_exit_handlers()`,
+`update(lat, lon, objects)`, `save()`) **değişmedi**, `nav_process.py` düzenlenmesi gerekmedi.
+
+### Yeni tasarım
+
+Artımlı çizim yerine **metre cinsinden veri biriktirilip `save()` anında bir kez render
+ediliyor**. Bu, artımlı tuval büyütme mantığını (`_expand_image_if_needed`) ve onun
+origin-kaydırma defter tutmasını tamamen ortadan kaldırdı.
+
+| | Ne tutuluyor |
+|---|---|
+| `self.track` | Tekne konumları — **5 Hz** (R3) |
+| `self.objects` | id → son bilinen konum · **şamandıra başına tek parlak nokta** (R1) |
+| `self.observations` | Her ham gözlem · **soluk bulut katmanı** (R5) |
+
+Ayrıca:
+- **R2** — çizim yarıçapı `BUOY_RADIUS_M`'den türetiliyor (3 m çap → 0,5 m)
+- **R4** — çözünürlük 0,5 → **0,2 m/px**, tuval **veriye göre otomatik sığdırılıyor**
+- Başlangıç (yeşil) / bitiş (kırmızı) işaretleri + **ölçek çubuğu**
+- Her nesnenin etrafına **RMS saçılma halkası** — belirsizlik haritadan metre olarak okunuyor
+
+### Ölçülen sonuç (aynı benzetilmiş uçuş verisi)
+
+| | Eski | Yeni |
+|---|---|---|
+| Tuval | 1000×1000 px (500×500 m) | **147×436 px (29×87 m)** |
+| Dolu alan | 45×157 px → **%0,27** | otomatik sığdırma → ~%100 |
+| Şamandıra gösterimi | ~900 üst üste disk | **16 ayrık nokta** |
+| Daire manevrası | 10 köşeli çokgen | düzgün eğri |
+
+### Terminal çıktısı — asıl kazanç
+
+`save()` artık **sayı** basıyor:
+
+```
+[COSTMAP] Saved final_costmap.png  147x436 px @ 0.20 m/px  (29 x 87 m)
+[COSTMAP]   track points: 250   objects: 16   raw sightings: 336
+[COSTMAP]   position scatter (RMS), A* clearance = 1.20 m:
+[COSTMAP]     orange  n=12  mean 2.82 m  max 5.01 m  <-- exceeds clearance
+[COSTMAP]     yellow  n=4   mean 2.54 m  max 3.73 m  <-- exceeds clearance
+```
+
+**`<-- exceeds clearance` uyarısı bölüm 3(D)'nin doğrudan ölçümüdür:** konum belirsizliği
+A\*'ın engel açıklığından büyükse, planlayıcının "soldan mı sağdan mı geçeyim" kararı
+istatistiksel olarak **gürültüdür**. Ertelenen 13 (pusula) ve 14 (derinlik) maddelerini
+çözerken izlemeniz gereken sayı budur — hedef, ortalama saçılmayı açıklığın altına indirmek.
+
+> Sahada bu satırları her görevden sonra not edin. Saçılma 1,20 m'nin altına indiğinde
+> engelden kaçınma davranışı tekrarlanabilir hale gelir.
