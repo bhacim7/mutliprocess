@@ -40,6 +40,15 @@ AE_SETTLE_S = 2.0            # how long to let auto exposure/WB settle before lo
 FALLBACK_EXPOSURE = 100      # used only if the driver will not report its own value
 FALLBACK_WB_TEMPERATURE = 5500
 
+# Locking once at startup is right for a flight, but wrong if the program is started in
+# different light from where it ends up - booting indoors and then carrying the drone out
+# into the sun leaves the frame blown out, which desaturates every colour and makes
+# everything read BELIRSIZ. Re-settle if the scene stays out of a sane band.
+EXPOSURE_RELOCK = True
+RELOCK_V_HIGH = 235          # blown out
+RELOCK_V_LOW = 20            # crushed
+RELOCK_AFTER_S = 4.0
+
 # --- Detection geometry ---
 ROI_RATIO = 0.7              # centre crop used for detection
 
@@ -49,9 +58,21 @@ ROI_RATIO = 0.7              # centre crop used for detection
 # 4K). An absolute floor is what actually turns resolution into detection range.
 # 20x20 px = 400 px. At 1280x720 that corresponds to roughly 22 m altitude.
 MIN_BLOB_AREA_PX = 400
-# Anything larger than this fraction of the ROI cannot be a 50 cm plaque at flight altitude
-# (it is a building shadow, the horizon, or a large stain).
-MAX_BLOB_AREA_FRAC = 0.25
+
+# Upper area limit, BLACK MASK ONLY. Its only job is to reject a large shadow; a big red or
+# green region simply IS the target and must never be capped.
+#
+# This was originally applied to all three colours at 0.25, which silently broke bench
+# testing: at 1280x720 the ROI is 896x504, so 25% is a 336x336 px blob. A 1x1 m plaque
+# exceeds that from closer than 2.70 m (a 0.5 m plaque from 1.35 m). Holding the drone over
+# a plaque by hand is well inside that, so the plaque was rejected as "too big" and the
+# result was BELIRSIZ - while a phone screen at arm's length stayed small enough to pass.
+BLACK_MAX_AREA_FRAC = 0.60
+
+# Bench/hand-held testing. The flight-altitude gates (upper area limit, border rejection)
+# assume the plaque is a small object in a large frame. Up close it fills the frame and
+# touches the edges, so those gates fight you. Set True while testing by hand, False to fly.
+CLOSE_RANGE_TEST = False
 
 # --- Black plaque shape gate (see detect_color) ---
 # Concrete makes red/green trivial to separate by saturation, but it makes BLACK hard:
@@ -183,9 +204,15 @@ def clean(mask):
     return mask
 
 
-def _best_blob(mask, max_area, shape_gated=False):
+def _best_blob(mask, max_area=None, shape_gated=False):
     """
-    Largest acceptable contour in `mask`. Returns (area, extent).
+    Largest acceptable contour in `mask`. Returns (area, extent, reason).
+
+    `reason` describes why the LARGEST contour was thrown away, so a BELIRSIZ result can
+    say what actually happened instead of leaving you guessing. It is None on success.
+
+    max_area=None means no upper limit - that is the correct setting for red and green,
+    where a large blob simply is a large target.
 
     shape_gated=True applies the two cheap checks that separate a 50x50 cm plaque from a
     shadow. They are applied to the BLACK mask only - red and green already separate from
@@ -202,9 +229,21 @@ def _best_blob(mask, max_area, shape_gated=False):
 
     best_area = 0.0
     best_extent = 0.0
+    largest = 0.0
+    reason = None
+
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < MIN_BLOB_AREA_PX or area > max_area:
+        if area > largest:
+            largest = area
+
+        if area < MIN_BLOB_AREA_PX:
+            if area >= largest:
+                reason = f"kucuk ({area:.0f}<{MIN_BLOB_AREA_PX})"
+            continue
+        if max_area is not None and area > max_area:
+            if area >= largest:
+                reason = f"buyuk ({area:.0f}>{max_area:.0f})"
             continue
 
         x, y, bw, bh = cv2.boundingRect(c)
@@ -212,19 +251,33 @@ def _best_blob(mask, max_area, shape_gated=False):
 
         if shape_gated:
             if extent < BLACK_MIN_EXTENT:
+                if area >= largest:
+                    reason = f"extent {extent:.2f}<{BLACK_MIN_EXTENT}"
                 continue
-            if BLACK_REJECT_BORDER and (x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1):
+            if (BLACK_REJECT_BORDER and not CLOSE_RANGE_TEST
+                    and (x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1)):
+                if area >= largest:
+                    reason = "kenara degiyor"
                 continue
 
         if area > best_area:
             best_area = area
             best_extent = extent
 
-    return best_area, best_extent
+    if best_area > 0:
+        reason = None
+    elif reason is None and largest == 0.0:
+        reason = "maske bos"
+    return best_area, best_extent, reason
 
 
 def detect_color(roi):
-    """Detects the most dominant color (Black, Red, Green or Undefined) in the ROI."""
+    """
+    Detects the most dominant color (Black, Red, Green or Undefined) in the ROI.
+
+    Returns (label, confidence, area_px, black_extent, diag) where diag maps each colour to
+    its rejection reason (or None).
+    """
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
@@ -236,19 +289,23 @@ def detect_color(roi):
     mask_black = clean(mask_black)
 
     roi_area = roi.shape[0] * roi.shape[1]
-    max_area = roi_area * MAX_BLOB_AREA_FRAC
+    # No upper bound on the chromatic plaques; the black mask keeps one so a large shadow
+    # cannot win, unless we are bench testing up close.
+    black_max = None if CLOSE_RANGE_TEST else roi_area * BLACK_MAX_AREA_FRAC
 
-    red_area, _ = _best_blob(mask_red, max_area)
-    green_area, _ = _best_blob(mask_green, max_area)
-    black_area, black_extent = _best_blob(mask_black, max_area, shape_gated=True)
+    red_area, _, red_why = _best_blob(mask_red)
+    green_area, _, green_why = _best_blob(mask_green)
+    black_area, black_extent, black_why = _best_blob(mask_black, black_max, shape_gated=True)
+
+    diag = {"KIRMIZI": red_why, "YESIL": green_why, "SIYAH": black_why}
 
     areas = {"KIRMIZI": red_area, "YESIL": green_area, "SIYAH": black_area}
     max_area_label = max(areas, key=areas.get)
     max_area_value = areas[max_area_label]
 
     if max_area_value > 0:
-        return max_area_label, max_area_value / roi_area, max_area_value, black_extent
-    return "BELIRSIZ", 0.0, 0.0, 0.0
+        return max_area_label, max_area_value / roi_area, max_area_value, black_extent, diag
+    return "BELIRSIZ", 0.0, 0.0, 0.0, diag
 
 
 # --- Logging ---
@@ -376,9 +433,11 @@ last_black_extent = 0.0
 last_area_px = 0.0
 
 scene_stats = (0, 0, 0)
+diag = {}
 last_scene_t = 0.0
 last_display_t = 0.0
 cam_fail_count = 0
+bad_exposure_since = 0.0
 
 
 def clear_screen():
@@ -448,7 +507,7 @@ try:
         y1 = int((1 + ROI_RATIO) / 2 * h)
         roi = frame[y0:y1, x0:x1]
 
-        current_color, current_conf, current_area, current_extent = detect_color(roi)
+        current_color, current_conf, current_area, current_extent, diag = detect_color(roi)
 
         # Background survey: median H/S/V of the ROI. With no plaques available to
         # calibrate against, knowing exactly what the concrete and its shadows read is the
@@ -459,6 +518,28 @@ try:
             last_scene_t = now
             hsv_small = cv2.cvtColor(cv2.resize(roi, (160, 120)), cv2.COLOR_BGR2HSV)
             scene_stats = tuple(int(v) for v in np.median(hsv_small.reshape(-1, 3), axis=0))
+
+            # Exposure is locked once at startup, which is right for a flight but wrong if
+            # the program was started in different light from where it ends up (e.g. booted
+            # indoors, then carried out into the sun). A blown-out frame desaturates every
+            # colour and a crushed one hides them all, so re-settle when the scene leaves a
+            # sane brightness band for long enough.
+            if EXPOSURE_RELOCK and cap is not None:
+                v_med = scene_stats[2]
+                if v_med > RELOCK_V_HIGH or v_med < RELOCK_V_LOW:
+                    if bad_exposure_since == 0.0:
+                        bad_exposure_since = now
+                    elif now - bad_exposure_since >= RELOCK_AFTER_S:
+                        print(f"\n[CAM] Scene median V={v_med} out of range - re-locking exposure...")
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = open_camera()
+                        bad_exposure_since = 0.0
+                        continue
+                else:
+                    bad_exposure_since = 0.0
 
         colour_changed = current_color != last_detected_color
         last_detected_color = current_color
@@ -487,8 +568,14 @@ try:
             print(f"Confidence: {last_detected_conf:.3f}   Area: {last_area_px:.0f} px")
             if last_detected_color == "SIYAH":
                 print(f"Black extent: {last_black_extent:.2f} (min {BLACK_MIN_EXTENT})")
+            # Say WHY nothing matched. A bare BELIRSIZ hides whether the colour was absent,
+            # too small, too large, or thrown out by a shape gate.
+            if last_detected_color == "BELIRSIZ":
+                for _c in ("KIRMIZI", "YESIL", "SIYAH"):
+                    print(f"   {_c:<8} red: {diag.get(_c) or '-'}")
             print(f"Scene median HSV: {scene_stats}")
-            print(f"Frame: {w}x{h}  ROI: {x1-x0}x{y1-y0}")
+            print(f"Frame: {w}x{h}  ROI: {x1-x0}x{y1-y0}"
+                  f"{'  [YAKIN TEST MODU]' if CLOSE_RANGE_TEST else ''}")
             print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
             print(f"Pulse Width (µs): {pulse_width_us:.2f}")
             print(f"RC Signal: {'OK' if rc_link_ok else 'NO SIGNAL'}")
