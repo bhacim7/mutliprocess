@@ -16,40 +16,39 @@ ROBOT_RADIUS_M = 0.4
 # 6 px (0.60 m) inside nav_process; it is now a real, tunable quantity so that ALL the
 # safety margin lives in INFLATION_MARGIN_M where the geometry is applied correctly.
 BUOY_RADIUS_M = 0.25
-# Total clearance A* keeps from a buoy centre = BUOY_RADIUS_M + ROBOT_RADIUS_M + INFLATION_MARGIN_M
-#   0.25 + 0.40 + 0.55 = 1.20 m   (was 0.60 + 0.50 = 1.10 m, but mis-decomposed)
+# Total clearance A* keeps from a buoy CENTRE = BUOY_RADIUS_M + ROBOT_RADIUS_M + this.
 #
-# TUNING RULE - measure the real gate width before raising this:
-#   free_gap = corridor_width - 2 * (BUOY_RADIUS_M + ROBOT_RADIUS_M + INFLATION_MARGIN_M)
-#   free_gap must stay >= 1.0 m or A* will find NO path and fall back to the
-#   obstacle-blind PID, which is worse than the current behaviour.
-#     corridor 3.0 m -> INFLATION_MARGIN_M <= 0.35
-#     corridor 4.0 m -> INFLATION_MARGIN_M <= 0.85
-#     corridor 5.0 m -> INFLATION_MARGIN_M <= 1.35
-# 0.55 -> 0.25 -> 0.45.
-#
-# 0.25 was set from the per-track scatter (0.11 m), which was the WRONG statistic: that
-# figure is precision within one track, not how well the buoy's position is actually known.
-# Clustering the tracks gave the real number - between-track spread, mean 0.50 m - and with
-# it the boat hit two yellow buoys it had detected correctly at 2.0 m.
+# History, because the value was got wrong twice in both directions:
+#   0.55 -> too wide. A 1.5 m gap between buoy surfaces came out negative, so tight
+#           passages were invisible and going around the outside of the course was the
+#           only route A* could see.
+#   0.25 -> too narrow. Set from the per-track scatter (0.11 m), which is the WRONG
+#           statistic - that is precision within one track, not how well a buoy's
+#           position is known. The boat then hit two yellow buoys it had detected
+#           correctly at 2.0 m.
+#   0.45 -> grazed in the water.
+#   0.50 -> current. Completed Task 2 without contact and without leaving the course.
 #
 # The geometry is exact:
 #
 #     hull-to-buoy gap = INFLATION_MARGIN_M - position_error
 #
-# because A* keeps the boat CENTRE at BUOY + ROBOT + INFLATION from the MAPPED position,
-# and the true buoy may be `position_error` closer than that. At 0.25 with 0.50 m of error
-# the gap is -0.25 m, i.e. contact, which is exactly what happened.
+# because A* keeps the boat CENTRE at BUOY + ROBOT + INFLATION from the MAPPED position
+# while the true buoy may be `position_error` closer. Measured position error (between-track
+# spread, i.e. how far the ~10 tracks of one physical buoy disagree) is 0.50 m mean,
+# 0.85 m max.
 #
 #     INFL   gap at 0.50 m error   narrowest passable surface gap
 #     0.25          -0.25 m                 1.30 m
 #     0.45          -0.05 m                 1.70 m
+#     0.50           0.00 m                 1.80 m
 #     0.55          +0.05 m                 1.90 m
 #
-# There is no value that both avoids contact and threads the 1.5 m gaps on this course -
-# that needs the position error itself to come down. 0.45 is the compromise: grazing rather
-# than hitting, and passages from 1.7 m up stay open.
-INFLATION_MARGIN_M = 0.45
+# No value satisfies both constraints on this course: avoiding contact wants INFL > 0.50,
+# threading its 1.5 m gaps wants INFL <= 0.35. Closing that gap means reducing the position
+# error itself - 0.50 m is about 2.9 deg of heading error at 10 m. Until then the corridor
+# cap is what stops a blocked 1.5 m gap being answered by leaving the course.
+INFLATION_MARGIN_M = 0.5
 MAX_TILT_ANGLE = 5.0
 
 # --- PINS / CHANNELS ---
@@ -200,7 +199,7 @@ TASK2_APPROACH_REACHED_M = 3.0  # approach point counts as reached inside this r
 # Only route via the approach point when we are this far off the corridor axis.
 # Lined up in front of the mouth, a straight run at the entry is already aligned,
 # and keying on lateral offset keeps the switch one-way instead of oscillating.
-TASK2_APPROACH_LATERAL_M = 3.0
+TASK2_APPROACH_LATERAL_M = 8.0
 
 # Planning is decoupled from control: Pure Pursuit runs every nav cycle on the last good
 # path, A* only every A_STAR_PLAN_DIVISOR cycles (25 Hz / 5 = 5 Hz) but with double the
