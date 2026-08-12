@@ -88,6 +88,12 @@ LOG_CSV = "color_log.csv"
 CAPTURE_DIR = "captures"
 MAX_CAPTURES = 300           # disk guard
 SCENE_STATS_INTERVAL_S = 2.0 # background survey cadence
+# Frames were only saved on a colour CHANGE, so a run that is stuck on BELIRSIZ produced
+# no evidence at all - exactly the case you most need to look at afterwards.
+FAIL_CAPTURE_INTERVAL_S = 5.0
+# Pixels above this saturation are treated as "actually coloured" for the readout below.
+# Concrete sits at S 20-60.
+CHROMA_MIN_S = 90
 
 # --- Terminal ---
 DISPLAY_INTERVAL_S = 0.2     # the old code redrew the whole screen at ~100 Hz
@@ -174,13 +180,21 @@ if cap is None:
 USE_OUTDOOR = True
 
 if USE_OUTDOOR:
-    # RED - RAL 3026. Lands around H 0-5, S 220-255. The 170-179 band catches the hue wrap.
-    lower_red1, upper_red1 = (0, 150, 60), (10, 255, 255)
-    lower_red2, upper_red2 = (170, 150, 60), (179, 255, 255)
+    # RED - RAL 3026 is a luminous, slightly orange red; the swatch computes to H 0-5.
+    # The window is 0-15 / 165-179 rather than 0-10 / 170-179 because everything between
+    # 11 and 164 is a dead zone: a white-balance shift of a few degrees pushes the plaque
+    # into that gap and it matches NO mask at all. Concrete sits at S 20-60, so widening
+    # the hue costs nothing here - the saturation floor is what does the rejecting.
+    lower_red1, upper_red1 = (0, 110, 60), (15, 255, 255)
+    lower_red2, upper_red2 = (165, 110, 60), (179, 255, 255)
 
     # GREEN - RAL 6037 computes to H ~70-78.5. The old 40-85 window left only 6.5 deg of
     # headroom above the target while wasting 30 deg below it; 55-95 centres it properly.
-    lower_green, upper_green = (55, 150, 60), (95, 255, 255)
+    lower_green, upper_green = (55, 110, 60), (95, 255, 255)
+
+    # Saturation floor was 150. Concrete is achromatic (S 20-60) so 110 still separates it
+    # by a wide margin, while leaving room for a plaque that is partially washed out by
+    # direct sun or a slightly wrong white balance.
 
     # BLACK - RAL 9005. The old V ceiling of 45 was almost certainly rejecting the plaque
     # outright: with exposure set for sunlit concrete the plaque is expected around V 54-76.
@@ -433,9 +447,11 @@ last_black_extent = 0.0
 last_area_px = 0.0
 
 scene_stats = (0, 0, 0)
+chroma_stats = None
 diag = {}
 last_scene_t = 0.0
 last_display_t = 0.0
+last_fail_capture = 0.0
 cam_fail_count = 0
 bad_exposure_since = 0.0
 
@@ -517,7 +533,20 @@ try:
         if now - last_scene_t >= SCENE_STATS_INTERVAL_S:
             last_scene_t = now
             hsv_small = cv2.cvtColor(cv2.resize(roi, (160, 120)), cv2.COLOR_BGR2HSV)
-            scene_stats = tuple(int(v) for v in np.median(hsv_small.reshape(-1, 3), axis=0))
+            flat = hsv_small.reshape(-1, 3)
+            scene_stats = tuple(int(v) for v in np.median(flat, axis=0))
+
+            # Dominant chroma: the median HSV of everything that is meaningfully coloured.
+            # Concrete is achromatic, so whatever survives this filter IS the plaque - and
+            # its H/S/V is the number the thresholds have to accept. This is what turns a
+            # "still says BELIRSIZ" report into an actual measurement.
+            chroma = flat[flat[:, 1] > CHROMA_MIN_S]
+            if chroma.shape[0] >= 20:
+                m = np.median(chroma, axis=0).astype(int)
+                chroma_stats = (int(m[0]), int(m[1]), int(m[2]),
+                                round(100.0 * chroma.shape[0] / flat.shape[0], 1))
+            else:
+                chroma_stats = None
 
             # Exposure is locked once at startup, which is right for a flight but wrong if
             # the program was started in different light from where it ends up (e.g. booted
@@ -553,6 +582,12 @@ try:
             log_row(current_status, current_color, current_conf, current_area,
                     current_extent, scene_stats)
             save_capture(frame, current_color)
+        elif current_color == "BELIRSIZ" and (now - last_fail_capture) >= FAIL_CAPTURE_INTERVAL_S:
+            # Keep evidence from a run that never detects anything.
+            last_fail_capture = now
+            log_row(current_status, current_color, current_conf, current_area,
+                    current_extent, scene_stats)
+            save_capture(frame, "BELIRSIZ")
 
         if current_status == "AKTİF":
             send_serial_message(last_detected_color)
@@ -573,6 +608,15 @@ try:
             if last_detected_color == "BELIRSIZ":
                 for _c in ("KIRMIZI", "YESIL", "SIYAH"):
                     print(f"   {_c:<8} red: {diag.get(_c) or '-'}")
+            if chroma_stats:
+                print(f"RENKLI BOLGE  HSV: H={chroma_stats[0]:3d} S={chroma_stats[1]:3d} "
+                      f"V={chroma_stats[2]:3d}  (ROI'nin %{chroma_stats[3]}'i)")
+                print(f"   kirmizi ister H 0-{upper_red1[0]} veya {lower_red2[0]}-179, "
+                      f"S>={lower_red1[1]}, V>={lower_red1[2]}")
+                print(f"   yesil   ister H {lower_green[0]}-{upper_green[0]}, "
+                      f"S>={lower_green[1]}, V>={lower_green[2]}")
+            else:
+                print(f"RENKLI BOLGE  yok (S>{CHROMA_MIN_S} olan piksel < %0.1)")
             print(f"Scene median HSV: {scene_stats}")
             print(f"Frame: {w}x{h}  ROI: {x1-x0}x{y1-y0}"
                   f"{'  [YAKIN TEST MODU]' if CLOSE_RANGE_TEST else ''}")
