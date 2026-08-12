@@ -104,7 +104,11 @@ CLOSE_RANGE_TEST = False
 #     shaded concrete alone   P95  95 -> ceiling 38, concrete median 67  -> not black OK
 #     plaque in frame         P95 139 -> ceiling 56, plaque median  17  -> black     OK
 #     sunlit concrete         P95 209 -> ceiling 84, concrete median 111 -> not black OK
-BLACK_V_FRACTION = 0.40
+# 0.40 was measured against a matte plaque. The glossy test plaque reflects the sky, so a
+# large part of it is far brighter than its paint would suggest and 0.40 clipped most of it
+# away. 0.55 recovers it; the parameter sweep over the labelled footage put the best black
+# score here too.
+BLACK_V_FRACTION = 0.55
 BLACK_V_MIN = 25             # never go below this, or nothing is ever dark enough
 BLACK_V_MAX = 110            # never go above this, whatever the frame looks like
 
@@ -128,8 +132,28 @@ MIN_CHROMA_DELTA = 45
 # a shadow on concrete and the RAL 9005 plaque land at almost the same brightness, because
 # concrete/plaque albedo (~0.30 / ~0.045) differ by about the same factor as sun/shade.
 # No brightness threshold can split them, so the black mask gets two cheap shape checks.
-BLACK_MIN_EXTENT = 0.75      # contour area / bounding-box area. Square ~0.95, drone shadow ~0.3
-BLACK_REJECT_BORDER = True   # drop blobs touching the frame edge (large ground shadows)
+# contour area / bounding-box area.
+#
+# 0.75 came from a synthetic clean square and it rejected EVERY real detection: measured
+# 0/24 on the labelled black-plaque frames of renk_20260811_201821. Two reasons, both
+# geometric rather than colour related:
+#
+#   * boundingRect is AXIS ALIGNED. A perfect square rotated 20-40 deg scores 0.50-0.60,
+#     which is exactly the 0.53-0.62 band measured in the footage. The gate was mostly
+#     measuring how the plaque happened to be turned.
+#   * the test plaque is GLOSSY. It reflects the sky, so the bright part of it fails the
+#     brightness test and the surviving mask is a crescent, not a square.
+#
+# 0.30 still throws out the drone's own shadow (~0.11-0.30 measured on the arms+props
+# shape) while keeping the plaque: 21/24 on the same frames.
+BLACK_MIN_EXTENT = 0.30
+# Border rejection, but only for blobs BIG enough to be a ground shadow rather than a
+# plaque. Rejecting everything that touched the edge was throwing the plaque away whenever
+# it sat near the side of the window; rejecting nothing let a building shadow walk in from
+# the edge. At altitude the plaque is a small object (a 50 cm plaque is ~0.45% of the ROI at
+# 10 m), while a shadow entering the frame is an order of magnitude larger.
+BLACK_REJECT_BORDER = True
+BLACK_BORDER_MAX_FRAC = 0.05
 
 # --- Video recording ---
 # Same on/off idea as the boat's cfg.RECORD_VIDEO. The recorded frame carries the overlay
@@ -402,9 +426,10 @@ def _best_blob(mask, max_area=None, shape_gated=False):
                     reason = f"extent {extent:.2f}<{BLACK_MIN_EXTENT}"
                 continue
             if (BLACK_REJECT_BORDER and not CLOSE_RANGE_TEST
+                    and area > (w * h) * BLACK_BORDER_MAX_FRAC
                     and (x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1)):
                 if area >= largest:
-                    reason = "kenara degiyor"
+                    reason = "kenara degiyor (buyuk)"
                 continue
 
         if area > best_area:
