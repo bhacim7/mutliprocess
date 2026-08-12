@@ -159,6 +159,61 @@ class CostmapRecorder:
 
     # ------------------------------------------------------------------- render
 
+    def _clustered_objects(self, merge_m=None):
+        """
+        Merge tracks that are really the same physical buoy.
+
+        ObjectMemoryManager drops a track after 5 s without a sighting, so a buoy that goes
+        in and out of view collects a new id every time. The 2026-08-12 run recorded 292
+        object ids for a course with roughly 25-30 buoys - about a dozen tracks each - and
+        the map showed every one of them.
+
+        This also fixes what the scatter figure means. Per-track scatter (0.11 m on that
+        run) is PRECISION: how steady one track's own readings were. The spread BETWEEN the
+        tracks of one buoy is ACCURACY, and that is the number that decides whether a 1.5 m
+        gap can be threaded. Clustering exposes it.
+
+        Returns (clusters, stats) where each cluster is
+        {'x','y','cid','n_tracks','spread'} and spread is the RMS distance of its member
+        tracks from the cluster centre.
+        """
+        if merge_m is None:
+            merge_m = getattr(cfg, 'COSTMAP_REC_MERGE_M', 1.5)
+
+        by_cid = {}
+        for o in self.objects.values():
+            by_cid.setdefault(o['cid'], []).append(o)
+
+        clusters = []
+        for cid, objs in by_cid.items():
+            remaining = list(objs)
+            while remaining:
+                seed = remaining.pop()
+                members = [seed]
+                changed = True
+                while changed:
+                    changed = False
+                    cx = sum(m['x'] for m in members) / len(members)
+                    cy = sum(m['y'] for m in members) / len(members)
+                    keep = []
+                    for r in remaining:
+                        if math.hypot(r['x'] - cx, r['y'] - cy) <= merge_m:
+                            members.append(r)
+                            changed = True
+                        else:
+                            keep.append(r)
+                    remaining = keep
+                cx = sum(m['x'] for m in members) / len(members)
+                cy = sum(m['y'] for m in members) / len(members)
+                if len(members) > 1:
+                    spread = math.sqrt(sum((m['x'] - cx) ** 2 + (m['y'] - cy) ** 2
+                                           for m in members) / len(members))
+                else:
+                    spread = 0.0
+                clusters.append({'x': cx, 'y': cy, 'cid': cid,
+                                 'n_tracks': len(members), 'spread': spread})
+        return clusters
+
     def _bounds(self, margin_m=5.0):
         xs = [p[0] for p in self.track] + [o['x'] for o in self.objects.values()] \
              + [p[0] for p in self.observations]
@@ -246,20 +301,21 @@ class CostmapRecorder:
             cv2.circle(img, to_px(*self.track[0]), 4, (0, 255, 0), 1, cv2.LINE_AA)   # start
             cv2.circle(img, to_px(*self.track[-1]), 4, (0, 0, 255), 1, cv2.LINE_AA)  # end
 
-        # 3. One bright dot per buoy at its final position, plus its RMS scatter ring.
+        # 3. One bright dot per PHYSICAL buoy (tracks clustered), with a ring showing how
+        #    far its individual tracks disagreed - that spread is the position accuracy.
         buoy_px = max(1, int(round(getattr(cfg, 'BUOY_RADIUS_M', 0.25) / res)))
         scatter = self._scatter_radii()
-        for key, o in self.objects.items():
-            colour = CID_BGR.get(o['cid'], UNKNOWN_BGR)
-            centre = to_px(o['x'], o['y'])
-            rms = scatter.get(key)
-            if rms and rms > res:
-                cv2.circle(img, centre, int(rms / res),
-                           tuple(c // 3 for c in colour), 1, cv2.LINE_AA)
+        clusters = self._clustered_objects()
+        for c in clusters:
+            colour = CID_BGR.get(c['cid'], UNKNOWN_BGR)
+            centre = to_px(c['x'], c['y'])
+            if c['spread'] > res:
+                cv2.circle(img, centre, int(c['spread'] / res),
+                           tuple(v // 3 for v in colour), 1, cv2.LINE_AA)
             cv2.circle(img, centre, buoy_px, colour, -1)
 
         self._draw_scale_bar(img, res)
-        return img, res, scatter
+        return img, res, scatter, clusters
 
     def save(self):
         # atexit and the signal handler can both fire; only write once.
@@ -272,7 +328,7 @@ class CostmapRecorder:
                 self._saved = True
                 return
 
-            img, res, scatter = rendered
+            img, res, scatter, clusters = rendered
             cv2.imwrite(self.output_path, img)
             self._saved = True
 
@@ -280,7 +336,21 @@ class CostmapRecorder:
             print(f"[COSTMAP] Saved {self.output_path}  {w}x{h} px @ {res:.2f} m/px  "
                   f"({w * res:.0f} x {h * res:.0f} m)")
             print(f"[COSTMAP]   track points: {len(self.track)}   "
-                  f"objects: {len(self.objects)}   raw sightings: {len(self.observations)}")
+                  f"tracks: {len(self.objects)}   buoys (clustered): {len(clusters)}   "
+                  f"raw sightings: {len(self.observations)}")
+
+            # Between-track spread per physical buoy. This is the ACCURACY figure - the one
+            # that decides whether a narrow gap can be threaded. The per-track scatter below
+            # is only precision and will always look better than this.
+            multi = [c for c in clusters if c['n_tracks'] > 1]
+            if multi:
+                by_name = {}
+                for c in multi:
+                    by_name.setdefault(CID_NAME.get(c['cid'], "unknown"), []).append(c['spread'])
+                print("[COSTMAP]   between-track spread per buoy (ACCURACY):")
+                for name, vals in sorted(by_name.items()):
+                    print(f"[COSTMAP]     {name:<7} n={len(vals):<3} "
+                          f"mean {sum(vals)/len(vals):.2f} m  max {max(vals):.2f} m")
 
             # Per-colour position scatter. This is the diagnostic number: while it stays
             # above the A* clearance (BUOY_RADIUS_M + ROBOT_RADIUS_M + INFLATION_MARGIN_M)

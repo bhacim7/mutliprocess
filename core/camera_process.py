@@ -175,6 +175,10 @@ class ObjectMemoryManager:
             best_match['lat'] = best_match['lat'] * 0.8 + lat * 0.2
             best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
             best_match['last_seen'] = current_time
+            # Sighting count. nav_process only lets a buoy constrain the Task 2 corridor
+            # once it has been seen a few times - a spurious boundary buoy narrows the
+            # corridor, and one that is too narrow is as unhelpful as none at all.
+            best_match['seen'] = best_match.get('seen', 1) + 1
 
             # Colour vote: the winning class id decides both 'cid' and 'color'.
             if cid is not None:
@@ -201,6 +205,7 @@ class ObjectMemoryManager:
                 'type': obj_type,
                 'color': color,
                 'last_seen': current_time,
+                'seen': 1,
                 'v_lat': 0.0,
                 'v_lon': 0.0,
                 'cid': cid,
@@ -562,6 +567,9 @@ def camera_worker(shared_state, hf_data):
                         # seen. Consumers that steer on 'cx' (Task 3 visual servoing) must be
                         # able to tell a fresh detection from a 5-second-old one.
                         "last_seen": obj.get('last_seen', 0.0),
+                        # Used by the Task 2 corridor cap to tell a confirmed boundary buoy
+                        # from a one-frame false positive.
+                        "seen": obj.get('seen', 1),
                     })
 
                 shared_state['vision_detected_objects'] = memory_objects

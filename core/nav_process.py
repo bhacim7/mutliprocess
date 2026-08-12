@@ -124,6 +124,71 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm, slew=True):
     controller.set_servo(CH_STEER, steer_out, force=force)
 
 
+def _latlon_to_local(origin_lat, origin_lon, lat, lon):
+    """(North, East) metres from the local frame origin - the same frame robot_x/robot_y use."""
+    d = nav.haversine(origin_lat, origin_lon, lat, lon)
+    b = math.radians(nav.calculate_bearing(origin_lat, origin_lon, lat, lon))
+    return d * math.cos(b), d * math.sin(b)
+
+
+def _task2_axis_local(origin_lat, origin_lon):
+    """
+    Task 2 reference axis in local coordinates: first waypoint -> last waypoint.
+
+    This is the only geometry the rules guarantee - a straight line between those two points
+    stays inside the course - and unlike a boat->goal axis it does not rotate with the
+    approach, so "left" and "right" stay meaningful when entering diagonally.
+    Returns (p0, p1) as numpy arrays, or None if the points are unset or degenerate.
+    """
+    e_lat = getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0.0)
+    e_lon = getattr(cfg, 'T2_ZONE_ENTRY_LON', 0.0)
+    x_lat = getattr(cfg, 'T2_ZONE_END_LAT', 0.0)
+    x_lon = getattr(cfg, 'T2_ZONE_END_LON', 0.0)
+    if not (e_lat and e_lon and x_lat and x_lon):
+        return None
+    if nav.haversine(e_lat, e_lon, x_lat, x_lon) < 5.0:
+        return None
+    p0 = np.array(_latlon_to_local(origin_lat, origin_lon, e_lat, e_lon), dtype=float)
+    p1 = np.array(_latlon_to_local(origin_lat, origin_lon, x_lat, x_lon), dtype=float)
+    return p0, p1
+
+
+def _confirmed_boundary_local(vision_objects, boat_lat, boat_lon, robot_x, robot_y):
+    """
+    Local (x, y) of the boundary buoys that are trustworthy enough to constrain on.
+
+    Confirmation matters here in a way it does not for plain obstacle avoidance: a spurious
+    orange narrows the corridor, and a corridor that is too narrow is as bad as none at all.
+    A buoy counts once it has been seen CORRIDOR_CONFIRM_SIGHTINGS times and was seen in the
+    last CORRIDOR_CONFIRM_MAX_AGE_S seconds.
+    """
+    if not vision_objects or not boat_lat:
+        return []
+
+    min_seen = int(getattr(cfg, 'CORRIDOR_CONFIRM_SIGHTINGS', 3))
+    max_age = float(getattr(cfg, 'CORRIDOR_CONFIRM_MAX_AGE_S', 1.5))
+    now = time.time()
+
+    out = []
+    for obj in vision_objects:
+        if obj.get('cid') != 3:          # orange = boundary
+            continue
+        if int(obj.get('seen', 0)) < min_seen:
+            continue
+        last_seen = obj.get('last_seen')
+        if last_seen is None or (now - last_seen) > max_age:
+            continue
+        o_lat, o_lon = obj.get('lat'), obj.get('lon')
+        if not o_lat or not o_lon:
+            continue
+        dist = nav.haversine(boat_lat, boat_lon, o_lat, o_lon)
+        if not (0.0 < dist < 20.0):
+            continue
+        brg = math.radians(nav.calculate_bearing(boat_lat, boat_lon, o_lat, o_lon))
+        out.append((robot_x + dist * math.cos(brg), robot_y + dist * math.sin(brg)))
+    return out
+
+
 def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     """
     Independent process handling the autonomous state machine,
@@ -557,8 +622,30 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                     if task_state in targets:
                         t_lat, t_lon, next_state = targets[task_state]
-                        if nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
-                            task_state = next_state
+                        dist_to_target = nav.haversine(lat, lon, t_lat, t_lon)
+                        if dist_to_target < 3.0:
+                            return next_state, t_lat, t_lon
+
+                        # Entrance approach. Arriving at the mouth very obliquely, the
+                        # straight line to the entry waypoint can pass between the first and
+                        # second buoy of a boundary chain instead of through the mouth - the
+                        # chain spacing leaves a gap wide enough for A* to slip through.
+                        # Aiming at a point set back along the corridor axis first forces the
+                        # final leg to be aligned with the corridor, from either diagonal.
+                        if task_state == "TASK2_START":
+                            engage = getattr(cfg, 'TASK2_APPROACH_ENGAGE_M', 8.0)
+                            offset = getattr(cfg, 'TASK2_APPROACH_OFFSET_M', 12.0)
+                            end_lat = getattr(cfg, 'T2_ZONE_END_LAT', 0)
+                            end_lon = getattr(cfg, 'T2_ZONE_END_LON', 0)
+                            if dist_to_target > engage and end_lat and end_lon:
+                                axis_len = nav.haversine(t_lat, t_lon, end_lat, end_lon)
+                                if axis_len > 5.0:
+                                    back_bearing = nav.calculate_bearing(end_lat, end_lon,
+                                                                         t_lat, t_lon)
+                                    a_lat, a_lon = calculate_obj_gps(t_lat, t_lon,
+                                                                     offset, back_bearing)
+                                    return task_state, a_lat, a_lon
+
                         return task_state, t_lat, t_lon
 
                     return task_state, None, None
@@ -870,8 +957,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     # (cfg.A_STAR_CROP_RADIUS_M is the SAME constant used below to build that window -
                     # keeping these tied together is what prevents the out-of-bounds-goal freeze from
                     # silently coming back if the crop radius is ever retuned).
-                    _a_star_crop_radius_m = getattr(cfg, 'A_STAR_CROP_RADIUS_M', 20.0)
-                    projection_dist = min(hedefe_mesafe, _a_star_crop_radius_m * 0.75)
+                    # Kept shorter than the 15 m at which obstacles stop being drawn, so the
+                    # goal always sits inside well-observed space rather than on the ragged
+                    # outer edge of the costmap.
+                    projection_dist = min(hedefe_mesafe,
+                                          getattr(cfg, 'A_STAR_GOAL_PROJECTION_M', 10.0))
 
                     # The local costmap is built using raw compass bearings mapped directly into math.cos/sin.
                     # We must plot the target exactly the same way we plot the vision obstacles.
@@ -994,6 +1084,25 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 nav_map, _ = planner.get_inflated_nav_map(cropped_costmap)
 
+                                # --- Task 2 corridor cap (soft) ---
+                                # Orange boundary buoys are otherwise indistinguishable from
+                                # yellow obstacles, so routing around the OUTSIDE of the
+                                # course is both legal and shorter whenever a waypoint sits
+                                # near the boundary. That is what took the boat out of the
+                                # course on the 2026-08-12 run.
+                                corridor_cost = None
+                                if (getattr(cfg, 'ENABLE_TASK2_CORRIDOR', True)
+                                        and "TASK2" in mevcut_gorev and origin_lat is not None):
+                                    axis = _task2_axis_local(origin_lat, origin_lon)
+                                    if axis is not None:
+                                        boundary = _confirmed_boundary_local(
+                                            vision_objects, ida_enlem, ida_boylam,
+                                            robot_x, robot_y)
+                                        corridor_cost = planner.build_corridor_cost(
+                                            nav_map.shape, cropped_center_m,
+                                            COSTMAP_RES_M_PER_PX, axis[0], axis[1],
+                                            boundary, (robot_x, robot_y))
+
                                 # --- Planning is decoupled from control ---
                                 # A* runs every A_STAR_PLAN_DIVISOR cycles (5 Hz at 25 Hz
                                 # loop) with A_STAR_TIME_BUDGET_S; Pure Pursuit below runs
@@ -1003,16 +1112,35 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 if (plan_timer >= plan_divisor or not current_path) and tx_world is not None:
                                     plan_timer = 0
                                     new_path = None
+                                    _los_cost = getattr(cfg, 'CORRIDOR_LOS_BLOCK_COST', 3.0)
                                     if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map,
                                                                    cropped_center_m, COSTMAP_RES_M_PER_PX,
-                                                                   cropped_size_px):
+                                                                   cropped_size_px,
+                                                                   corridor_cost, _los_cost):
                                         new_path = [(robot_x, robot_y), (tx_world, ty_world)]
                                     else:
                                         new_path = planner.get_path_plan(
                                             (robot_x, robot_y), (tx_world, ty_world),
                                             nav_map, cropped_center_m,
                                             COSTMAP_RES_M_PER_PX, cropped_size_px,
-                                            heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5))
+                                            heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5),
+                                            max_expansions=40000, time_budget_s=0.15,
+                                            cost_map=corridor_cost, los_max_cost=_los_cost)
+
+                                        # Fallback ladder. Staying inside the corridor is a
+                                        # preference, not a hard requirement: if the cap
+                                        # leaves no route at all, an obstacle-avoiding path
+                                        # that steps outside beats the alternative, which is
+                                        # dropping to the obstacle-BLIND Direct-Drive PID.
+                                        if new_path is None and corridor_cost is not None:
+                                            new_path = planner.get_path_plan(
+                                                (robot_x, robot_y), (tx_world, ty_world),
+                                                nav_map, cropped_center_m,
+                                                COSTMAP_RES_M_PER_PX, cropped_size_px,
+                                                heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5))
+                                            if new_path:
+                                                print("[NAV_PROCESS] Corridor cap left no route "
+                                                      "- replanning without it.")
                                     if new_path and len(new_path) >= 2:
                                         current_path = new_path
                                         current_path_ts = time.time()

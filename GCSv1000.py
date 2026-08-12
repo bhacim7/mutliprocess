@@ -3461,10 +3461,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # 100 ms (10 Hz) asked the boat for a full telemetry packet faster than a
             # 57600 baud radio link can carry one, so the serial buffers backed up and
             # the shared command channel (emergency stop included) got slower and slower.
-            # 500 ms is still a responsive UI and leaves headroom for commands.
+            # 500 ms fixed that, but once the packet was trimmed (objects dropped, waypoints
+            # sent only on change, floats rounded) it became the only thing limiting the
+            # display: measured on the 2026-08-12 run the panel refreshed at 2.3 Hz with a
+            # single gap over 2 s in 88 s, i.e. the link was healthy and simply idle between
+            # polls. At ~332 B a packet, 5 Hz is about 29% of a 57600 baud link.
             self._polling_timer = QtCore.QTimer(self)
             self._polling_timer.timeout.connect(self._perform_polling)
-            self._polling_timer.start(500)
+            self._polling_timer.start(200)
 
             self._connected = True
             self.btn_connect.setText("BAĞLI")

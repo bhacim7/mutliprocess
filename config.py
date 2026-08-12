@@ -26,7 +26,16 @@ BUOY_RADIUS_M = 0.25
 #     corridor 3.0 m -> INFLATION_MARGIN_M <= 0.35
 #     corridor 4.0 m -> INFLATION_MARGIN_M <= 0.85
 #     corridor 5.0 m -> INFLATION_MARGIN_M <= 1.35
-INFLATION_MARGIN_M = 0.55
+# 0.55 -> 0.25. Measured on the 2026-08-12 run, the per-track position scatter is
+# mean 0.11 m (max 1.38 m), which is far tighter than the 0.55 m margin assumed. With the
+# old value the total forbidden radius was 1.20 m, so a 1.5 m gap between buoy surfaces
+# came out NEGATIVE - every tight passage was invisible to A*, and going around the outside
+# of the course was the only route it could see. That is a direct cause of the observed
+# course exit.
+#     gap between buoy surfaces 1.5 m -> free passage  -0.40 m at 0.55, +0.20 m at 0.25
+#     gap between buoy surfaces 2.0 m -> free passage  +0.10 m at 0.55, +0.70 m at 0.25
+# If the boat starts shaving buoys instead of leaving the course, raise this to 0.35.
+INFLATION_MARGIN_M = 0.25
 MAX_TILT_ANGLE = 5.0
 
 # --- PINS / CHANNELS ---
@@ -123,7 +132,57 @@ PURE_PURSUIT_KP = 2.0
 PURE_PURSUIT_KD = 0.8
 A_STAR_HEURISTIC_WEIGHT = 2.5
 COSTMAP_RES_M_PER_PX = 0.10
-A_STAR_CROP_RADIUS_M = 20.0  # Local A* window radius. Target projection below is derived from this.
+A_STAR_CROP_RADIUS_M = 20.0  # Local A* window radius.
+
+# How far ahead the GPS target is projected into the local map for A* to aim at.
+# This used to be A_STAR_CROP_RADIUS_M * 0.75 = 15 m, which is exactly the range at which
+# obstacles stop being drawn into the costmap (see nav_process). The planner was therefore
+# aiming at the outer edge of what it could see, where detections are newest, smallest in
+# the image and least reliable. Keeping the goal inside the well-observed region is the
+# point of making this its own number.
+A_STAR_GOAL_PROJECTION_M = 10.0
+
+# --- TASK 2 CORRIDOR (lateral cap) ---
+# The boat left the course when a waypoint sat near the boundary: orange boundary buoys are
+# just point obstacles to A*, so routing around the OUTSIDE of them is both legal and
+# shorter. The fix is a soft rule - "do not pass on the far side of an orange buoy" -
+# expressed as extra cost rather than a wall, so a genuinely blocked corridor can still be
+# escaped instead of deadlocking.
+#
+# Lateral offsets are measured against the line from the first Task 2 point to the last one.
+# That line is the ONE thing the rules guarantee stays inside the course, and unlike a
+# boat->goal axis it does not rotate with the approach, so left/right stays correct even
+# when entering the corridor diagonally.
+ENABLE_TASK2_CORRIDOR = True
+# Only buoys whose distance along the axis falls in [boat - back, boat + ahead] set the cap.
+# Anything further ahead says nothing about how far sideways we may go right now.
+CORRIDOR_WINDOW_BACK_M = 5.0
+CORRIDOR_WINDOW_AHEAD_M = 15.0
+# The cap is only applied when BOTH sides are visible. Seeing one chain (which is what
+# happens on the diagonal approach to the entrance, and whenever a chain is momentarily
+# lost) tells us nothing about where the corridor ends, so no constraint is imposed.
+CORRIDOR_REQUIRE_BOTH_SIDES = True
+# A buoy counts once it has been seen this many times and was seen recently.
+CORRIDOR_CONFIRM_SIGHTINGS = 3
+CORRIDOR_CONFIRM_MAX_AGE_S = 1.5
+# Extra clearance kept inside the boundary buoys, and the cost charged per cell beyond it.
+# The penalty is per grid cell, against a base step cost of 1.0, so 6.0 makes a 1 m
+# excursion (10 cells at 0.10 m/px) cost about 30 - far more than any sane detour.
+# Measured: 3.0 and 6.0 give the same route, but a smaller penalty keeps the search cheap.
+CORRIDOR_MARGIN_M = 0.5
+CORRIDOR_PENALTY = 3.0
+# Straight-line shortcuts may not cross cells costing more than this, otherwise the
+# line-of-sight fast path would tunnel straight through the cap.
+CORRIDOR_LOS_BLOCK_COST = 3.0
+# Longitudinal bin width used to turn the buoys into a cap profile along the axis.
+CORRIDOR_BIN_M = 2.0
+
+# Approach point for the Task 2 entrance, set back along the axis. Coming in very obliquely,
+# the shortest line to the entry waypoint can slip between the first and second buoys of a
+# boundary chain rather than through the mouth. Aiming at a point behind the entrance first
+# forces the last leg to be aligned with the corridor, whichever diagonal we arrive from.
+TASK2_APPROACH_OFFSET_M = 12.0
+TASK2_APPROACH_ENGAGE_M = 8.0   # stop using it once this close to the entry point
 
 # Planning is decoupled from control: Pure Pursuit runs every nav cycle on the last good
 # path, A* only every A_STAR_PLAN_DIVISOR cycles (25 Hz / 5 = 5 Hz) but with double the

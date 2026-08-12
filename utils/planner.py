@@ -53,7 +53,7 @@ def get_inflated_nav_map(raw_costmap):
     return nav_map, inflated_obstacles
 
 
-def _segment_is_clear(nav_map, p1, p2):
+def _segment_is_clear(nav_map, p1, p2, cost_map=None, max_cost=None):
     """
     O(L) obstacle check along a pixel segment. Samples one pixel per unit of the
     dominant axis instead of rasterising the line into a full-size mask and scanning
@@ -76,12 +76,24 @@ def _segment_is_clear(nav_map, p1, p2):
     if xi.min() < 0 or yi.min() < 0 or xi.max() >= w or yi.max() >= h:
         return False
 
-    return not np.any(nav_map[yi, xi] == 0)
+    if np.any(nav_map[yi, xi] == 0):
+        return False
+
+    # A straight-line shortcut must also respect the soft cost layer, otherwise the
+    # line-of-sight fast path tunnels straight through the corridor cap that A* itself
+    # would have paid to avoid.
+    if cost_map is not None and max_cost is not None:
+        if np.any(cost_map[yi, xi] > max_cost):
+            return False
+
+    return True
 
 
-def check_line_of_sight(start, end, nav_map, center_m, res, size_px):
+def check_line_of_sight(start, end, nav_map, center_m, res, size_px,
+                        cost_map=None, max_cost=None):
     """
-    Raycast on the grid to check if a straight line between start and end is obstacle-free.
+    Raycast on the grid to check if a straight line between start and end is obstacle-free
+    and, if a soft cost layer is supplied, does not cross anything above `max_cost`.
     """
     if nav_map is None: return True
 
@@ -101,7 +113,7 @@ def check_line_of_sight(start, end, nav_map, center_m, res, size_px):
 
     if p1 is None or p2 is None: return False
 
-    return _segment_is_clear(nav_map, p1, p2)
+    return _segment_is_clear(nav_map, p1, p2, cost_map, max_cost)
 
 
 # --- A* PATH PLANNING ---
@@ -111,7 +123,7 @@ def heuristic(a, b, weight=1.0):
     dy = abs(b[1] - a[1])
     return weight * (dx + dy + (1.414 - 2) * min(dx, dy))
 
-def string_pulling(path, nav_map, center_m, res, size_px):
+def string_pulling(path, nav_map, center_m, res, size_px, cost_map=None, max_cost=None):
     """
     Smoothens the jagged A* grid path by drawing straight lines between furthest
     visible nodes, reducing zigzagging significantly.
@@ -126,7 +138,8 @@ def string_pulling(path, nav_map, center_m, res, size_px):
         furthest_visible = current_idx + 1
         # Try to find the furthest node we can draw a straight line to without hitting an obstacle
         for test_idx in range(current_idx + 2, len(path)):
-            if check_line_of_sight(path[current_idx], path[test_idx], nav_map, center_m, res, size_px):
+            if check_line_of_sight(path[current_idx], path[test_idx], nav_map, center_m, res,
+                                   size_px, cost_map, max_cost):
                 furthest_visible = test_idx
             else:
                 # Visibility broken, keep the last visible
@@ -136,6 +149,117 @@ def string_pulling(path, nav_map, center_m, res, size_px):
         current_idx = furthest_visible
 
     return smoothed_path
+
+
+def build_corridor_cost(shape, center_m, res, axis_p0, axis_p1, boundary_pts, robot_xy):
+    """
+    Soft "do not pass outside a boundary buoy" cost layer for Task 2.
+
+    Returns a float32 array the same shape as the nav map, 0 everywhere the boat is free to
+    go and CORRIDOR_PENALTY per cell beyond the boundary. None if the cap cannot be
+    established, in which case no constraint is applied at all.
+
+    How it works, and why it is built this way:
+
+      * Lateral offsets are measured against axis_p0 -> axis_p1, the line from the first
+        Task 2 waypoint to the last. The rules guarantee that line stays inside the course,
+        and because it is fixed it keeps left and right meaningful no matter how obliquely
+        the boat approaches - a boat->goal axis rotates with the boat and can put both
+        buoys of a gate on the same side.
+      * Only buoys within a longitudinal window around the boat contribute. One 25 m ahead
+        says nothing about how far sideways we may go here, and using it would drag the cap
+        in wherever the corridor happens to be narrow further on.
+      * The cap is built per longitudinal bin, so a corridor that curves or changes width is
+        followed automatically. Bins with no buoy inherit from their neighbours.
+      * If either side is missing the whole thing is abandoned (see
+        CORRIDOR_REQUIRE_BOTH_SIDES). Seeing one chain - which is exactly what happens on
+        the diagonal run-in to the entrance - tells us nothing about where the corridor
+        ends, so imposing a cap from it would be guesswork.
+    """
+    if not boundary_pts:
+        return None
+
+    ax0, ay0 = axis_p0
+    ax1, ay1 = axis_p1
+    dx, dy = ax1 - ax0, ay1 - ay0
+    axis_len = math.hypot(dx, dy)
+    if axis_len < 1.0:
+        return None
+    ux, uy = dx / axis_len, dy / axis_len       # along
+    nx, ny = -uy, ux                            # left-positive normal
+
+    def project(px, py):
+        rx, ry = px - ax0, py - ay0
+        return rx * ux + ry * uy, rx * nx + ry * ny
+
+    boat_s, _ = project(*robot_xy)
+    back = getattr(cfg, 'CORRIDOR_WINDOW_BACK_M', 5.0)
+    ahead = getattr(cfg, 'CORRIDOR_WINDOW_AHEAD_M', 15.0)
+    s_lo, s_hi = boat_s - back, boat_s + ahead
+
+    bin_m = max(0.5, getattr(cfg, 'CORRIDOR_BIN_M', 2.0))
+    nbins = max(1, int(math.ceil((s_hi - s_lo) / bin_m)))
+    left = [None] * nbins     # most negative lateral allowed (nearest left buoy)
+    right = [None] * nbins    # most positive lateral allowed
+
+    for px, py in boundary_pts:
+        s, d = project(px, py)
+        if not (s_lo <= s <= s_hi):
+            continue
+        b = min(nbins - 1, max(0, int((s - s_lo) / bin_m)))
+        if d >= 0:
+            if right[b] is None or d < right[b]:
+                right[b] = d
+        else:
+            if left[b] is None or d > left[b]:
+                left[b] = d
+
+    if getattr(cfg, 'CORRIDOR_REQUIRE_BOTH_SIDES', True):
+        if not any(v is not None for v in left) or not any(v is not None for v in right):
+            return None
+
+    def fill(seq):
+        out = list(seq)
+        last = None
+        for i in range(len(out)):
+            if out[i] is None:
+                out[i] = last
+            else:
+                last = out[i]
+        last = None
+        for i in range(len(out) - 1, -1, -1):
+            if out[i] is None:
+                out[i] = last
+            else:
+                last = out[i]
+        return out
+
+    left = fill(left)
+    right = fill(right)
+    if any(v is None for v in left) or any(v is None for v in right):
+        return None
+
+    h, w = shape[:2]
+    cw, ch = w // 2, h // 2
+    yy, xx = np.mgrid[0:h, 0:w]
+    wx = center_m[0] + (xx - cw) * res
+    wy = center_m[1] - (yy - ch) * res
+    rx, ry = wx - ax0, wy - ay0
+    s_grid = rx * ux + ry * uy
+    d_grid = rx * nx + ry * ny
+
+    idx = np.clip(((s_grid - s_lo) / bin_m).astype(np.int32), 0, nbins - 1)
+    margin = getattr(cfg, 'CORRIDOR_MARGIN_M', 0.5)
+    left_arr = np.asarray(left, dtype=np.float32) + margin     # e.g. -6.0 + 0.5
+    right_arr = np.asarray(right, dtype=np.float32) - margin
+
+    outside = (d_grid < left_arr[idx]) | (d_grid > right_arr[idx])
+    # Beyond the longitudinal window we know nothing, so charge nothing.
+    outside &= (s_grid >= s_lo) & (s_grid <= s_hi)
+
+    cost = np.zeros((h, w), dtype=np.float32)
+    cost[outside] = float(getattr(cfg, 'CORRIDOR_PENALTY', 6.0))
+    return cost
 
 
 def _find_free_cell(nav_map, cell, max_radius_px):
@@ -173,38 +297,35 @@ def _find_free_cell(nav_map, cell, max_radius_px):
     return None
 
 
-def _nudge_goal_to_free(goal, start, nav_map):
+def _nudge_goal_to_free(goal, start, nav_map, max_radius_px=None):
     """
-    If the goal cell sits inside an inflated obstacle, walk back along the goal->start
-    line and take the first free cell. Without this, a target that happens to be behind
-    (or on) a buoy makes A* give up entirely and hand control to the obstacle-blind PID.
-    Returns None if the whole segment is blocked.
+    If the goal cell sits inside an inflated obstacle, move it to the NEAREST free cell.
+
+    This used to walk from the goal back along the goal->start line. That direction is
+    wrong for the case it matters most in: approaching a corridor entrance whose waypoint
+    sits a couple of metres from a boundary buoy. Once position error puts that waypoint
+    inside the buoy's inflated disc, walking toward the boat drags the goal back OUT of the
+    mouth, and the boat then aims at a point outside the course instead of entering it.
+
+    The nearest free cell to a goal blocked by a single buoy lies beside it, which is the
+    sensible place to aim, so the ring search is used instead. Returns None if nothing free
+    is within reach.
     """
-    h, w = nav_map.shape[:2]
     if nav_map[goal[1], goal[0]] != 0:
         return goal
 
-    x0, y0 = float(goal[0]), float(goal[1])
-    x1, y1 = float(start[0]), float(start[1])
-    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
-    if n < 2:
-        return None
+    if max_radius_px is None:
+        res = getattr(cfg, 'COSTMAP_RES_M_PER_PX', 0.10)
+        max_radius_px = int((getattr(cfg, 'BUOY_RADIUS_M', 0.25) +
+                             getattr(cfg, 'ROBOT_RADIUS_M', 0.4) +
+                             getattr(cfg, 'INFLATION_MARGIN_M', 0.25)) / res) * 2 + 6
 
-    xi = np.rint(np.linspace(x0, x1, n)).astype(np.int32)
-    yi = np.rint(np.linspace(y0, y1, n)).astype(np.int32)
-    np.clip(xi, 0, w - 1, out=xi)
-    np.clip(yi, 0, h - 1, out=yi)
-
-    free = np.nonzero(nav_map[yi, xi] != 0)[0]
-    if free.size == 0:
-        return None
-    k = int(free[0])
-    return (int(xi[k]), int(yi[k]))
+    return _find_free_cell(nav_map, goal, max_radius_px)
 
 
 def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
                   heuristic_weight=2.5, max_expansions=20000, time_budget_s=None,
-                  goal_tolerance_px=3):
+                  goal_tolerance_px=3, cost_map=None, los_max_cost=None):
     """
     A* algorithm implementation over the local costmap grid.
     Returns list of world coordinates (x,y).
@@ -295,7 +416,8 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
             path.append(p2w(start[0], start[1]))
             path.reverse()
             # Apply path smoothing post-processing
-            return string_pulling(path, nav_map, center_m, res, size_px)
+            return string_pulling(path, nav_map, center_m, res, size_px,
+                                  cost_map, los_max_cost)
 
         expansions += 1
         if expansions >= max_expansions:
@@ -312,6 +434,12 @@ def get_path_plan(start_world, end_world, nav_map, center_m, res, size_px,
 
                 # Cost is 1 for straight, 1.414 for diagonal
                 step_cost = 1 if dx == 0 or dy == 0 else 1.414
+
+                # Soft cost layer (Task 2 corridor cap). Charged rather than forbidden, so
+                # a corridor that is genuinely blocked can still be escaped instead of
+                # leaving A* with no path at all.
+                if cost_map is not None:
+                    step_cost += float(cost_map[neighbor[1], neighbor[0]])
 
                 # --- Kinematic Constraint Penalty ---
                 # NOTE: this makes the true state space (cell, arrival direction) while
