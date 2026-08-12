@@ -26,16 +26,30 @@ BUOY_RADIUS_M = 0.25
 #     corridor 3.0 m -> INFLATION_MARGIN_M <= 0.35
 #     corridor 4.0 m -> INFLATION_MARGIN_M <= 0.85
 #     corridor 5.0 m -> INFLATION_MARGIN_M <= 1.35
-# 0.55 -> 0.25. Measured on the 2026-08-12 run, the per-track position scatter is
-# mean 0.11 m (max 1.38 m), which is far tighter than the 0.55 m margin assumed. With the
-# old value the total forbidden radius was 1.20 m, so a 1.5 m gap between buoy surfaces
-# came out NEGATIVE - every tight passage was invisible to A*, and going around the outside
-# of the course was the only route it could see. That is a direct cause of the observed
-# course exit.
-#     gap between buoy surfaces 1.5 m -> free passage  -0.40 m at 0.55, +0.20 m at 0.25
-#     gap between buoy surfaces 2.0 m -> free passage  +0.10 m at 0.55, +0.70 m at 0.25
-# If the boat starts shaving buoys instead of leaving the course, raise this to 0.35.
-INFLATION_MARGIN_M = 0.25
+# 0.55 -> 0.25 -> 0.45.
+#
+# 0.25 was set from the per-track scatter (0.11 m), which was the WRONG statistic: that
+# figure is precision within one track, not how well the buoy's position is actually known.
+# Clustering the tracks gave the real number - between-track spread, mean 0.50 m - and with
+# it the boat hit two yellow buoys it had detected correctly at 2.0 m.
+#
+# The geometry is exact:
+#
+#     hull-to-buoy gap = INFLATION_MARGIN_M - position_error
+#
+# because A* keeps the boat CENTRE at BUOY + ROBOT + INFLATION from the MAPPED position,
+# and the true buoy may be `position_error` closer than that. At 0.25 with 0.50 m of error
+# the gap is -0.25 m, i.e. contact, which is exactly what happened.
+#
+#     INFL   gap at 0.50 m error   narrowest passable surface gap
+#     0.25          -0.25 m                 1.30 m
+#     0.45          -0.05 m                 1.70 m
+#     0.55          +0.05 m                 1.90 m
+#
+# There is no value that both avoids contact and threads the 1.5 m gaps on this course -
+# that needs the position error itself to come down. 0.45 is the compromise: grazing rather
+# than hitting, and passages from 1.7 m up stay open.
+INFLATION_MARGIN_M = 0.45
 MAX_TILT_ANGLE = 5.0
 
 # --- PINS / CHANNELS ---
