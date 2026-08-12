@@ -182,7 +182,11 @@ CORRIDOR_BIN_M = 2.0
 # boundary chain rather than through the mouth. Aiming at a point behind the entrance first
 # forces the last leg to be aligned with the corridor, whichever diagonal we arrive from.
 TASK2_APPROACH_OFFSET_M = 12.0
-TASK2_APPROACH_ENGAGE_M = 8.0   # stop using it once this close to the entry point
+TASK2_APPROACH_REACHED_M = 3.0  # approach point counts as reached inside this radius
+# Only route via the approach point when we are this far off the corridor axis.
+# Lined up in front of the mouth, a straight run at the entry is already aligned,
+# and keying on lateral offset keeps the switch one-way instead of oscillating.
+TASK2_APPROACH_LATERAL_M = 3.0
 
 # Planning is decoupled from control: Pure Pursuit runs every nav cycle on the last good
 # path, A* only every A_STAR_PLAN_DIVISOR cycles (25 Hz / 5 = 5 Hz) but with double the

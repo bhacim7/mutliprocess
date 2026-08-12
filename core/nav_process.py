@@ -633,17 +633,47 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         # Aiming at a point set back along the corridor axis first forces the
                         # final leg to be aligned with the corridor, from either diagonal.
                         if task_state == "TASK2_START":
-                            engage = getattr(cfg, 'TASK2_APPROACH_ENGAGE_M', 8.0)
-                            offset = getattr(cfg, 'TASK2_APPROACH_OFFSET_M', 12.0)
                             end_lat = getattr(cfg, 'T2_ZONE_END_LAT', 0)
                             end_lon = getattr(cfg, 'T2_ZONE_END_LON', 0)
-                            if dist_to_target > engage and end_lat and end_lon:
-                                axis_len = nav.haversine(t_lat, t_lon, end_lat, end_lon)
-                                if axis_len > 5.0:
-                                    back_bearing = nav.calculate_bearing(end_lat, end_lon,
-                                                                         t_lat, t_lon)
-                                    a_lat, a_lon = calculate_obj_gps(t_lat, t_lon,
-                                                                     offset, back_bearing)
+                            if end_lat and end_lon and \
+                                    nav.haversine(t_lat, t_lon, end_lat, end_lon) > 5.0:
+                                offset = getattr(cfg, 'TASK2_APPROACH_OFFSET_M', 12.0)
+                                reached = getattr(cfg, 'TASK2_APPROACH_REACHED_M', 3.0)
+                                axis_brg = nav.calculate_bearing(t_lat, t_lon, end_lat, end_lon)
+                                a_lat, a_lon = calculate_obj_gps(
+                                    t_lat, t_lon, offset, (axis_brg + 180.0) % 360.0)
+
+                                # Position relative to the corridor axis, measured from the
+                                # entry: s along the axis (negative = still outside, in front
+                                # of the mouth) and d across it.
+                                brg_to_boat = nav.calculate_bearing(t_lat, t_lon, lat, lon)
+                                r_boat = nav.haversine(t_lat, t_lon, lat, lon)
+                                rel = math.radians(brg_to_boat - axis_brg)
+                                s_along = r_boat * math.cos(rel)
+                                d_across = abs(r_boat * math.sin(rel))
+
+                                # The approach point exists for one reason: make the last leg
+                                # into the mouth run ALONG the corridor, so an oblique line
+                                # cannot slip between the first two buoys of a boundary
+                                # chain. It is therefore needed only while we are off to the
+                                # side - once we are lined up in front of the mouth, heading
+                                # straight for the entry is already aligned.
+                                #
+                                # Keying it on lateral offset also makes the switch one-way.
+                                # Two earlier versions oscillated instead:
+                                #   * comparing distance to the ENTRY against an 8 m
+                                #     threshold while the approach point sat 12 m further
+                                #     back meant that on reaching it the boat was still 12 m
+                                #     from the entry, so it kept targeting the point it was
+                                #     already standing on and never left TASK2_START. Flight
+                                #     log 03:59:02-03:59:31: HEDEFE_MESAFE cycling 0.6-3.5 m
+                                #     with HEDEF_HDG swinging 143, 273, 296, 177, 100, 256.
+                                #   * a simple "within `reached` of the approach point" test
+                                #     flipped back the moment the boat moved past it toward
+                                #     the entry and left that radius again.
+                                lateral_tol = getattr(cfg, 'TASK2_APPROACH_LATERAL_M', 3.0)
+                                if s_along < 0.0 and d_across > lateral_tol and \
+                                        nav.haversine(lat, lon, a_lat, a_lon) > reached:
                                     return task_state, a_lat, a_lon
 
                         return task_state, t_lat, t_lon
