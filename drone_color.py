@@ -17,8 +17,27 @@ import Jetson.GPIO as GPIO
 # ==========================================================================
 
 # --- GPIO and Telemetry Settings ---
-# BCM pin numaralandırması kullanılıyor. Orin Nano'da 40-pin header'a göre doğru pini seçtiğinden emin ol.
-TRIGGER_PIN = 17
+# FİZİKSEL pin numaralandırması (GPIO.BOARD) kullanılıyor; 40-pin header diyagramındaki
+# numaraların aynısı.
+# Kaynak: Orange Cube AUX1 (SERVO9), ArduPilot relay olarak yapılandırıldı.
+#   SERVO9_FUNCTION = -1   (AUX1'i GPIO yap)
+#   RELAY1_PIN      = 50   (50 = AUX1)
+#   RC7_OPTION      = 28   (Relay On/Off)
+# Kablolama: Cube AUX1 "S" -> Jetson pin 16, Cube AUX1 "-" -> Jetson pin 14 (GND).
+# AUX1 "+" hattı BAĞLANMAZ. Pin ile GND arasına harici 10k pull-down direnç konur.
+#
+# Bu bir SEVİYE sinyali (relay), servo darbesi değil. Önceki sürüm kenar yakalayıp darbe
+# genişliği ölçüyordu; relay çıkışında ölçülecek darbe olmadığı için tetik hiç çalışmıyordu.
+TRIGGER_PIN = 16
+
+# Relay HIGH iken sistemin aktif olmasını istiyoruz. Kumandada kanal 7 ters çalışıyorsa
+# (tuş indirilince ch7 düşüyorsa) burayı 0 yapmak yeterli, başka yeri değiştirme.
+ACTIVE_LEVEL = 1  # 1 = GPIO.HIGH, 0 = GPIO.LOW
+
+# Gürültüye karşı basit yumuşatma: art arda bu kadar okuma aynı olmadan seviye değişmiş
+# sayılmaz. Döngü ~100 Hz döndüğü için 3 okuma ≈ 30 ms.
+DEBOUNCE_SAMPLES = 3
+TIMER_THRESHOLD = 2.0   # seviye bu kadar süre sabit kalınca durum değişir
 
 # RFD900x veya benzeri telemetri modülü USB üzerinden bağlıysa ttyUSB0 kalabilir.
 # Eğer doğrudan Jetson'un TX/RX pinlerine (UART) bağlıysa "/dev/ttyTHS0" veya "/dev/ttyTHS1" olabilir.
@@ -49,10 +68,13 @@ MAX_RECALIBRATIONS = 3
 RECALIBRATE_AFTER_S = 5.0
 
 # --- Detection geometry ---
-# Whole frame. The centre crop was throwing away the outer 30% for no good reason - if the
-# plaque is anywhere in view we want it. Set below 1.0 only if something at the edge of the
-# frame is causing false positives.
-ROI_RATIO = 1.0
+# Centre window that is actually evaluated. Mapping where each colour appeared across the
+# test footage settled this: the false positives live at the edges and the targets do not.
+#     orange bench edge   65% of its pixels in the TOP row of a 3x3 split
+#     green plaque        56% in the bottom-centre cell, 24% centre
+# Shoes, the car and hands were all at the border too. 0.70 keeps the aiming area
+# comfortable while cutting the frame edge where the clutter is.
+ROI_RATIO = 0.70
 
 # Absolute minimum blob size, in pixels. This used to be 0.5% of the ROI AREA, which
 # scales with resolution - so raising the camera resolution moved the threshold by exactly
@@ -76,6 +98,16 @@ BLACK_MAX_AREA_FRAC = 0.60
 # touches the edges, so those gates fight you. Set True while testing by hand, False to fly.
 CLOSE_RANGE_TEST = False
 
+# The black ceiling is this fraction of the frame's 95th-percentile V. P95 stands in for
+# "the concrete", and it keeps doing so even when the plaque fills most of the frame, which
+# a median would not. Checked against the measured footage:
+#     shaded concrete alone   P95  95 -> ceiling 38, concrete median 67  -> not black OK
+#     plaque in frame         P95 139 -> ceiling 56, plaque median  17  -> black     OK
+#     sunlit concrete         P95 209 -> ceiling 84, concrete median 111 -> not black OK
+BLACK_V_FRACTION = 0.40
+BLACK_V_MIN = 25             # never go below this, or nothing is ever dark enough
+BLACK_V_MAX = 110            # never go above this, whatever the frame looks like
+
 # Minimum ABSOLUTE spread between the BGR channels (max - min) for a pixel to count as
 # red or green.
 #
@@ -87,8 +119,9 @@ CLOSE_RANGE_TEST = False
 #     black plaque reading as "red"   delta ~ 35-40
 #     RAL 6037 green                  delta ~ 120
 #     RAL 3026 red                    delta ~ 190
-# A floor of 60 sits in the gap, and still admits a plaque sitting in shade.
-MIN_CHROMA_DELTA = 60
+# A floor of 45 sits in the gap. It was 60, but the red plaque was measured down to
+# delta=56 in shade - right on the edge - and shade is the worst case.
+MIN_CHROMA_DELTA = 45
 
 # --- Black plaque shape gate (see detect_color) ---
 # Concrete makes red/green trivial to separate by saturation, but it makes BLACK hard:
@@ -251,36 +284,54 @@ if cap is None:
 USE_OUTDOOR = True
 
 if USE_OUTDOOR:
-    # RED - RAL 3026 is a luminous, slightly orange red; the swatch computes to H 0-5.
-    # The window is 0-15 / 165-179 rather than 0-10 / 170-179 because everything between
-    # 11 and 164 is a dead zone: a white-balance shift of a few degrees pushes the plaque
-    # into that gap and it matches NO mask at all. Concrete sits at S 20-60, so widening
-    # the hue costs nothing here - the saturation floor is what does the rejecting.
-    lower_red1, upper_red1 = (0, 110, 60), (15, 255, 255)
-    lower_red2, upper_red2 = (165, 110, 60), (179, 255, 255)
+    # ------------------------------------------------------------------------------
+    # MEASURED from renk_20260811_194931.mp4 (983 frames, shaded concrete). These are
+    # no longer derived from RAL swatch values - two earlier attempts to do that put the
+    # windows in the wrong place, because what matters is what the CAMERA reports, not
+    # what the paint chip says:
+    #
+    #     red plaque      87% of its pixels at H 168-179   S 180-200  delta 56-93
+    #     green plaque    60% at H 45-54, peak 53-54       S 139-169  delta 80-101
+    #     orange wood     77% at H 11-20                   S 150-205  delta 70-93
+    #       (a bench edge in the test footage - the reason the old 0-15 red band and the
+    #        55-95 green window between them produced "big green plaque -> KIRMIZI")
+    #
+    # The three targets sit far apart in hue, so the windows are deliberately generous:
+    # the test was shot in SHADE and competition light may be direct sun, which shifts
+    # hue a few degrees and can wash out saturation on a glossy surface.
+    # ------------------------------------------------------------------------------
 
-    # GREEN - RAL 6037 computes to H ~70-78.5. The old 40-85 window left only 6.5 deg of
-    # headroom above the target while wasting 30 deg below it; 55-95 centres it properly.
-    lower_green, upper_green = (55, 110, 60), (95, 255, 255)
+    # RED - the plaque lives on the wrap side. The 0-15 half is dropped entirely: the
+    # plaque puts essentially nothing there, while orange/brown/skin-toned objects do.
+    # A narrow 0-4 sliver is kept only so a hue that drifts past 179 is not lost.
+    lower_red1, upper_red1 = (0, 100, 55), (4, 255, 255)
+    lower_red2, upper_red2 = (163, 100, 55), (179, 255, 255)
 
-    # Saturation floor was 150. Concrete is achromatic (S 20-60) so 110 still separates it
-    # by a wide margin, while leaving room for a plaque that is partially washed out by
-    # direct sun or a slightly wrong white balance.
+    # GREEN - measured at H 45-57. 38-88 gives ~7 deg below and ~30 above, and still
+    # stops well clear of the orange cluster that ends around H 24.
+    lower_green, upper_green = (38, 100, 55), (88, 255, 255)
+
+    # Saturation floor 100 and value floor 55: measured S was 139-205 and V 116-148 in
+    # shade, so both have wide margin, and direct sun only raises them.
     #
     # NOTE: the S floor alone is NOT enough to keep dark surfaces out - see
     # MIN_CHROMA_DELTA below.
 
-    # BLACK - RAL 9005. The old V ceiling of 45 was almost certainly rejecting the plaque
-    # outright: with exposure set for sunlit concrete the plaque is expected around V 54-76.
-    # Raising the ceiling to 85 lets it in - and also lets shadowed concrete (V ~62-87) in,
-    # which is why the shape gate in detect_color is not optional.
+    # BLACK - no fixed brightness ceiling. Measured in shade:
+    #     black plaque   V median 17   (P25 11, P75 29)
+    #     concrete       V median 67   (P5 35, P95 95)
+    # but under direct sun the SAME surfaces land at roughly V 77 and V 180. Any constant
+    # ceiling that works in one lighting fails in the other - a fixed 45 misses the plaque
+    # in sun, a fixed 85 swallows shaded concrete. The ceiling is therefore derived from
+    # the frame itself in detect_color (BLACK_V_FRACTION); the value here is only a
+    # fallback and the S ceiling stays wide open on purpose.
     #
-    # The S ceiling is deliberately wide open (255). Saturation is a RATIO and is useless on
-    # dark pixels - a black plaque under warm light reads S=146 and would fail any sane S
-    # ceiling, which is why it was coming out BELIRSIZ. "Achromatic" is decided by the
-    # ABSOLUTE channel spread instead, in detect_color, using the same MIN_CHROMA_DELTA that
-    # gates red and green. The two tests are exact complements: a pixel is either coloured
-    # enough for red/green or flat enough for black, never both.
+    # The S ceiling is 255 because saturation is a RATIO and is useless on dark pixels - a
+    # black plaque under warm light reads S=146 and would fail any sane S ceiling, which is
+    # why it was coming out BELIRSIZ. "Achromatic" is decided by the ABSOLUTE channel spread
+    # instead, using the same MIN_CHROMA_DELTA that gates red and green. The two tests are
+    # exact complements: a pixel is either coloured enough for red/green or flat enough for
+    # black, never both.
     lower_black, upper_black = (0, 0, 0), (179, 255, 85)
 else:
     # Indoor set, kept for bench testing. Not tuned.
@@ -379,7 +430,12 @@ def detect_color(roi):
 
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
-    mask_black = cv2.inRange(hsv, lower_black, upper_black)
+
+    # Scene-relative black ceiling (see BLACK_V_FRACTION) so the same code works in shade
+    # and in direct sun without retuning.
+    v_ref = float(np.percentile(hsv[:, :, 2], 95))
+    black_v = int(min(BLACK_V_MAX, max(BLACK_V_MIN, v_ref * BLACK_V_FRACTION)))
+    mask_black = cv2.inRange(hsv, lower_black, (upper_black[0], upper_black[1], black_v))
 
     # Absolute chroma gate for the two colour classes (see MIN_CHROMA_DELTA). Without it a
     # dark surface with a slight warm cast passes the red hue+saturation test, which is why
@@ -516,11 +572,17 @@ class AsyncVideoWriter(threading.Thread):
         print(f"[VIDEO] {self.filename}: {self.written} frames written, {self.dropped} dropped.")
 
 
-def draw_overlay(frame, label, conf, area, extent, chroma, scene, diag, contour):
+def draw_overlay(frame, label, conf, area, extent, chroma, scene, diag, contour, roi_box=None):
     """Burn the decision into the frame so the recording is reviewable on its own."""
     colours = {"KIRMIZI": (0, 0, 255), "YESIL": (0, 255, 0),
                "SIYAH": (255, 255, 255), "BELIRSIZ": (0, 200, 255)}
     col = colours.get(label, (200, 200, 200))
+
+    # The evaluated window. Drawn so you can see what the detector is allowed to look at
+    # while aiming - nothing outside this rectangle is considered.
+    if roi_box is not None:
+        rx0, ry0, rx1, ry1 = roi_box
+        cv2.rectangle(frame, (rx0, ry0), (rx1, ry1), (255, 255, 0), 1)
 
     if contour is not None:
         cv2.drawContours(frame, [contour], -1, col, 3)
@@ -582,40 +644,28 @@ def send_serial_message(label):
 
 
 # --- Main Loop & GPIO Setup ---
-global pulse_width_us, pulse_start_time, last_pulse_time
-pulse_width_us = 0.0
-pulse_start_time = 0.0
-last_pulse_time = 0.0
-
-# If no RC edge arrives for this long the signal is gone (transmitter off, cable out).
-# pulse_width_us only ever updates on a falling edge, so without this it FREEZES at its
-# last value - a link loss while active left the drone stuck transmitting forever.
-RC_SIGNAL_TIMEOUT_S = 0.5
-
 # Jetson GPIO Kurulumu
 GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM)  # BCM pin numaralandırmasını kullan
-GPIO.setup(TRIGGER_PIN, GPIO.IN)
+GPIO.setmode(GPIO.BOARD)  # Fiziksel (header) pin numaralandırmasını kullan
+
+# Jetson'da yazılımsal pull-down her pinde desteklenmiyor; parametre sessizce yok
+# sayılabilir. Bu yüzden HARİCİ 10k pull-down direnç şart. Kablo çıkarsa pin havada
+# kalır ve gürültüden rastgele HIGH okur.
+try:
+    GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+except Exception:
+    GPIO.setup(TRIGGER_PIN, GPIO.IN)
 
 
-# Pin olay işleyicisi (Interrupt Callback)
-def pin_edge_callback(channel):
-    global pulse_start_time, pulse_width_us, last_pulse_time
-    now = time.time()
-    last_pulse_time = now
-    if GPIO.input(channel) == GPIO.HIGH:  # Yükselen kenar (Activated)
-        pulse_start_time = now
-    else:  # Düşen kenar (Deactivated)
-        if pulse_start_time > 0:
-            pulse_width_us = (now - pulse_start_time) * 1000000
+def read_trigger():
+    """Cube AUX1'in mevcut seviyesini okur. True = tetik aktif konumda."""
+    return GPIO.input(TRIGGER_PIN) == ACTIVE_LEVEL
 
 
-# Hem yükselen hem düşen kenarda tetiklenecek şekilde ayarla
-GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_edge_callback)
+stable_level = read_trigger()
+candidate_level = stable_level
+candidate_count = 0
 
-ACTIVATION_THRESHOLD = 1500
-DEACTIVATION_THRESHOLD = 1500
-TIMER_THRESHOLD = 2.0  # 2 seconds
 active_start_time = None
 idle_start_time = time.time()
 current_status = "Boşta"
@@ -655,20 +705,22 @@ clear_screen()
 print("-------------------------------------")
 print(" Live Color Detection and Status Screen ")
 print("-------------------------------------")
-print(f"RC Trigger Pin: GPIO {TRIGGER_PIN}")
+print(f"RC Trigger Pin: fiziksel pin {TRIGGER_PIN}")
 
 try:
     while True:
-        # RC failsafe: no edges for a while means there is no signal any more, so the
-        # last measured pulse width is stale and must not keep the system ACTIVE.
-        if last_pulse_time > 0.0 and (time.time() - last_pulse_time) > RC_SIGNAL_TIMEOUT_S:
-            pulse_width_us = 0.0
-            rc_link_ok = False
+        # Tetik seviyesini oku ve yumuşat.
+        raw_level = read_trigger()
+        if raw_level == candidate_level:
+            candidate_count += 1
         else:
-            rc_link_ok = last_pulse_time > 0.0
+            candidate_level = raw_level
+            candidate_count = 1
+        if candidate_count >= DEBOUNCE_SAMPLES:
+            stable_level = candidate_level
 
         # Check for state changes with a timer
-        if pulse_width_us > ACTIVATION_THRESHOLD:
+        if stable_level:
             if active_start_time is None:
                 active_start_time = time.time()
             if time.time() - active_start_time >= TIMER_THRESHOLD:
@@ -788,7 +840,8 @@ try:
             last_video_t = now
             vis = draw_overlay(frame.copy(), current_color, current_conf, current_area,
                                current_extent, chroma_stats, scene_stats, diag,
-                               None if win_cnt is None else win_cnt + np.array([[x0, y0]]))
+                               None if win_cnt is None else win_cnt + np.array([[x0, y0]]),
+                               roi_box=(x0, y0, x1, y1))
             video_writer.enqueue(vis)
 
         # Terminal refresh was redrawing the whole screen every iteration (~100 Hz).
@@ -807,6 +860,12 @@ try:
             if last_detected_color == "BELIRSIZ":
                 for _c in ("KIRMIZI", "YESIL", "SIYAH"):
                     print(f"   {_c:<8} red: {diag.get(_c) or '-'}")
+                # The area cap and the border test both assume the plaque is a small object
+                # in a big frame, which is true at altitude and false when you are holding
+                # the drone over it. Say so rather than letting it look like a colour bug.
+                _sr = diag.get("SIYAH") or ""
+                if not CLOSE_RANGE_TEST and ("buyuk" in _sr or "kenara" in _sr):
+                    print("   >> yakin mesafe? CLOSE_RANGE_TEST = True yapin")
             if chroma_stats:
                 print(f"RENKLI BOLGE  HSV: H={chroma_stats[0]:3d} S={chroma_stats[1]:3d} "
                       f"V={chroma_stats[2]:3d}  (ROI'nin %{chroma_stats[3]}'i)")
@@ -819,9 +878,9 @@ try:
             print(f"Scene median HSV: {scene_stats}")
             print(f"Frame: {w}x{h}  ROI: {x1-x0}x{y1-y0}"
                   f"{'  [YAKIN TEST MODU]' if CLOSE_RANGE_TEST else ''}")
-            print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
-            print(f"Pulse Width (µs): {pulse_width_us:.2f}")
-            print(f"RC Signal: {'OK' if rc_link_ok else 'NO SIGNAL'}")
+            print(f"RC Trigger Pin: fiziksel pin {TRIGGER_PIN} <- Cube AUX1")
+            print(f"Pin Level: {'HIGH' if GPIO.input(TRIGGER_PIN) else 'LOW'}"
+                  f"  (aktif kabul edilen: {'HIGH' if ACTIVE_LEVEL else 'LOW'})")
 
             if master and master.is_open:
                 print(f"Serial Connection: OK ({TELEMETRY_PORT})")
