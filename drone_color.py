@@ -5,9 +5,11 @@ import numpy as np
 import time
 import datetime
 import csv
+import queue
 import serial
 import json
 import os
+import threading
 import Jetson.GPIO as GPIO
 
 # ==========================================================================
@@ -74,6 +76,20 @@ BLACK_MAX_AREA_FRAC = 0.60
 # touches the edges, so those gates fight you. Set True while testing by hand, False to fly.
 CLOSE_RANGE_TEST = False
 
+# Minimum ABSOLUTE spread between the BGR channels (max - min) for a pixel to count as
+# red or green.
+#
+# This is what stops the black plaque being reported as KIRMIZI. HSV saturation is a
+# RATIO, S = (max-min)/max, so on a dark surface a tiny channel difference produces a huge
+# S: BGR (30,35,70) - a black plaque under warm sunlight, or with the white balance a
+# little off - comes out H=4 S=146 V=70, which clears both the red hue window and the S
+# floor. Measured channel spreads:
+#     black plaque reading as "red"   delta ~ 35-40
+#     RAL 6037 green                  delta ~ 120
+#     RAL 3026 red                    delta ~ 190
+# A floor of 60 sits in the gap, and still admits a plaque sitting in shade.
+MIN_CHROMA_DELTA = 60
+
 # --- Black plaque shape gate (see detect_color) ---
 # Concrete makes red/green trivial to separate by saturation, but it makes BLACK hard:
 # a shadow on concrete and the RAL 9005 plaque land at almost the same brightness, because
@@ -81,6 +97,14 @@ CLOSE_RANGE_TEST = False
 # No brightness threshold can split them, so the black mask gets two cheap shape checks.
 BLACK_MIN_EXTENT = 0.75      # contour area / bounding-box area. Square ~0.95, drone shadow ~0.3
 BLACK_REJECT_BORDER = True   # drop blobs touching the frame edge (large ground shadows)
+
+# --- Video recording ---
+# Same on/off idea as the boat's cfg.RECORD_VIDEO. The recorded frame carries the overlay
+# (label, blob outline, live HSV), so reviewing it frame by frame shows what the detector
+# actually decided rather than just what the camera saw.
+RECORD_VIDEO = True
+VIDEO_FPS = 15.0             # written at this rate; keep below the capture rate
+VIDEO_MAX_QUEUE = 120        # drop frames rather than stall the loop if the disk lags
 
 # --- Logging ---
 LOG_ENABLED = True
@@ -242,12 +266,22 @@ if USE_OUTDOOR:
     # Saturation floor was 150. Concrete is achromatic (S 20-60) so 110 still separates it
     # by a wide margin, while leaving room for a plaque that is partially washed out by
     # direct sun or a slightly wrong white balance.
+    #
+    # NOTE: the S floor alone is NOT enough to keep dark surfaces out - see
+    # MIN_CHROMA_DELTA below.
 
     # BLACK - RAL 9005. The old V ceiling of 45 was almost certainly rejecting the plaque
     # outright: with exposure set for sunlit concrete the plaque is expected around V 54-76.
     # Raising the ceiling to 85 lets it in - and also lets shadowed concrete (V ~62-87) in,
     # which is why the shape gate in detect_color is not optional.
-    lower_black, upper_black = (0, 0, 0), (179, 80, 85)
+    #
+    # The S ceiling is deliberately wide open (255). Saturation is a RATIO and is useless on
+    # dark pixels - a black plaque under warm light reads S=146 and would fail any sane S
+    # ceiling, which is why it was coming out BELIRSIZ. "Achromatic" is decided by the
+    # ABSOLUTE channel spread instead, in detect_color, using the same MIN_CHROMA_DELTA that
+    # gates red and green. The two tests are exact complements: a pixel is either coloured
+    # enough for red/green or flat enough for black, never both.
+    lower_black, upper_black = (0, 0, 0), (179, 255, 85)
 else:
     # Indoor set, kept for bench testing. Not tuned.
     lower_red1, upper_red1 = (0, 120, 80), (10, 255, 255)
@@ -290,6 +324,7 @@ def _best_blob(mask, max_area=None, shape_gated=False):
 
     best_area = 0.0
     best_extent = 0.0
+    best_cnt = None
     largest = 0.0
     reason = None
 
@@ -324,12 +359,13 @@ def _best_blob(mask, max_area=None, shape_gated=False):
         if area > best_area:
             best_area = area
             best_extent = extent
+            best_cnt = c
 
     if best_area > 0:
         reason = None
     elif reason is None and largest == 0.0:
         reason = "maske bos"
-    return best_area, best_extent, reason
+    return best_area, best_extent, reason, best_cnt
 
 
 def detect_color(roi):
@@ -345,6 +381,20 @@ def detect_color(roi):
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     mask_black = cv2.inRange(hsv, lower_black, upper_black)
 
+    # Absolute chroma gate for the two colour classes (see MIN_CHROMA_DELTA). Without it a
+    # dark surface with a slight warm cast passes the red hue+saturation test, which is why
+    # the black plaque was being reported as KIRMIZI.
+    mx = roi.max(axis=2)
+    mn = roi.min(axis=2)
+    delta = cv2.subtract(mx, mn)
+    chroma_ok = cv2.inRange(delta, np.uint8([MIN_CHROMA_DELTA]), np.uint8([255]))
+    achromatic = cv2.bitwise_not(chroma_ok)
+
+    mask_red = cv2.bitwise_and(mask_red, chroma_ok)
+    mask_green = cv2.bitwise_and(mask_green, chroma_ok)
+    # Black is "dark AND flat", not "dark AND low saturation" - see lower_black above.
+    mask_black = cv2.bitwise_and(mask_black, achromatic)
+
     mask_red = clean(mask_red)
     mask_green = clean(mask_green)
     mask_black = clean(mask_black)
@@ -354,19 +404,22 @@ def detect_color(roi):
     # cannot win, unless we are bench testing up close.
     black_max = None if CLOSE_RANGE_TEST else roi_area * BLACK_MAX_AREA_FRAC
 
-    red_area, _, red_why = _best_blob(mask_red)
-    green_area, _, green_why = _best_blob(mask_green)
-    black_area, black_extent, black_why = _best_blob(mask_black, black_max, shape_gated=True)
+    red_area, _, red_why, red_cnt = _best_blob(mask_red)
+    green_area, _, green_why, green_cnt = _best_blob(mask_green)
+    black_area, black_extent, black_why, black_cnt = _best_blob(
+        mask_black, black_max, shape_gated=True)
 
     diag = {"KIRMIZI": red_why, "YESIL": green_why, "SIYAH": black_why}
+    cnts = {"KIRMIZI": red_cnt, "YESIL": green_cnt, "SIYAH": black_cnt}
 
     areas = {"KIRMIZI": red_area, "YESIL": green_area, "SIYAH": black_area}
     max_area_label = max(areas, key=areas.get)
     max_area_value = areas[max_area_label]
 
     if max_area_value > 0:
-        return max_area_label, max_area_value / roi_area, max_area_value, black_extent, diag
-    return "BELIRSIZ", 0.0, 0.0, 0.0, diag
+        return (max_area_label, max_area_value / roi_area, max_area_value,
+                black_extent, diag, cnts[max_area_label])
+    return "BELIRSIZ", 0.0, 0.0, 0.0, diag, None
 
 
 # --- Logging ---
@@ -414,6 +467,86 @@ def save_capture(frame, color):
         capture_count += 1
     except Exception:
         pass
+
+
+class AsyncVideoWriter(threading.Thread):
+    """
+    Background MP4 writer. Encoding on the capture thread would throttle detection, so
+    frames go through a bounded queue and are dropped when the disk cannot keep up - a
+    dropped frame costs a gap in the review video, a stalled loop costs detections.
+    """
+
+    def __init__(self, filename, fps, size, max_queue=120):
+        super().__init__(daemon=True)
+        self.filename = filename
+        self.fps = fps
+        self.size = size
+        self.q = queue.Queue(maxsize=max_queue)
+        self.running = True
+        self.dropped = 0
+        self.written = 0
+
+    def enqueue(self, frame):
+        if not self.running:
+            return
+        try:
+            self.q.put_nowait(frame)
+        except queue.Full:
+            self.dropped += 1
+
+    def run(self):
+        writer = cv2.VideoWriter(self.filename, cv2.VideoWriter_fourcc(*'mp4v'),
+                                 self.fps, self.size)
+        if not writer.isOpened():
+            print(f"[VIDEO] Could not open {self.filename} for writing.")
+            self.running = False
+            return
+        while self.running or not self.q.empty():
+            try:
+                frame = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            writer.write(frame)
+            self.written += 1
+        writer.release()
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=5.0)
+        print(f"[VIDEO] {self.filename}: {self.written} frames written, {self.dropped} dropped.")
+
+
+def draw_overlay(frame, label, conf, area, extent, chroma, scene, diag, contour):
+    """Burn the decision into the frame so the recording is reviewable on its own."""
+    colours = {"KIRMIZI": (0, 0, 255), "YESIL": (0, 255, 0),
+               "SIYAH": (255, 255, 255), "BELIRSIZ": (0, 200, 255)}
+    col = colours.get(label, (200, 200, 200))
+
+    if contour is not None:
+        cv2.drawContours(frame, [contour], -1, col, 3)
+        x, y, w_, h_ = cv2.boundingRect(contour)
+        cv2.rectangle(frame, (x, y), (x + w_, y + h_), col, 1)
+
+    lines = [f"{label}  conf={conf:.3f}  area={area:.0f}px"]
+    if label == "SIYAH":
+        lines.append(f"extent={extent:.2f} (min {BLACK_MIN_EXTENT})")
+    if chroma:
+        lines.append(f"chroma HSV H={chroma[0]} S={chroma[1]} V={chroma[2]} ({chroma[3]}%)")
+    else:
+        lines.append("chroma: yok")
+    lines.append(f"scene HSV {scene}")
+    if label == "BELIRSIZ":
+        for c in ("KIRMIZI", "YESIL", "SIYAH"):
+            if diag.get(c):
+                lines.append(f"  {c}: {diag[c]}")
+
+    y0 = 26
+    for i, t in enumerate(lines):
+        cv2.putText(frame, t, (12, y0 + i * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, t, (12, y0 + i * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    col if i == 0 else (230, 230, 230), 1, cv2.LINE_AA)
+    return frame
 
 
 last_sent_label = None
@@ -499,9 +632,19 @@ diag = {}
 last_scene_t = 0.0
 last_display_t = 0.0
 last_fail_capture = 0.0
+last_video_t = 0.0
 cam_fail_count = 0
 bad_exposure_since = 0.0
 recalibrations = 0
+
+video_writer = None
+if RECORD_VIDEO and cap is not None:
+    _vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or CAM_WIDTH
+    _vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or CAM_HEIGHT
+    _vname = f"renk_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+    video_writer = AsyncVideoWriter(_vname, VIDEO_FPS, (_vw, _vh), VIDEO_MAX_QUEUE)
+    video_writer.start()
+    print(f"[VIDEO] Recording to {_vname} at {VIDEO_FPS:.0f} fps ({_vw}x{_vh})")
 
 
 def clear_screen():
@@ -571,7 +714,7 @@ try:
         y1 = int((1 + ROI_RATIO) / 2 * h)
         roi = frame[y0:y1, x0:x1]
 
-        current_color, current_conf, current_area, current_extent, diag = detect_color(roi)
+        current_color, current_conf, current_area, current_extent, diag, win_cnt = detect_color(roi)
 
         # Background survey: median H/S/V of the ROI. With no plaques available to
         # calibrate against, knowing exactly what the concrete and its shadows read is the
@@ -639,6 +782,15 @@ try:
         if current_status == "AKTİF":
             send_serial_message(last_detected_color)
 
+        # Video: the overlay is drawn on a copy so the saved captures and the detector
+        # itself keep seeing clean pixels.
+        if video_writer is not None and (now - last_video_t) >= (1.0 / VIDEO_FPS):
+            last_video_t = now
+            vis = draw_overlay(frame.copy(), current_color, current_conf, current_area,
+                               current_extent, chroma_stats, scene_stats, diag,
+                               None if win_cnt is None else win_cnt + np.array([[x0, y0]]))
+            video_writer.enqueue(vis)
+
         # Terminal refresh was redrawing the whole screen every iteration (~100 Hz).
         if now - last_display_t >= DISPLAY_INTERVAL_S:
             last_display_t = now
@@ -683,6 +835,8 @@ try:
 except KeyboardInterrupt:
     print("\nProgram terminated by user.")
 finally:
+    if video_writer is not None:
+        video_writer.stop()
     if cap is not None:
         cap.release()
     if log_file is not None:
