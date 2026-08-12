@@ -3,10 +3,16 @@
 import cv2
 import numpy as np
 import time
+import datetime
+import csv
 import serial
 import json
 import os
 import Jetson.GPIO as GPIO
+
+# ==========================================================================
+# TUNABLES - hepsi burada, sahada tek yerden ayarlanır
+# ==========================================================================
 
 # --- GPIO and Telemetry Settings ---
 # BCM pin numaralandırması kullanılıyor. Orin Nano'da 40-pin header'a göre doğru pini seçtiğinden emin ol.
@@ -17,33 +23,151 @@ TRIGGER_PIN = 17
 TELEMETRY_PORT = "/dev/ttyUSB0"
 TELEMETRY_BAUD = 57600
 
-# Create Serial connection. Does not stop the code from running in case of an error.
+# --- Camera ---
+CAM_INDEX = 0
+# 640x480 -> 1280x720. At 10 m with the Brio's ~70 deg horizontal FOV a 50x50 cm plaque is
+# about 45 px across here, versus 12 px at the old 320x240 processing size. 12 px is too
+# small to judge shape and barely survives the morphology step.
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
+CAM_FPS = 30
+
+# Exposure/white balance are LOCKED after a short auto-settle (see open_camera).
+# Auto WB drifts the hue of everything as the scene content changes, and auto exposure
+# brightens the frame when a dark plaque fills it - which is exactly when we need the
+# black plaque to still read as dark.
+AE_SETTLE_S = 2.0            # how long to let auto exposure/WB settle before locking
+FALLBACK_EXPOSURE = 100      # used only if the driver will not report its own value
+FALLBACK_WB_TEMPERATURE = 5500
+
+# --- Detection geometry ---
+ROI_RATIO = 0.7              # centre crop used for detection
+
+# Absolute minimum blob size, in pixels. This used to be 0.5% of the ROI AREA, which
+# scales with resolution - so raising the camera resolution moved the threshold by exactly
+# the same factor and bought no extra range at all (measured: 9.0 m at 320x240 vs 9.5 m at
+# 4K). An absolute floor is what actually turns resolution into detection range.
+# 20x20 px = 400 px. At 1280x720 that corresponds to roughly 22 m altitude.
+MIN_BLOB_AREA_PX = 400
+# Anything larger than this fraction of the ROI cannot be a 50 cm plaque at flight altitude
+# (it is a building shadow, the horizon, or a large stain).
+MAX_BLOB_AREA_FRAC = 0.25
+
+# --- Black plaque shape gate (see detect_color) ---
+# Concrete makes red/green trivial to separate by saturation, but it makes BLACK hard:
+# a shadow on concrete and the RAL 9005 plaque land at almost the same brightness, because
+# concrete/plaque albedo (~0.30 / ~0.045) differ by about the same factor as sun/shade.
+# No brightness threshold can split them, so the black mask gets two cheap shape checks.
+BLACK_MIN_EXTENT = 0.75      # contour area / bounding-box area. Square ~0.95, drone shadow ~0.3
+BLACK_REJECT_BORDER = True   # drop blobs touching the frame edge (large ground shadows)
+
+# --- Logging ---
+LOG_ENABLED = True
+LOG_CSV = "color_log.csv"
+CAPTURE_DIR = "captures"
+MAX_CAPTURES = 300           # disk guard
+SCENE_STATS_INTERVAL_S = 2.0 # background survey cadence
+
+# --- Terminal ---
+DISPLAY_INTERVAL_S = 0.2     # the old code redrew the whole screen at ~100 Hz
+
+# ==========================================================================
+
+
+# --- Serial ---
+# write_timeout matters: without it a blocked write hangs this loop forever and the drone
+# silently stops reporting. Same failure mode that was breaking the boat's telemetry.
 master = None
 try:
-    master = serial.Serial(TELEMETRY_PORT, TELEMETRY_BAUD, timeout=1)
+    master = serial.Serial(TELEMETRY_PORT, TELEMETRY_BAUD, timeout=1, write_timeout=0.5)
     print("Serial connection established successfully.")
 except Exception as e:
     print(f"Serial connection failed: {e}")
     master = None
 
-# --- Camera and Image Settings ---
-# Jetson üzerinde USB kameralar V4L2 üzerinden cv2.VideoCapture(0) ile sorunsuz okunur.
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-# Adjust this variable to True/False according to the environment
-USE_OUTDOOR = False
+# --- Camera ---
+def open_camera():
+    """
+    Open the camera, then LOCK exposure and white balance.
 
-# Using your preferred color ranges
+    Rather than hardcoding an exposure value (which would be wrong for every lighting
+    condition except the one it was picked in), auto exposure/WB are left on for
+    AE_SETTLE_S, the values the driver converged on are read back, and the camera is then
+    switched to manual with those values. So it adapts to the day but cannot drift mid-flight.
+
+    Ordering matters on V4L2: FOURCC before resolution, and the AUTO_* switch before the
+    manual value, otherwise the driver ignores the setting.
+    """
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        return None
+
+    # MJPG is required for 720p+ over USB; the default YUYV runs out of bandwidth.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep latency down on a moving platform
+    except Exception:
+        pass
+
+    # 1. Let auto exposure / auto WB find the scene.
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)   # V4L2: 0.75 = aperture priority (auto)
+    t0 = time.time()
+    while time.time() - t0 < AE_SETTLE_S:
+        cap.read()
+
+    # 2. Read back what it settled on.
+    settled_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+    settled_wb = cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
+    if not settled_exp or settled_exp <= 0:
+        settled_exp = FALLBACK_EXPOSURE
+    if not settled_wb or settled_wb <= 0:
+        settled_wb = FALLBACK_WB_TEMPERATURE
+
+    # 3. Lock.
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # V4L2: 0.25 = manual
+    cap.set(cv2.CAP_PROP_EXPOSURE, settled_exp)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    cap.set(cv2.CAP_PROP_WB_TEMPERATURE, settled_wb)
+
+    print(f"[CAM] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} "
+          f"| exposure locked at {settled_exp:.0f} (auto={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f}) "
+          f"| WB locked at {settled_wb:.0f}")
+    return cap
+
+
+cap = open_camera()
+if cap is None:
+    print("[CAM][ERROR] Camera could not be opened at startup.")
+
+
+# --- Colour ranges (HSV, OpenCV convention: H 0-179, S 0-255, V 0-255) ---
+# Ground is concrete, so there is no vegetation to confuse the green channel and concrete
+# itself is achromatic (S ~20-60). That makes saturation a very clean discriminator for the
+# two chromatic plaques, and it is the brightness thresholds that need the care.
+USE_OUTDOOR = True
+
 if USE_OUTDOOR:
-    lower_red1, upper_red1 = (0, 140, 110), (10, 255, 255)
-    lower_red2, upper_red2 = (170, 140, 110), (179, 255, 255)
-    lower_green, upper_green = (40, 120, 110), (85, 255, 255)
-    lower_black, upper_black = (0, 0, 0), (179, 70, 45)
+    # RED - RAL 3026. Lands around H 0-5, S 220-255. The 170-179 band catches the hue wrap.
+    lower_red1, upper_red1 = (0, 150, 60), (10, 255, 255)
+    lower_red2, upper_red2 = (170, 150, 60), (179, 255, 255)
+
+    # GREEN - RAL 6037 computes to H ~70-78.5. The old 40-85 window left only 6.5 deg of
+    # headroom above the target while wasting 30 deg below it; 55-95 centres it properly.
+    lower_green, upper_green = (55, 150, 60), (95, 255, 255)
+
+    # BLACK - RAL 9005. The old V ceiling of 45 was almost certainly rejecting the plaque
+    # outright: with exposure set for sunlit concrete the plaque is expected around V 54-76.
+    # Raising the ceiling to 85 lets it in - and also lets shadowed concrete (V ~62-87) in,
+    # which is why the shape gate in detect_color is not optional.
+    lower_black, upper_black = (0, 0, 0), (179, 80, 85)
 else:
+    # Indoor set, kept for bench testing. Not tuned.
     lower_red1, upper_red1 = (0, 120, 80), (10, 255, 255)
     lower_red2, upper_red2 = (170, 120, 80), (179, 255, 255)
     lower_green, upper_green = (36, 80, 80), (85, 255, 255)
@@ -59,6 +183,46 @@ def clean(mask):
     return mask
 
 
+def _best_blob(mask, max_area, shape_gated=False):
+    """
+    Largest acceptable contour in `mask`. Returns (area, extent).
+
+    shape_gated=True applies the two cheap checks that separate a 50x50 cm plaque from a
+    shadow. They are applied to the BLACK mask only - red and green already separate from
+    concrete by saturation alone, so gating them would add risk for no benefit.
+
+      extent = contour area / bounding-box area
+        square plaque ~0.95, drone's own shadow ~0.3 (body + four arms + prop rings)
+      border contact
+        the plaque is a discrete object in frame; building/pole/operator shadows usually
+        run off the edge
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = mask.shape[:2]
+
+    best_area = 0.0
+    best_extent = 0.0
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < MIN_BLOB_AREA_PX or area > max_area:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(c)
+        extent = area / float(bw * bh) if bw * bh > 0 else 0.0
+
+        if shape_gated:
+            if extent < BLACK_MIN_EXTENT:
+                continue
+            if BLACK_REJECT_BORDER and (x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1):
+                continue
+
+        if area > best_area:
+            best_area = area
+            best_extent = extent
+
+    return best_area, best_extent
+
+
 def detect_color(roi):
     """Detects the most dominant color (Black, Red, Green or Undefined) in the ROI."""
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -71,26 +235,67 @@ def detect_color(roi):
     mask_green = clean(mask_green)
     mask_black = clean(mask_black)
 
-    min_area = int(roi.shape[0] * roi.shape[1] * 0.005)
+    roi_area = roi.shape[0] * roi.shape[1]
+    max_area = roi_area * MAX_BLOB_AREA_FRAC
 
-    def max_contour_area(mask):
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return 0
-        return max((cv2.contourArea(c) for c in cnts))
-
-    red_area = max_contour_area(mask_red)
-    green_area = max_contour_area(mask_green)
-    black_area = max_contour_area(mask_black)
+    red_area, _ = _best_blob(mask_red, max_area)
+    green_area, _ = _best_blob(mask_green, max_area)
+    black_area, black_extent = _best_blob(mask_black, max_area, shape_gated=True)
 
     areas = {"KIRMIZI": red_area, "YESIL": green_area, "SIYAH": black_area}
     max_area_label = max(areas, key=areas.get)
     max_area_value = areas[max_area_label]
 
-    if max_area_value > min_area:
-        return max_area_label, max_area_value / (roi.shape[0] * roi.shape[1])
-    else:
-        return "BELIRSIZ", 0.0
+    if max_area_value > 0:
+        return max_area_label, max_area_value / roi_area, max_area_value, black_extent
+    return "BELIRSIZ", 0.0, 0.0, 0.0
+
+
+# --- Logging ---
+# Without the plaques in hand the thresholds above are reasoned, not measured. This log is
+# how they get corrected after the first real flight: it records what was decided, and the
+# scene statistics record what the concrete and its shadows actually look like - which is
+# half of the calibration and needs no plaques at all.
+log_writer = None
+log_file = None
+capture_count = 0
+if LOG_ENABLED:
+    try:
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        new_file = not os.path.exists(LOG_CSV)
+        log_file = open(LOG_CSV, "a", newline="", encoding="utf-8")
+        log_writer = csv.writer(log_file)
+        if new_file:
+            log_writer.writerow(["time", "status", "color", "conf", "area_px",
+                                 "black_extent", "scene_med_h", "scene_med_s", "scene_med_v"])
+    except Exception as e:
+        print(f"[LOG] Could not open {LOG_CSV}: {e}")
+        log_writer = None
+
+
+def log_row(status, color, conf, area_px, extent, scene):
+    if log_writer is None:
+        return
+    try:
+        log_writer.writerow([datetime.datetime.now().isoformat(timespec="milliseconds"),
+                             status, color, f"{conf:.4f}", f"{area_px:.0f}",
+                             f"{extent:.2f}", scene[0], scene[1], scene[2]])
+        log_file.flush()
+    except Exception:
+        pass
+
+
+def save_capture(frame, color):
+    global capture_count
+    if not LOG_ENABLED or capture_count >= MAX_CAPTURES:
+        return
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        cv2.imwrite(os.path.join(CAPTURE_DIR, f"{ts}_{color}.jpg"), frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        capture_count += 1
+    except Exception:
+        pass
 
 
 last_sent_label = None
@@ -167,6 +372,13 @@ last_status = "Boşta"
 
 last_detected_color = "BELIRSIZ"
 last_detected_conf = 0.0
+last_black_extent = 0.0
+last_area_px = 0.0
+
+scene_stats = (0, 0, 0)
+last_scene_t = 0.0
+last_display_t = 0.0
+cam_fail_count = 0
 
 
 def clear_screen():
@@ -206,51 +418,98 @@ try:
         if current_status != last_status:
             last_status = current_status
 
-        ok, frame = cap.read()
+        # A single dropped USB frame used to `break` out of the loop and end the mission.
+        # Retry, and rebuild the capture (which re-applies the exposure/WB lock) if the
+        # camera really has gone away.
+        ok, frame = (False, None)
+        if cap is not None:
+            ok, frame = cap.read()
         if not ok:
-            print("\nCamera could not be read. Terminating program.")
-            break
+            cam_fail_count += 1
+            if cam_fail_count >= 15:
+                print("\n[CAM] Read failing - reopening camera...")
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                cap = open_camera()
+                cam_fail_count = 0
+            time.sleep(0.05)
+            continue
+        cam_fail_count = 0
 
-        small_frame = cv2.resize(frame, (320, 240))
-        h, w = small_frame.shape[:2]
-        roi_ratio = 0.7
-        x0 = int((1 - roi_ratio) / 2 * w)
-        x1 = int((1 + roi_ratio) / 2 * w)
-        y0 = int((1 - roi_ratio) / 2 * h)
-        y1 = int((1 + roi_ratio) / 2 * h)
-        roi = small_frame[y0:y1, x0:x1]
+        # No downscale: the frame is processed at capture resolution. Resizing to 320x240
+        # here was throwing away every pixel the camera setting above buys us.
+        h, w = frame.shape[:2]
+        x0 = int((1 - ROI_RATIO) / 2 * w)
+        x1 = int((1 + ROI_RATIO) / 2 * w)
+        y0 = int((1 - ROI_RATIO) / 2 * h)
+        y1 = int((1 + ROI_RATIO) / 2 * h)
+        roi = frame[y0:y1, x0:x1]
 
-        current_color, current_conf = detect_color(roi)
+        current_color, current_conf, current_area, current_extent = detect_color(roi)
 
-        if current_color != last_detected_color:
-            last_detected_color = current_color
-            last_detected_conf = current_conf
+        # Background survey: median H/S/V of the ROI. With no plaques available to
+        # calibrate against, knowing exactly what the concrete and its shadows read is the
+        # half of the calibration that can still be done - it tells us what the thresholds
+        # must exclude.
+        now = time.time()
+        if now - last_scene_t >= SCENE_STATS_INTERVAL_S:
+            last_scene_t = now
+            hsv_small = cv2.cvtColor(cv2.resize(roi, (160, 120)), cv2.COLOR_BGR2HSV)
+            scene_stats = tuple(int(v) for v in np.median(hsv_small.reshape(-1, 3), axis=0))
+
+        colour_changed = current_color != last_detected_color
+        last_detected_color = current_color
+        # These used to update only when the colour CHANGED, so the confidence on screen
+        # was a stale value from whenever the last transition happened.
+        last_detected_conf = current_conf
+        last_black_extent = current_extent
+        last_area_px = current_area
+
+        if colour_changed:
+            log_row(current_status, current_color, current_conf, current_area,
+                    current_extent, scene_stats)
+            save_capture(frame, current_color)
 
         if current_status == "AKTİF":
             send_serial_message(last_detected_color)
 
-        # Temiz ve hızlı ekran yenileme (ANSI escape kodları ile)
-        print("\033[H\033[J", end="")
-        print("-------------------------------------")
-        print(" Live Color Detection and Status Screen ")
-        print("-------------------------------------")
-        print(f"Last Detected Color: {last_detected_color}")
-        print(f"Confidence: {last_detected_conf:.3f}")
-        print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
-        print(f"Pulse Width (µs): {pulse_width_us:.2f}")
-        print(f"RC Signal: {'OK' if rc_link_ok else 'NO SIGNAL'}")
+        # Terminal refresh was redrawing the whole screen every iteration (~100 Hz).
+        if now - last_display_t >= DISPLAY_INTERVAL_S:
+            last_display_t = now
+            print("\033[H\033[J", end="")
+            print("-------------------------------------")
+            print(" Live Color Detection and Status Screen ")
+            print("-------------------------------------")
+            print(f"Last Detected Color: {last_detected_color}")
+            print(f"Confidence: {last_detected_conf:.3f}   Area: {last_area_px:.0f} px")
+            if last_detected_color == "SIYAH":
+                print(f"Black extent: {last_black_extent:.2f} (min {BLACK_MIN_EXTENT})")
+            print(f"Scene median HSV: {scene_stats}")
+            print(f"Frame: {w}x{h}  ROI: {x1-x0}x{y1-y0}")
+            print(f"RC Trigger Pin: GPIO {TRIGGER_PIN} (BCM)")
+            print(f"Pulse Width (µs): {pulse_width_us:.2f}")
+            print(f"RC Signal: {'OK' if rc_link_ok else 'NO SIGNAL'}")
 
-        if master and master.is_open:
-            print(f"Serial Connection: OK ({TELEMETRY_PORT})")
-        else:
-            print(f"Serial Connection: ERROR")
+            if master and master.is_open:
+                print(f"Serial Connection: OK ({TELEMETRY_PORT})")
+            else:
+                print(f"Serial Connection: ERROR")
 
-        print(f"\nRC Trigger Status: {current_status}")
+            print(f"\nRC Trigger Status: {current_status}")
 
         time.sleep(0.01)
 
 except KeyboardInterrupt:
     print("\nProgram terminated by user.")
 finally:
-    cap.release()
+    if cap is not None:
+        cap.release()
+    if log_file is not None:
+        try:
+            log_file.close()
+        except Exception:
+            pass
     GPIO.cleanup()  # Program kapanırken pinleri güvenli hale getir
