@@ -32,25 +32,25 @@ CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 CAM_FPS = 30
 
-# Exposure/white balance are LOCKED after a short auto-settle (see open_camera).
-# Auto WB drifts the hue of everything as the scene content changes, and auto exposure
-# brightens the frame when a dark plaque fills it - which is exactly when we need the
-# black plaque to still read as dark.
-AE_SETTLE_S = 2.0            # how long to let auto exposure/WB settle before locking
-FALLBACK_EXPOSURE = 100      # used only if the driver will not report its own value
-FALLBACK_WB_TEMPERATURE = 5500
-
-# Locking once at startup is right for a flight, but wrong if the program is started in
-# different light from where it ends up - booting indoors and then carrying the drone out
-# into the sun leaves the frame blown out, which desaturates every colour and makes
-# everything read BELIRSIZ. Re-settle if the scene stays out of a sane band.
-EXPOSURE_RELOCK = True
-RELOCK_V_HIGH = 235          # blown out
-RELOCK_V_LOW = 20            # crushed
-RELOCK_AFTER_S = 4.0
+# Exposure handling. See calibrate_exposure() - the camera is MEASURED, not trusted.
+AE_SETTLE_S = 1.5            # let the driver's own auto exposure settle before measuring
+TARGET_V = 120               # aim for roughly mid grey
+V_TOO_BRIGHT = 235           # above this the frame is blown out and every colour desaturates
+V_TOO_DARK = 25              # below this nothing is distinguishable
+# Manual exposure candidates, swept high to low. Units differ between drivers (usually
+# 100 us steps), which is exactly why the value is chosen by measurement rather than
+# calculation.
+EXPOSURE_CANDIDATES = [1250, 640, 320, 160, 80, 40, 20, 10, 5, 3]
+# If the picture goes bad mid-run, recalibrate - but only a few times, so a camera that
+# simply cannot be controlled does not spin forever printing messages.
+MAX_RECALIBRATIONS = 3
+RECALIBRATE_AFTER_S = 5.0
 
 # --- Detection geometry ---
-ROI_RATIO = 0.7              # centre crop used for detection
+# Whole frame. The centre crop was throwing away the outer 30% for no good reason - if the
+# plaque is anywhere in view we want it. Set below 1.0 only if something at the edge of the
+# frame is causing false positives.
+ROI_RATIO = 1.0
 
 # Absolute minimum blob size, in pixels. This used to be 0.5% of the ROI AREA, which
 # scales with resolution - so raising the camera resolution moved the threshold by exactly
@@ -114,23 +114,91 @@ except Exception as e:
 
 
 # --- Camera ---
+def _median_v(cap, n=4):
+    """Median V of the last few frames, or -1 if nothing could be read."""
+    vals = []
+    for _ in range(n):
+        ok, f = cap.read()
+        if ok and f is not None:
+            small = cv2.resize(f, (160, 120))
+            vals.append(float(np.median(cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 2])))
+    return float(np.median(vals)) if vals else -1.0
+
+
+def _set_auto_exposure(cap, auto):
+    """
+    Switch the driver's auto exposure on or off.
+
+    OpenCV's encoding for CAP_PROP_AUTO_EXPOSURE is not stable across versions: older
+    builds used 0.25 (manual) / 0.75 (auto), newer ones pass the raw V4L2 control value
+    where 1 is Manual Mode and 3 is Aperture Priority. Writing 0.75 to a modern build
+    rounds to 1 - MANUAL - so the camera silently kept whatever exposure it happened to
+    have. That is what produced the blown-out V=254 frames in which no colour has any
+    saturation left and every plaque reads BELIRSIZ.
+    Write both encodings; the one the build does not understand is a harmless no-op.
+    """
+    for v in ((3, 0.75) if auto else (1, 0.25)):
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, v)
+
+
+def calibrate_exposure(cap):
+    """
+    Get a usable picture, whatever the driver does.
+
+    Ask for auto exposure first and MEASURE the result. If the frame is blown out or
+    crushed, take manual control and sweep EXPOSURE_CANDIDATES, keeping whichever lands
+    closest to TARGET_V. Measuring instead of calculating means this does not depend on
+    knowing the driver's exposure units or its control encoding.
+
+    Returns a short description for the status line.
+    """
+    _set_auto_exposure(cap, True)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+    t0 = time.time()
+    while time.time() - t0 < AE_SETTLE_S:
+        cap.read()
+
+    v = _median_v(cap)
+    if V_TOO_DARK <= v <= V_TOO_BRIGHT:
+        return f"auto (V={v:.0f})"
+
+    print(f"[CAM] Driver auto exposure gave V={v:.0f} - taking manual control and sweeping.")
+    _set_auto_exposure(cap, False)
+
+    best = None
+    for e in EXPOSURE_CANDIDATES:
+        cap.set(cv2.CAP_PROP_EXPOSURE, e)
+        for _ in range(3):           # let the change take effect
+            cap.read()
+        mv = _median_v(cap, n=3)
+        if mv < 0:
+            continue
+        print(f"[CAM]   exposure {e:>5} -> V={mv:.0f}")
+        if best is None or abs(mv - TARGET_V) < abs(best[1] - TARGET_V):
+            best = (e, mv)
+        if mv < V_TOO_DARK:          # already too dark, going lower will not help
+            break
+
+    if best is None:
+        return "manual sweep failed"
+
+    cap.set(cv2.CAP_PROP_EXPOSURE, best[0])
+    for _ in range(3):
+        cap.read()
+    final = _median_v(cap, n=3)
+    if final > V_TOO_BRIGHT or final < V_TOO_DARK:
+        return f"UNCONTROLLABLE (best V={final:.0f}) - check 'v4l2-ctl -d /dev/video0 -l'"
+    return f"manual exposure={best[0]} (V={final:.0f})"
+
+
 def open_camera():
-    """
-    Open the camera, then LOCK exposure and white balance.
-
-    Rather than hardcoding an exposure value (which would be wrong for every lighting
-    condition except the one it was picked in), auto exposure/WB are left on for
-    AE_SETTLE_S, the values the driver converged on are read back, and the camera is then
-    switched to manual with those values. So it adapts to the day but cannot drift mid-flight.
-
-    Ordering matters on V4L2: FOURCC before resolution, and the AUTO_* switch before the
-    manual value, otherwise the driver ignores the setting.
-    """
+    """Open the camera at the requested format and get the exposure into a usable range."""
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         return None
 
     # MJPG is required for 720p+ over USB; the default YUYV runs out of bandwidth.
+    # Ordering matters on V4L2: FOURCC before resolution.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
@@ -140,31 +208,10 @@ def open_camera():
     except Exception:
         pass
 
-    # 1. Let auto exposure / auto WB find the scene.
-    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)   # V4L2: 0.75 = aperture priority (auto)
-    t0 = time.time()
-    while time.time() - t0 < AE_SETTLE_S:
-        cap.read()
-
-    # 2. Read back what it settled on.
-    settled_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
-    settled_wb = cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
-    if not settled_exp or settled_exp <= 0:
-        settled_exp = FALLBACK_EXPOSURE
-    if not settled_wb or settled_wb <= 0:
-        settled_wb = FALLBACK_WB_TEMPERATURE
-
-    # 3. Lock.
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # V4L2: 0.25 = manual
-    cap.set(cv2.CAP_PROP_EXPOSURE, settled_exp)
-    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    cap.set(cv2.CAP_PROP_WB_TEMPERATURE, settled_wb)
+    how = calibrate_exposure(cap)
 
     print(f"[CAM] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} "
-          f"| exposure locked at {settled_exp:.0f} (auto={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f}) "
-          f"| WB locked at {settled_wb:.0f}")
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} | exposure: {how}")
     return cap
 
 
@@ -454,6 +501,7 @@ last_display_t = 0.0
 last_fail_capture = 0.0
 cam_fail_count = 0
 bad_exposure_since = 0.0
+recalibrations = 0
 
 
 def clear_screen():
@@ -548,25 +596,24 @@ try:
             else:
                 chroma_stats = None
 
-            # Exposure is locked once at startup, which is right for a flight but wrong if
-            # the program was started in different light from where it ends up (e.g. booted
-            # indoors, then carried out into the sun). A blown-out frame desaturates every
-            # colour and a crushed one hides them all, so re-settle when the scene leaves a
-            # sane brightness band for long enough.
-            if EXPOSURE_RELOCK and cap is not None:
+            # Recalibrate if the picture goes bad mid-run (started indoors, flown out into
+            # the sun). Bounded: a camera whose exposure genuinely cannot be driven must
+            # not turn this into an endless reopen loop spamming the terminal, which is
+            # exactly what the first version did.
+            if cap is not None and recalibrations < MAX_RECALIBRATIONS:
                 v_med = scene_stats[2]
-                if v_med > RELOCK_V_HIGH or v_med < RELOCK_V_LOW:
+                if v_med > V_TOO_BRIGHT or v_med < V_TOO_DARK:
                     if bad_exposure_since == 0.0:
                         bad_exposure_since = now
-                    elif now - bad_exposure_since >= RELOCK_AFTER_S:
-                        print(f"\n[CAM] Scene median V={v_med} out of range - re-locking exposure...")
-                        try:
-                            cap.release()
-                        except Exception:
-                            pass
-                        cap = open_camera()
+                    elif now - bad_exposure_since >= RECALIBRATE_AFTER_S:
+                        recalibrations += 1
+                        print(f"\n[CAM] Scene median V={v_med} - recalibrating exposure "
+                              f"({recalibrations}/{MAX_RECALIBRATIONS})...")
+                        print(f"[CAM] {calibrate_exposure(cap)}")
                         bad_exposure_since = 0.0
-                        continue
+                        if recalibrations >= MAX_RECALIBRATIONS:
+                            print("[CAM] Giving up on automatic exposure - will keep running "
+                                  "with whatever the camera gives.")
                 else:
                     bad_exposure_since = 0.0
 
