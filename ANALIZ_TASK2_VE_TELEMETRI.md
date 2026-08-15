@@ -411,6 +411,59 @@ Konum hatasını düşürmenin üç yolu, **hiçbiri uygulanmadı**:
 
 ---
 
+## 12. SIRADAKİ İŞ — GCS'TEN RÖLE KONTROLÜ (tasarım, henüz yazılmadı)
+
+Motor gücünü kesip veren röle şu an **sadece RC kumandadan** kontrol ediliyor. GCS'e de aç/kapat butonu eklenecek; **kumanda yolu aynen kalacak.**
+
+### Mevcut ArduPilot yapılandırması
+
+```
+RC7_OPTION       = 28   kumanda 7. kanal anahtarı = "Röle Aç/Kapa"
+RELAY1_PIN       = 50   röle 1 = AUX1
+SERVO9_FUNCTION  = -1   AUX1 motor sürmeyi bırakıp GPIO oldu
+RELAY1_FUNCTION  = 1    röle fonksiyonu aktif
+```
+
+### İki yol birbirini etkiler mi — hayır
+
+ArduPilot'ta RC yardımcı fonksiyonları **kenar tetiklemelidir**: anahtar pozisyonu *değiştiğinde* çalışır, sürekli dayatmaz. Sahada doğrulandı — kumanda kapatılınca röle açık kalıyor.
+
+MAVLink `DO_SET_RELAY` de aynı durum değişkenine yazar. **İkisi aynı anahtarı çeviriyor, son yazan kazanır.**
+
+**Üç istisna (test edilmeli):**
+
+| Durum | Beklenen |
+|---|---|
+| Cube yeniden başlarsa | Açılışta anahtar pozisyonundan okunur → kumanda kazanır |
+| RC sinyali kesilip dönerse | ArduPilot anahtarları yeniden değerlendirir; sürüme göre değişir |
+| Röle durumu geri okunamıyorsa | ArduPilot 4.4+ `RELAY_STATUS` (msg 376) yollar. Eski sürümde GCS ancak "son gönderilen komut"u gösterir — kumandadan değiştirilirse ekran yanlış olur |
+
+### Tasarlanan yol
+
+```
+GCS butonu → {"target_id":1,"cmd":"set_relay","value":0|1}
+           → CommandReceiver → command_queue
+           → nav_process → MAV_CMD_DO_SET_RELAY → Cube
+```
+
+Yeni altyapı gerekmiyor; `set_target_color` ile aynı boru hattı.
+
+### Yazmadan önce halledilecekler
+
+| # | Konu | Neden |
+|---|---|---|
+| 1 | **`target_id` filtresi** — `nav_process` şu an gelen komutu `target_id`'ye bakmadan işliyor | Drone'a (id 3) giden röle komutunu tekne de uygular |
+| 2 | **KAPAT onaysız, AÇ onaylı** | Kapatmak güvenli yön; açmak motorları çalıştırabilir |
+| 3 | **Komut tekrarı veya `COMMAND_ACK`** | `command_long_send` şu an ACK beklemiyor; kayıp komut fark edilmez |
+| 4 | **Durum göstergesi** | `RELAY_STATUS` varsa gerçek durum, yoksa açıkça "son komut" diye etiketlensin |
+| 5 | **Acil durdurma ile ilişki** | Mevcut "ACİL DURDUR" sadece `shutdown=True` yapıp thruster'ları nötrlüyor, **gücü kesmiyor**. Röleyi de kesmesi tartışılacak |
+
+### Değişmeyecek ilke
+
+Kumandadaki anahtar **Jetson'dan tamamen bağımsız donanım yolu**. GCS butonu nav_process'e bağımlı, o takılırsa komut gitmez. Bu yüzden **asıl acil durdurma kumanda olarak kalır**, GCS kolaylıktır.
+
+---
+
 ## KAPANIŞ NOTU
 
 Bu süreçte en çok tekrar eden hata, **yanlış istatistiğe bakmak** oldu: şişirme değeri iz-içi saçılmadan ayarlandı ve tekne şamandıralara çarptı. Doğru sayı (izler arası fark) ancak recorder'a kümeleme eklenince ortaya çıktı.
