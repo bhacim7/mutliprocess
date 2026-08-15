@@ -82,6 +82,29 @@ HEADING_SOURCE = 'ZED'
 FC_PORT = "/dev/ttyACM0"  # OrangeCube Uçuş Kontrolcüsü Portu
 FC_BAUD = 57600
 
+# --- MOTOR POWER RELAY ---
+# Cube side (already set, nothing new needed for the GCS path):
+#   SERVO9_FUNCTION = -1   AUX1 becomes GPIO instead of a servo output
+#   RELAY1_PIN      = 50   relay 1 is bound to AUX1
+#   RELAY1_FUNCTION = 1    relay function enabled
+#   RELAY1_DEFAULT  = 0    boots de-energised, i.e. motors unpowered  <- keep at 0
+#   RC7_OPTION      = 28   transmitter switch drives the same relay
+#
+# The first three define the relay itself; RC7_OPTION is merely one input to it and
+# MAVLink DO_SET_RELAY is another. Both write the same state inside ArduPilot, so the last
+# one wins - the transmitter keeps working exactly as before.
+#
+# MAV_CMD_DO_SET_RELAY's instance argument is ZERO based: RELAY1 is instance 0.
+RELAY_INSTANCE = 0
+# Retries, because command_long_send waits for no ACK. They stop early once RELAY_STATUS
+# confirms the vehicle agrees, and are spread over nav cycles rather than slept through.
+RELAY_COMMAND_RETRIES = 5
+RELAY_RETRY_INTERVAL_S = 0.25
+
+# Used to ignore commands addressed to another vehicle. The RFD link is shared with the
+# drone and CommandReceiver queues every line it hears, whoever it was meant for.
+VEHICLE_ID = 1
+
 LIDAR_PORT_NAME = "/dev/ttyUSB1"
 LIDAR_BAUDRATE = 1000000
 LIDAR_MAX_DIST = 10.0

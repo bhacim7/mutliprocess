@@ -120,6 +120,10 @@ def telem_worker(shared_state, command_queue, hf_data):
                     "dist": r(shared_state.get('target_dist', 0.0), 1),
                     "mod": bool(manual_mode),
                     "FPS": int(shared_state.get('camera_fps', 0) or 0),
+                    # Motor-power relay as the VEHICLE reports it (RELAY_STATUS), not as we
+                    # last commanded it - the RC transmitter can change it independently.
+                    # -1 = the vehicle never reported, so the GCS shows "unknown".
+                    "relay": int(shared_state.get('relay_state', -1)),
                 }
 
                 # 'objects' is deliberately NOT sent any more.

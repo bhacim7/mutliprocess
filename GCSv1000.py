@@ -2950,12 +2950,36 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(b_fz, 2, 0);
         g.addWidget(b_cl, 2, 1)
 
-        # 4. Acil Kapatma (KOYU KIRMIZI)
+        # 4. Röle (motor gücü) - kumandadaki anahtarla AYNI röleyi çevirir.
+        # ArduPilot'ta RC yardımcı fonksiyonu kenar tetiklemeli, MAVLink DO_SET_RELAY de
+        # aynı duruma yazar; son yazan kazanır. Kumanda yolu bundan etkilenmez ve
+        # Jetson'dan bağımsız olduğu için asıl acil durdurma olarak kalır.
+        b_relay_on = QtWidgets.QPushButton("⚡ RÖLE AÇ")
+        b_relay_on.setToolTip("Motorlara gücü verir (kumandadaki anahtarla aynı röle)")
+        b_relay_on.setStyleSheet(self._get_btn_style("#1b5e20", "#00e676", "#00c853"))
+        b_relay_on.clicked.connect(lambda: self._send_relay(bid, 1))
+
+        b_relay_off = QtWidgets.QPushButton("⛔ RÖLE KAPAT")
+        b_relay_off.setToolTip("Motorlara giden gücü keser (kumandadaki anahtarla aynı röle)")
+        b_relay_off.setStyleSheet(self._get_btn_style("#e65100", "#ffa726", "#fb8c00"))
+        b_relay_off.clicked.connect(lambda: self._send_relay(bid, 0))
+
+        g.addWidget(b_relay_on, 3, 0)
+        g.addWidget(b_relay_off, 3, 1)
+
+        # Rölenin GERÇEK durumu (aracın RELAY_STATUS mesajından). Kumandadan
+        # değiştirildiğinde de doğru kalsın diye "son gönderdiğimiz komut" gösterilmiyor.
+        self.relay_lbl = QtWidgets.QLabel("RÖLE: bilinmiyor")
+        self.relay_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self.relay_lbl.setStyleSheet("color:#90a4ae; font-weight:bold;")
+        g.addWidget(self.relay_lbl, 4, 0, 1, 2)
+
+        # 5. Acil Kapatma (KOYU KIRMIZI)
         b_estop = QtWidgets.QPushButton("🛑 ACİL DURDUR")
         b_estop.setToolTip("DİKKAT: Motorlara giden gücü anında keser!")  # <--- EKLENDİ
         b_estop.setStyleSheet(self._get_btn_style("#b71c1c", "#ff1744", "#d50000"))
         b_estop.clicked.connect(lambda: self._confirm_estop(bid))
-        g.addWidget(b_estop, 3, 0, 1, 2)
+        g.addWidget(b_estop, 5, 0, 1, 2)
 
         # 5. Bilgi
         info_text = "[↑]İleri  [↓]Geri  [←][→]Yön  [SPACE]Dur"
@@ -3117,6 +3141,22 @@ class MainWindow(QtWidgets.QMainWindow):
         s("FPS", "FPS")
         s("SENSOR_SAGLIK", "hlth")
 
+        # Role durumu: -1 = arac RELAY_STATUS bildirmiyor -> "bilinmiyor" de, tahmin etme.
+        if hasattr(self, "relay_lbl") and "relay" in d:
+            try:
+                rv = int(d.get("relay", -1))
+            except (TypeError, ValueError):
+                rv = -1
+            if rv == 1:
+                self.relay_lbl.setText("RÖLE: AÇIK (motorlarda güç var)")
+                self.relay_lbl.setStyleSheet("color:#00e676; font-weight:bold;")
+            elif rv == 0:
+                self.relay_lbl.setText("RÖLE: KAPALI")
+                self.relay_lbl.setStyleSheet("color:#ffa726; font-weight:bold;")
+            else:
+                self.relay_lbl.setText("RÖLE: bilinmiyor")
+                self.relay_lbl.setStyleSheet("color:#90a4ae; font-weight:bold;")
+
         pos = d.get("MEVCUT_KONUM", {})
         lat = pos.get("lat", 0.0)
         lon = pos.get("lon", 0.0)
@@ -3172,6 +3212,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _send_cmd(self, bid, cmd, val):
         if self.worker_1: self.worker_1.queue_send({"target_id": 1, "cmd": cmd, "value": val})
         self.on_status(f"TX[USV1]: {cmd}->{val}")
+
+    def _send_relay(self, bid, state):
+        """Motor gucu rolesini ac/kapat. Kumandadaki anahtarla ayni roleye gider."""
+        if self.worker_1:
+            self.worker_1.queue_send({"target_id": 1, "cmd": "set_relay", "value": int(state)})
+        self.on_status(f"TX[USV{bid}]: RÖLE -> {'AÇ' if state else 'KAPAT'}")
 
     def _send_manual_pwm(self, bid, l, r):
         if self.worker_1: self.worker_1.queue_send({"target_id": 1, "cmd": "manual_control", "left": l, "right": r})

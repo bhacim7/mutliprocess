@@ -2,7 +2,7 @@
 
 **Son güncelleme:** 2026-08-12
 **Durum:** Uygulandı ve sahada doğrulandı. Task 2 çarpmadan ve parkurdan çıkmadan tamamlanıyor.
-**Sıradaki test:** GPS noktaları parkurun daha da kenarına atılarak koridor kapağının sınavı.
+**Sıradaki test:** (a) GPS noktaları parkurun daha da kenarına atılarak koridor kapağının sınavı, (b) GCS röle butonlarının saha denemesi.
 
 **Kardeş belge:** Drone plaket rengi tespiti için → [`ANALIZ_DRONE_COLOR.md`](ANALIZ_DRONE_COLOR.md)
 
@@ -21,6 +21,7 @@
 9. [Bilinen sınırlar ve ertelenenler](#9-bilinen-sınırlar-ve-ertelenenler)
 10. [Saha kontrol listesi](#10-saha-kontrol-listesi)
 11. [Değişiklik günlüğü](#11-değişiklik-günlüğü)
+12. [GCS'ten röle kontrolü](#12-gcsten-röle-kontrolü--uygulandı)
 
 ---
 
@@ -411,56 +412,86 @@ Konum hatasını düşürmenin üç yolu, **hiçbiri uygulanmadı**:
 
 ---
 
-## 12. SIRADAKİ İŞ — GCS'TEN RÖLE KONTROLÜ (tasarım, henüz yazılmadı)
+## 12. GCS'TEN RÖLE KONTROLÜ — **uygulandı**
 
-Motor gücünü kesip veren röle şu an **sadece RC kumandadan** kontrol ediliyor. GCS'e de aç/kapat butonu eklenecek; **kumanda yolu aynen kalacak.**
+**Durum:** Kod yazıldı, mantık test edildi, **sahada denenmedi.**
+**Firmware:** ArduRover **4.6.2** → `RELAY_STATUS` mevcut, gerçek durum okunabiliyor.
 
-### Mevcut ArduPilot yapılandırması
+### Eklenenler
+
+| Yer | Ne |
+|---|---|
+| `GCSv1000.py` | **⚡ RÖLE AÇ** ve **⛔ RÖLE KAPAT** butonları (onaysız) + gerçek durum etiketi |
+| `telem_process.py` | Pakete `relay` alanı (−1 = bilinmiyor) |
+| `nav_process.py` | `set_relay` komutu, `target_id` filtresi, teyitli tekrar |
+| `MainSystem2.py` | `set_relay()` / `get_relay_state()` + `RELAY_STATUS` isteği @2 Hz |
+| `config.py` | `RELAY_INSTANCE`, `RELAY_COMMAND_RETRIES`, `RELAY_RETRY_INTERVAL_S`, `VEHICLE_ID` |
+
+Mevcut **ACİL DURDUR butonuna dokunulmadı.**
+
+### Kritik ayrıntılar
+
+**`MAV_CMD_DO_SET_RELAY`'in instance parametresi 0 tabanlı.** `RELAY1` için `param1 = 0`. `1` göndermek var olmayan ikinci röleyi adresler ve sessizce hiçbir şey olmaz. Test edildi.
+
+**Durum "son gönderilen komut" değil, aracın kendi raporu.** Kumanda röleyi bizden habersiz değiştirebildiği için `RELAY_STATUS`'tan okunuyor. Mesaj gelmezse GCS **"bilinmiyor"** yazıyor — tahmin etmiyor.
+
+**Tekrar mekanizması.** `command_long_send` ACK beklemiyor; kaybolan güvenlik komutu fark edilmez. En fazla 5 kez, 0,25 s arayla, `RELAY_STATUS` teyit edince erken durur. Nav döngüsü bloklanmıyor.
+
+**`target_id` filtresi.** `CommandReceiver` telsizde duyduğu her satırı kuyruğa koyuyor — drone'a (id 3) giden röle komutunu tekne de uygulardı. Artık `VEHICLE_ID` ile filtreleniyor. `target_id` olmayan eski komutlar geriye uyumlu şekilde işleniyor.
+
+### Cube parametreleri — hiçbiri değişmedi
 
 ```
-RC7_OPTION       = 28   kumanda 7. kanal anahtarı = "Röle Aç/Kapa"
-RELAY1_PIN       = 50   röle 1 = AUX1
-SERVO9_FUNCTION  = -1   AUX1 motor sürmeyi bırakıp GPIO oldu
-RELAY1_FUNCTION  = 1    röle fonksiyonu aktif
+SERVO9_FUNCTION = -1     AUX1 GPIO oldu          } röleyi TANIMLAR
+RELAY1_PIN      = 50     röle 1 = AUX1           } (kim komut verirse versin)
+RELAY1_FUNCTION = 1      röle aktif              }
+RELAY1_DEFAULT  = 0      açılışta KAPALI  <- güvenli, dokunmayın
+RC7_OPTION      = 28     kumanda anahtarı          <- sadece kumanda yolu
 ```
 
-### İki yol birbirini etkiler mi — hayır
+İlk üçü röleyi tanımlıyor; `RC7_OPTION` bir *girdi*, MAVLink `DO_SET_RELAY` başka bir girdi. **İkisi ArduPilot içindeki aynı duruma yazıyor, son yazan kazanıyor.**
 
-ArduPilot'ta RC yardımcı fonksiyonları **kenar tetiklemelidir**: anahtar pozisyonu *değiştiğinde* çalışır, sürekli dayatmaz. Sahada doğrulandı — kumanda kapatılınca röle açık kalıyor.
+### Neden `nav_process`, `telem_process` değil
 
-MAVLink `DO_SET_RELAY` de aynı durum değişkenine yazar. **İkisi aynı anahtarı çeviriyor, son yazan kazanır.**
+Bir seri portu aynı anda tek proses açabilir. Cube'a giden `/dev/ttyACM0` **`nav_process`'in elinde**; `telem_process` telsize (`/dev/ttyUSB0`) bağlı ve Cube'a hiç erişimi yok.
 
-**Üç istisna (test edilmeli):**
+- `telem_process` = **tercüman** (GCS JSON'u ↔ iç dünya)
+- `nav_process` = **uygulayıcı** (Cube'a dokunan her şey)
+
+`set_gps`, `set_manual`, `set_target_color`, `emergency_stop` de aynı yolu izliyor. Röle yeni bir desen değil, listeye yeni bir üye.
+
+**Bedeli:** `nav_process` takılırsa GCS röle komutu Cube'a ulaşmaz. Bu yüzden **kumanda anahtarı asıl acil durdurma olarak kalıyor** — Jetson'dan, Python'dan, telsizden bağımsız donanım yolu.
+
+### Doğrulama (mantık düzeyinde)
+
+| Test | Sonuç |
+|---|---|
+| `DO_SET_RELAY` instance 0, state 0/1 | ✅ |
+| `RELAY_STATUS` yok → `None` (bilinmiyor) | ✅ |
+| `present`/`on` bitmask çözümleme | ✅ 3/3 |
+| Teyit gelince tekrar durur | ✅ 2 gönderimde durdu |
+| Teyit gelmezse 5 kez dener, 0,25 s arayla | ✅ |
+| Drone'a (id 3) giden komut | ✅ yok sayıldı |
+| `target_id` olmayan eski komut | ✅ işlendi |
+| Hızlı AÇ→KAPAT | ✅ son komut kazandı |
+
+Telemetri paketi `relay` alanıyla **342 B** → 5 Hz'de %29,7 seri doluluk. Röle komutu 48 B.
+
+### Sahada bakılacaklar
+
+1. **RÖLE AÇ/KAPAT** → motor gücü kesiliyor/veriliyor mu
+2. Durum etiketi **"bilinmiyor"da takılıyor mu** → takılırsa `RELAY_STATUS` gelmiyordur, `MAV_CMD_SET_MESSAGE_INTERVAL` isteği çalışmamış olabilir
+3. **Kumandadan** röleyi değiştirin → GCS etiketi birkaç saniye içinde güncellenmelidir
+4. GCS'ten kapatıp **kumanda anahtarını oynatın** → kumanda kazanmalı
+5. Terminalde `Relay command not confirmed after 5 attempts` uyarısı çıkıyor mu
+
+### Test edilmemiş üç durum
 
 | Durum | Beklenen |
 |---|---|
-| Cube yeniden başlarsa | Açılışta anahtar pozisyonundan okunur → kumanda kazanır |
-| RC sinyali kesilip dönerse | ArduPilot anahtarları yeniden değerlendirir; sürüme göre değişir |
-| Röle durumu geri okunamıyorsa | ArduPilot 4.4+ `RELAY_STATUS` (msg 376) yollar. Eski sürümde GCS ancak "son gönderilen komut"u gösterir — kumandadan değiştirilirse ekran yanlış olur |
-
-### Tasarlanan yol
-
-```
-GCS butonu → {"target_id":1,"cmd":"set_relay","value":0|1}
-           → CommandReceiver → command_queue
-           → nav_process → MAV_CMD_DO_SET_RELAY → Cube
-```
-
-Yeni altyapı gerekmiyor; `set_target_color` ile aynı boru hattı.
-
-### Yazmadan önce halledilecekler
-
-| # | Konu | Neden |
-|---|---|---|
-| 1 | **`target_id` filtresi** — `nav_process` şu an gelen komutu `target_id`'ye bakmadan işliyor | Drone'a (id 3) giden röle komutunu tekne de uygular |
-| 2 | **KAPAT onaysız, AÇ onaylı** | Kapatmak güvenli yön; açmak motorları çalıştırabilir |
-| 3 | **Komut tekrarı veya `COMMAND_ACK`** | `command_long_send` şu an ACK beklemiyor; kayıp komut fark edilmez |
-| 4 | **Durum göstergesi** | `RELAY_STATUS` varsa gerçek durum, yoksa açıkça "son komut" diye etiketlensin |
-| 5 | **Acil durdurma ile ilişki** | Mevcut "ACİL DURDUR" sadece `shutdown=True` yapıp thruster'ları nötrlüyor, **gücü kesmiyor**. Röleyi de kesmesi tartışılacak |
-
-### Değişmeyecek ilke
-
-Kumandadaki anahtar **Jetson'dan tamamen bağımsız donanım yolu**. GCS butonu nav_process'e bağımlı, o takılırsa komut gitmez. Bu yüzden **asıl acil durdurma kumanda olarak kalır**, GCS kolaylıktır.
+| Cube yeniden başlarsa | `RELAY1_DEFAULT = 0` → kapalı gelir |
+| RC sinyali kesilip dönerse | ArduPilot anahtarları yeniden değerlendirebilir, sürüme göre değişir |
+| Aynı anda iki komut | Son yazan kazanır (mantıken; sahada doğrulanmadı) |
 
 ---
 

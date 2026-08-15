@@ -85,6 +85,23 @@ class USVController:
             )
             print("[USVController] Data stream requested (ALL @ 5Hz).")
 
+            # RELAY_STATUS is not part of the legacy stream groups, so ask for it by id.
+            # Without this the relay state can only be inferred from what we last sent,
+            # which goes stale the moment the transmitter switch is used.
+            try:
+                self.master.mav.command_long_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    376,        # RELAY_STATUS
+                    500000,     # microseconds -> 2 Hz
+                    0, 0, 0, 0, 0
+                )
+                print("[USVController] RELAY_STATUS requested @ 2Hz.")
+            except Exception as e:
+                print(f"[USVController][WARNING] Could not request RELAY_STATUS: {e}")
+
     def _listen_messages(self):
         """Arka planda MAVLink mesajlarını dinler ve msg_dict'te saklar."""
         while self.running and self.master:
@@ -235,6 +252,60 @@ class USVController:
                 # heartbeat stays fresh and the watchdog doesn't have to kill+restart it
                 # just because one servo write glitched.
                 print(f"[USVController][WARNING] set_servo({channel}) write failed: {e}")
+
+    def set_relay(self, state, relay=None):
+        """
+        Switch the motor-power relay via MAVLink.
+
+        This reaches the SAME relay state inside ArduPilot that the transmitter's
+        RC7_OPTION=28 switch writes to, so the two are not rivals - whichever wrote last
+        wins. The RC path is edge triggered (it acts when the switch MOVES, not
+        continuously), which is why turning the transmitter off leaves the relay as it was.
+
+        param1 of MAV_CMD_DO_SET_RELAY is the relay INSTANCE and it is ZERO based:
+        instance 0 is the one configured by RELAY1_PIN / RELAY1_FUNCTION. Sending 1 here
+        would silently address a second relay that does not exist.
+        """
+        if not self.master:
+            return False
+        if relay is None:
+            relay = getattr(cfg, 'RELAY_INSTANCE', 0)
+        try:
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+                0,
+                int(relay),          # instance, 0 based
+                1 if state else 0,   # 1 = energised, 0 = off
+                0, 0, 0, 0, 0
+            )
+            return True
+        except Exception as e:
+            print(f"[USVController][WARNING] set_relay({state}) failed: {e}")
+            return False
+
+    def get_relay_state(self, relay=None):
+        """
+        True/False from the vehicle's own RELAY_STATUS, or None if it never arrives.
+
+        Reading the real state matters because the transmitter can change it behind our
+        back; echoing back "whatever the GCS last sent" would be wrong exactly when it
+        matters most. RELAY_STATUS carries two bitmasks - `present` says the relay exists,
+        `on` says it is energised.
+        """
+        msg = self.msg_dict.get('RELAY_STATUS')
+        if msg is None:
+            return None
+        if relay is None:
+            relay = getattr(cfg, 'RELAY_INSTANCE', 0)
+        try:
+            bit = 1 << int(relay)
+            if not (int(msg.present) & bit):
+                return None
+            return bool(int(msg.on) & bit)
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def set_mode(self, mode_name):
         """Changes the vehicle flight mode."""

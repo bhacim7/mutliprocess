@@ -330,6 +330,19 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     t3_original_heading = None
     t3_search_move_target = None
 
+    # --- Relay (motor power) ---
+    # Retried rather than fired once: command_long_send waits for no ACK, so a dropped
+    # safety command would go unnoticed. Retries stop as soon as RELAY_STATUS confirms the
+    # vehicle agrees, and they are spread across nav cycles rather than slept through, so
+    # the control loop keeps running.
+    MY_ID = getattr(cfg, 'VEHICLE_ID', 1)
+    RELAY_MAX_RETRIES = getattr(cfg, 'RELAY_COMMAND_RETRIES', 5)
+    RELAY_RETRY_INTERVAL_S = getattr(cfg, 'RELAY_RETRY_INTERVAL_S', 0.25)
+    relay_target = None          # state we are trying to reach, None = nothing pending
+    relay_retries = 0
+    relay_last_tx = 0.0
+    relay_reported = None        # last state read back from RELAY_STATUS
+
     costmap_recorder = None
     if getattr(cfg, 'RECORD_COSTMAP', False):
         costmap_recorder = CostmapRecorder()
@@ -390,6 +403,26 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 fc_hdg = controller.get_heading()
 
+                # --- Relay: read back, then retry any pending command ---
+                # The transmitter can change this relay too (RC7_OPTION=28), so the truth
+                # comes from the vehicle rather than from what we last sent.
+                try:
+                    relay_reported = controller.get_relay_state()
+                except AttributeError:
+                    relay_reported = None
+
+                if relay_target is not None:
+                    if relay_reported is not None and int(relay_reported) == relay_target:
+                        relay_target = None          # vehicle agrees, done
+                    elif relay_retries <= 0:
+                        print("[NAV_PROCESS][WARNING] Relay command not confirmed after "
+                              f"{RELAY_MAX_RETRIES} attempts.")
+                        relay_target = None
+                    elif (start_time - relay_last_tx) >= RELAY_RETRY_INTERVAL_S:
+                        relay_last_tx = start_time
+                        relay_retries -= 1
+                        controller.set_relay(relay_target)
+
                 # Compute actual magnetic_heading based on HEADING_SOURCE
                 zed_heading = shared_state.get('zed_heading', 0.0)
                 heading_source = getattr(cfg, 'HEADING_SOURCE', 'ZED')
@@ -410,7 +443,23 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         cmd = command_queue.get_nowait()
                         cmd_str = cmd.get("cmd")
 
-                        if cmd_str == "emergency_stop":
+                        # The RFD link is shared with the drone, and CommandReceiver puts
+                        # every line it hears on this queue regardless of who it was for.
+                        # Ignoring a command addressed elsewhere matters most for the relay,
+                        # which cuts motor power.
+                        _tgt = cmd.get("target_id")
+                        if _tgt is not None and int(_tgt) != MY_ID:
+                            continue
+
+                        if cmd_str == "set_relay":
+                            want = 1 if cmd.get("value") else 0
+                            relay_target = want
+                            relay_retries = RELAY_MAX_RETRIES
+                            relay_last_tx = 0.0     # send on this very cycle
+                            print(f"[NAV_PROCESS] Relay command received: "
+                                  f"{'ON' if want else 'OFF'}")
+
+                        elif cmd_str == "emergency_stop":
                             print("[NAV_PROCESS] Emergency Stop Received!")
                             shared_state['shutdown'] = True
                         elif cmd_str == "report_status":
@@ -1357,6 +1406,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     shared_state['horizontal_speed'] = speed_mps
                     if fc_hdg is not None:
                         shared_state['fc_heading'] = fc_hdg
+                    # -1 means the vehicle never reported RELAY_STATUS, so the GCS can say
+                    # "unknown" instead of showing a state it cannot actually vouch for.
+                    shared_state['relay_state'] = (-1 if relay_reported is None
+                                                   else int(relay_reported))
 
                 # Heartbeat: p.is_alive() in the orchestrator watchdog only detects a dead process,
                 # not one blocked on a hung call (e.g. a serial write). This timestamp lets the
