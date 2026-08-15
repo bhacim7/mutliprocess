@@ -195,10 +195,12 @@ except Exception as e:
 
 
 # --- Camera ---
-def _median_v(cap, n=4):
+def _median_v(cap, n=4, keepalive=None):
     """Median V of the last few frames, or -1 if nothing could be read."""
     vals = []
     for _ in range(n):
+        if keepalive is not None:
+            keepalive()
         ok, f = cap.read()
         if ok and f is not None:
             small = cv2.resize(f, (160, 120))
@@ -222,9 +224,15 @@ def _set_auto_exposure(cap, auto):
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, v)
 
 
-def calibrate_exposure(cap):
+def calibrate_exposure(cap, keepalive=None):
     """
     Get a usable picture, whatever the driver does.
+
+    `keepalive`, if given, is called on every frame read. This routine spends 1.5-4 s
+    reading frames and it runs on the main loop, so without it nothing transmits for
+    that whole stretch and the GCS - which declares the drone dead after a few missed
+    heartbeats - paints the link red every single time the exposure is re-tuned, with
+    the radio working perfectly. See link_keepalive().
 
     Ask for auto exposure first and MEASURE the result. If the frame is blown out or
     crushed, take manual control and sweep EXPOSURE_CANDIDATES, keeping whichever lands
@@ -237,9 +245,11 @@ def calibrate_exposure(cap):
     cap.set(cv2.CAP_PROP_AUTO_WB, 1)
     t0 = time.time()
     while time.time() - t0 < AE_SETTLE_S:
+        if keepalive is not None:
+            keepalive()
         cap.read()
 
-    v = _median_v(cap)
+    v = _median_v(cap, keepalive=keepalive)
     if V_TOO_DARK <= v <= V_TOO_BRIGHT:
         return f"auto (V={v:.0f})"
 
@@ -250,8 +260,10 @@ def calibrate_exposure(cap):
     for e in EXPOSURE_CANDIDATES:
         cap.set(cv2.CAP_PROP_EXPOSURE, e)
         for _ in range(3):           # let the change take effect
+            if keepalive is not None:
+                keepalive()
             cap.read()
-        mv = _median_v(cap, n=3)
+        mv = _median_v(cap, n=3, keepalive=keepalive)
         if mv < 0:
             continue
         print(f"[CAM]   exposure {e:>5} -> V={mv:.0f}")
@@ -265,15 +277,19 @@ def calibrate_exposure(cap):
 
     cap.set(cv2.CAP_PROP_EXPOSURE, best[0])
     for _ in range(3):
+        if keepalive is not None:
+            keepalive()
         cap.read()
-    final = _median_v(cap, n=3)
+    final = _median_v(cap, n=3, keepalive=keepalive)
     if final > V_TOO_BRIGHT or final < V_TOO_DARK:
         return f"UNCONTROLLABLE (best V={final:.0f}) - check 'v4l2-ctl -d /dev/video0 -l'"
     return f"manual exposure={best[0]} (V={final:.0f})"
 
 
-def open_camera():
-    """Open the camera at the requested format and get the exposure into a usable range."""
+def open_camera(keepalive=None):
+    """Open the camera at the requested format and get the exposure into a usable range.
+
+    `keepalive` is forwarded to calibrate_exposure(); see the note there."""
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         return None
@@ -289,7 +305,7 @@ def open_camera():
     except Exception:
         pass
 
-    how = calibrate_exposure(cap)
+    how = calibrate_exposure(cap, keepalive=keepalive)
 
     print(f"[CAM] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
           f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} | exposure: {how}")
@@ -638,7 +654,19 @@ def draw_overlay(frame, label, conf, area, extent, chroma, scene, diag, contour,
 
 last_sent_label = None
 last_sent_time = 0.0
-SEND_MIN_INTERVAL_S = 1.0   # heartbeat rate when the colour is unchanged
+
+# Heartbeat rate when the colour is unchanged.
+#
+# 1.0 s was too slow to be safe. The GCS declares the drone dead after TIMEOUT seconds of
+# silence, so at 1 Hz only THREE consecutive lost packets painted the link red - while the
+# boat, polled at 5 Hz against the same timeout, needed twelve. Same radio, same air, but
+# the drone panel was four times more likely to flash "Bağlantı Koptu" purely because of
+# how the two rates compared to one timeout.
+#
+# 3 Hz restores the same margin the boat has. It costs 45 B x 3 = 135 B/s, 2.3% of a 57600
+# baud link - and the polling interval was relaxed to 300 ms in the same change, which
+# gives back four times that.
+SEND_MIN_INTERVAL_S = 0.333
 
 
 def send_serial_message(label):
@@ -666,6 +694,28 @@ def send_serial_message(label):
         last_sent_time = now
     except Exception as e:
         print(f"Failed to send serial message: {e}")
+
+
+# Mirrors current_status for link_keepalive(). The main loop owns current_status as a
+# local, but the keepalive is called from deep inside calibrate_exposure().
+_trigger_active = False
+
+
+def link_keepalive():
+    """
+    Heartbeat that survives a blocking routine.
+
+    calibrate_exposure() spends 1.5-4 s reading frames to find a usable exposure and it
+    runs ON the main loop, so send_serial_message() was not called once for that whole
+    stretch. That is longer than the GCS timeout, so every exposure re-tune painted the
+    link red with the radio working perfectly - one of the reasons the drone appeared to
+    "keep disconnecting". Passed into the read loops so they keep the link alive.
+
+    The trigger still gates everything: nothing is sent while the drone is idle, exactly
+    as before.
+    """
+    if _trigger_active:
+        send_serial_message(last_sent_label or "BELIRSIZ")
 
 
 # --- Main Loop & GPIO Setup ---
@@ -776,7 +826,7 @@ try:
                         cap.release()
                 except Exception:
                     pass
-                cap = open_camera()
+                cap = open_camera(keepalive=link_keepalive)
                 cam_fail_count = 0
             time.sleep(0.05)
             continue
@@ -829,7 +879,7 @@ try:
                         recalibrations += 1
                         print(f"\n[CAM] Scene median V={v_med} - recalibrating exposure "
                               f"({recalibrations}/{MAX_RECALIBRATIONS})...")
-                        print(f"[CAM] {calibrate_exposure(cap)}")
+                        print(f"[CAM] {calibrate_exposure(cap, keepalive=link_keepalive)}")
                         bad_exposure_since = 0.0
                         if recalibrations >= MAX_RECALIBRATIONS:
                             print("[CAM] Giving up on automatic exposure - will keep running "
@@ -856,7 +906,8 @@ try:
                     current_extent, scene_stats)
             save_capture(frame, "BELIRSIZ")
 
-        if current_status == "AKTİF":
+        _trigger_active = (current_status == "AKTİF")
+        if _trigger_active:
             send_serial_message(last_detected_color)
 
         # Video: the overlay is drawn on a copy so the saved captures and the detector

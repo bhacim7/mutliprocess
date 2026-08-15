@@ -67,6 +67,31 @@ def telem_worker(shared_state, command_queue, hf_data):
         except (TypeError, ValueError):
             return default
 
+    # --- TASK3 target colour, as the boat actually holds it ---
+    #
+    # DRONE_ACTIVE is a static config value - nothing mutates it at runtime, unlike the GPS
+    # points - so reading this process's own cfg copy is safe here even under spawn.
+    drone_active = bool(getattr(cfg, 'DRONE_ACTIVE', False))
+    cfg_color = str(getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')).lower()
+
+    def task3_color():
+        """
+        Returns (colour, source) for the GCS.
+
+        The GCS uses this two ways: to show the operator which colour the boat will
+        actually hunt, and to notice when what the boat holds differs from what the drone
+        reported - i.e. that a set_target_color command was lost - and say it again. Before
+        this field existed the GCS sent the colour once and had no way of ever learning
+        whether it arrived.
+
+        source "cfg"   -> DRONE_ACTIVE is off, config.py decides, the drone is irrelevant
+        source "drone" -> the drone decides; an empty colour means none has arrived yet
+        """
+        if not drone_active:
+            return cfg_color, "cfg"
+        col = shared_state.get('drone_target_color')
+        return (str(col).lower() if col else ""), "drone"
+
     # 2. Main Loop
     try:
         while not shared_state['shutdown']:
@@ -125,6 +150,9 @@ def telem_worker(shared_state, command_queue, hf_data):
                     # -1 = the vehicle never reported, so the GCS shows "unknown".
                     "relay": int(shared_state.get('relay_state', -1)),
                 }
+
+                # TASK3 hedef rengi + kaynağı (~27 B). Bkz. task3_color().
+                payload["tcol"], payload["tsrc"] = task3_color()
 
                 # 'objects' is deliberately NOT sent any more.
                 #

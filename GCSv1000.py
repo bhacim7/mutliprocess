@@ -296,6 +296,47 @@ def normalize_gps_dict(gps_raw):
 
 
 # -------------------- Serial Worker (Düzeltilmiş & Hızlandırılmış) --------------------
+def _parse_or_recover(line: str):
+    """
+    Parse a received line, salvaging a whole packet glued behind a truncated one.
+
+    The reader splits on '\\n'. When a packet is corrupted in the air its trailing '\\n'
+    never arrives, so the half-line stays in the buffer and the NEXT packet is appended
+    straight onto it:
+
+        {"id": 1, "pwm_L": 1500, "spd": 1.2{"id": 3, "drone_color": "KIRMIZI"}
+
+    json.loads() fails on that and BOTH packets were thrown away. The boat sends ~3 packets
+    a second and the drone 3, so the victim was very often the drone's - which is a large
+    part of why the drone panel appeared to disconnect while the boat's kept updating. The
+    drone packet in that example arrived perfectly intact and was discarded.
+
+    Recovery looks for a later packet START, not merely a later '{'. Every packet on this
+    link begins with {"id" - a blind search for '{' would happily accept the nested
+    {"lat": ..., "lon": ...} inside MEVCUT_KONUM, which parses as valid JSON and would be
+    handed to the UI as a packet with no 'id' at all (silently treated as the boat's).
+
+    The leading fragment stays lost; it was corrupt to begin with.
+    """
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        pass
+
+    start = line.find('{"id"', 1)
+    while start != -1:
+        try:
+            return json.loads(line[start:])
+        except json.JSONDecodeError:
+            start = line.find('{"id"', start + 1)
+    return None
+
+
+# Drone reports colours in Turkish; the boat's config and detector speak English.
+COLOR_TR_TO_EN = {"KIRMIZI": "red", "YESIL": "green", "SIYAH": "black", "SARI": "yellow"}
+COLOR_EN_TO_TR = {v: k for k, v in COLOR_TR_TO_EN.items()}
+
+
 class SerialWorker(QThread):
     packet = Signal(dict)
     status = Signal(str)
@@ -379,16 +420,19 @@ class SerialWorker(QThread):
                                 for line in lines:
                                     line = line.strip()
                                     if line:
-                                        try:
-                                            obj = json.loads(line)
-                                            if isinstance(obj, dict):
-                                                self.packet.emit(obj)  # UI'a gönder
+                                        obj = _parse_or_recover(line)
+                                        if isinstance(obj, dict):
+                                            self.packet.emit(obj)  # UI'a gönder
 
-                                                # CSV Kayıt (Opsiyonel)
-                                                if self._csv_writer:
-                                                    pass
-                                        except json.JSONDecodeError:
-                                            pass  # Paketin içi bozuksa atla
+                                            # CSV Kayıt (Opsiyonel)
+                                            if self._csv_writer:
+                                                pass
+
+                            # Bir paket havada bozulup '\n' hiç gelmezse yarım satır burada
+                            # sonsuza kadar birikirdi. Makul bir paketten kat kat büyükse
+                            # kurtarılacak bir şey kalmamıştır; at ve akışa yeniden gir.
+                            if len(self._rx_buffer) > 8192:
+                                self._rx_buffer = ""
 
                         except Exception as e:
                             print(f"Read Error: {e}")
@@ -432,7 +476,14 @@ class SerialWorker(QThread):
                 avail = [p.device for p in serial.tools.list_ports.comports()]
                 if self.port in avail:
                     # Timeout değerini 0.1 yaptık (Daha hızlı pes etsin)
-                    self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                    #
+                    # write_timeout matters just as much. Without it the flush() below
+                    # blocks forever if the radio asserts flow control, and because this
+                    # thread does BOTH directions that stalls receiving too - the boat and
+                    # the drone go red together for reasons that have nothing to do with
+                    # either of them. Same failure the boat's own TelemetrySender had.
+                    self.ser = serial.Serial(self.port, self.baud, timeout=0.1,
+                                             write_timeout=0.5)
                     self.status.emit(f"Connected {self.port} @ {self.baud}")
                     self.link.emit(True)
                     return
@@ -2448,6 +2499,19 @@ class MainWindow(QtWidgets.QMainWindow):
         h_renk.addWidget(self.drone_color_lbl)
         il.addLayout(h_renk)
 
+        # TASK3 RENK - what the BOAT is actually hunting, straight from its telemetry.
+        #
+        # The line above is what the DRONE sees; this one is what arrived at the other end.
+        # They are not the same thing and the difference is the whole point: a colour can be
+        # detected perfectly, relayed by this GCS, and still never reach the boat if the
+        # radio drops that one packet. Until now nothing on this screen would have shown it.
+        h_t3 = QtWidgets.QHBoxLayout()
+        h_t3.addWidget(QtWidgets.QLabel("TASK3 Renk:"))
+        self.task3_color_lbl = QtWidgets.QLabel("—")
+        self.task3_color_lbl.setStyleSheet("font-weight: bold; color: #9e9e9e;")
+        h_t3.addWidget(self.task3_color_lbl)
+        il.addLayout(h_t3)
+
         # Boşluğu doldurmak için spacer
         il.addStretch(1)
 
@@ -3027,7 +3091,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # Drone LED efekti
             self.drone_led.setStyleSheet("background-color:#00e676; border-radius:8px;")
             QtCore.QTimer.singleShot(100, lambda: self.drone_led.setStyleSheet("background-color:#1b5e20; border-radius:8px;"))
-            self.drone_hb_timer.start(2500)
+            # 4000 ms, not 2500. The drone heartbeats at 3 Hz and the boat is polled at
+            # 3.3 Hz; against one shared timeout both now need ~12 consecutive losses to
+            # be declared dead. At the old 1 Hz / 2500 ms the drone needed only THREE,
+            # which is why its panel flashed "Bağlantı Koptu" so much more than the boat's
+            # on exactly the same radio link.
+            self.drone_hb_timer.start(4000)
 
             drone_color = d.get("drone_color", "BELIRSIZ")
             self.drone_color_lbl.setText(drone_color)
@@ -3035,12 +3104,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # İngilizceye çevir ve komut yolla.
             # Sadece renk DEĞİŞTİĞİNDE gönder: drone her karede paket yolluyordu ve
             # bu, aynı telsiz hattında tekneye saniyede onlarca gereksiz komut demekti.
-            color_map = {"KIRMIZI": "red", "YESIL": "green", "SIYAH": "black", "SARI": "yellow"}
-            if drone_color in color_map and drone_color != getattr(self, "_last_drone_color", None):
+            # BELIRSIZ haritada yok, yani iletilmez - drone anlık kararsızlaşınca teknenin
+            # elindeki renk silinmez.
+            if drone_color in COLOR_TR_TO_EN and drone_color != getattr(self, "_last_drone_color", None):
                 self._last_drone_color = drone_color
-                eng_color = color_map[drone_color]
-                if self.worker_1:
-                    self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color", "color": eng_color})
+                self._want_color_en = COLOR_TR_TO_EN[drone_color]
+                self._send_target_color()
             return
 
         task_str = d.get("task", "")
@@ -3157,6 +3226,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.relay_lbl.setText("RÖLE: bilinmiyor")
                 self.relay_lbl.setStyleSheet("color:#90a4ae; font-weight:bold;")
 
+        # --- TASK3 hedef rengi: teknenin GERÇEKTEN elinde tuttuğu renk ---
+        #
+        # 'tsrc' says where it came from: "cfg" = config.py's TASK3_KAMIKAZE_COLOR because
+        # DRONE_ACTIVE is off, "drone" = the boat is waiting for / using the drone's colour.
+        # Showing the source matters as much as the colour: hunting black because the drone
+        # said so, and hunting black because the drone never arrived and config says black,
+        # look identical on the water and mean completely different things.
+        if hasattr(self, "task3_color_lbl") and "tsrc" in d:
+            tsrc = d.get("tsrc", "")
+            tcol = (d.get("tcol") or "").lower()
+            tr = COLOR_EN_TO_TR.get(tcol, tcol.upper())
+            if tsrc == "cfg":
+                self.task3_color_lbl.setText(f"{tr} (config)")
+                self.task3_color_lbl.setStyleSheet("font-weight:bold; color:#90a4ae;")
+            elif tcol:
+                self.task3_color_lbl.setText(f"{tr} (drone)")
+                self.task3_color_lbl.setStyleSheet("font-weight:bold; color:#00e676;")
+            else:
+                self.task3_color_lbl.setText("RENK YOK")
+                self.task3_color_lbl.setStyleSheet("font-weight:bold; color:#ffa726;")
+
+            # Closed loop. If the boat is holding something other than what the drone last
+            # reported, the command did not land - say it again. Rate limited so a command
+            # in flight is given time to arrive and be reported back before we repeat it.
+            want = getattr(self, "_want_color_en", None)
+            if tsrc == "drone" and want and tcol != want:
+                if time.time() - getattr(self, "_last_color_tx", 0.0) >= 2.0:
+                    self._send_target_color()
+                    self.on_status(f"Tekne rengi uyuşmuyor ({tcol or 'yok'}) -> {want} tekrar gönderildi")
+
         pos = d.get("MEVCUT_KONUM", {})
         lat = pos.get("lat", 0.0)
         lon = pos.get("lon", 0.0)
@@ -3218,6 +3317,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker_1:
             self.worker_1.queue_send({"target_id": 1, "cmd": "set_relay", "value": int(state)})
         self.on_status(f"TX[USV{bid}]: RÖLE -> {'AÇ' if state else 'KAPAT'}")
+
+    def _send_target_color(self):
+        """
+        Push the colour the drone reported down to the boat.
+
+        Called on a fresh drone detection AND from the closed loop in on_packet() when the
+        boat's telemetry says it is holding something else. The old code sent once, on
+        change, and then recorded the new colour as "done" - so if that single command was
+        lost on the radio, the drone could report KIRMIZI for the rest of the mission and
+        this GCS would stay silent, because as far as it knew nothing had changed. The
+        boat would hunt the stale colour to the end of the run.
+
+        This still does not chatter: it fires on change, and otherwise only when the boat
+        actually disagrees.
+        """
+        if not self.worker_1 or not getattr(self, "_want_color_en", None):
+            return
+        self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color",
+                                  "color": self._want_color_en})
+        self._last_color_tx = time.time()
 
     def _send_manual_pwm(self, bid, l, r):
         if self.worker_1: self.worker_1.queue_send({"target_id": 1, "cmd": "manual_control", "left": l, "right": r})
@@ -3514,7 +3633,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # polls. At ~332 B a packet, 5 Hz is about 29% of a 57600 baud link.
             self._polling_timer = QtCore.QTimer(self)
             self._polling_timer.timeout.connect(self._perform_polling)
-            self._polling_timer.start(200)
+            # 300 ms, not 200. Three radios share one channel and SiK's TDMA is built for
+            # two, so every extra boat transmission is another chance to clobber the
+            # drone's - and the drone's packets are the rare ones. Going 5 Hz -> 3.3 Hz
+            # takes the link from ~34% to ~24% occupied even after tripling the drone's
+            # heartbeat, and a 300 ms panel refresh is indistinguishable from 200 ms.
+            self._polling_timer.start(300)
 
             self._connected = True
             self.btn_connect.setText("BAĞLI")

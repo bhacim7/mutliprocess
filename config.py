@@ -283,6 +283,15 @@ T3_MID_LON = 29.2622795
 TASK3_KAMIKAZE_COLOR = "black"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 
-DRONE_ACTIVE = False
+# When True, TASK3 hunts the colour the drone reported (relayed by the GCS as
+# `set_target_color`) instead of TASK3_KAMIKAZE_COLOR above. This was False while the
+# link was being built, which meant the boat received the colour, stored it and even
+# logged "Drone target color updated to ..." - and then ignored it.
+#
+# TASK3_KAMIKAZE_COLOR stays the fallback: if the drone never delivers a colour, the
+# boat hunts the configured one rather than sitting with no target at all. The GCS shows
+# which of the two is in force (see the TASK3 RENK field), so a silent fallback is
+# visible on the ground instead of being discovered on the water.
+DRONE_ACTIVE = True
 
 MEVCUT_GOREV = "TASK1_STATE_ENTER"
