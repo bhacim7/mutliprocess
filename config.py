@@ -123,6 +123,21 @@ COSTMAP_REC_RES_M_PER_PX = 0.2
 COSTMAP_REC_TRACK_HZ = 5.0    # boat track sampling - 1 Hz turned a 10 s circle into a decagon
 COSTMAP_REC_OBJECT_HZ = 1.0   # raw sighting sampling (feeds the noise-cloud layer)
 
+# --- Run replay video ---
+# The raw recording (.npz) is ALWAYS written next to the PNG; it costs milliseconds and a
+# few hundred KB, and it is what utils/costmap_video.py replays. This flag only controls
+# whether the mp4 is also rendered during shutdown, which adds 15-30 s to every exit.
+# Leave it False for competition runs and render the video afterwards from the .npz:
+#     python utils/costmap_video.py final_costmap.npz
+COSTMAP_REC_VIDEO = False
+COSTMAP_REC_VIDEO_SAMPLE_HZ = 1.0    # map snapshots per second of RUN time
+# Playback rate. Sampling and playback are different things: 1 Hz sampled and played at
+# 1 fps would make a ten minute run a ten minute video. 1 Hz at 15 fps plays it 15x, so a
+# ten minute run becomes 40 s - and each frame carries its elapsed time.
+COSTMAP_REC_VIDEO_FPS = 15.0
+COSTMAP_REC_VIDEO_SCALE = 2.0        # a 55 m course at 0.2 m/px is only ~275 px across
+COSTMAP_REC_VIDEO_MAX_FRAMES = 900   # long runs sample slower instead of growing forever
+
 CAM_RES = 2
 CAM_FPS = 30
 CAM_HFOV = 110.0

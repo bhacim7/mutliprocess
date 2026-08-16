@@ -22,6 +22,7 @@
 10. [Saha kontrol listesi](#10-saha-kontrol-listesi)
 11. [Değişiklik günlüğü](#11-değişiklik-günlüğü)
 12. [GCS'ten röle kontrolü](#12-gcsten-röle-kontrolü--uygulandı)
+13. [Telemetri akışını hızlandırma (öneri)](#13-telemetri-akışını-hızlandırma--öneri-uygulanmadi)
 
 ---
 
@@ -492,6 +493,104 @@ Telemetri paketi `relay` alanıyla **342 B** → 5 Hz'de %29,7 seri doluluk. Rö
 | Cube yeniden başlarsa | `RELAY1_DEFAULT = 0` → kapalı gelir |
 | RC sinyali kesilip dönerse | ArduPilot anahtarları yeniden değerlendirebilir, sürüme göre değişir |
 | Aynı anda iki komut | Son yazan kazanır (mantıken; sahada doğrulanmadı) |
+
+---
+
+## 13. TELEMETRİ AKIŞINI HIZLANDIRMA — **öneri, UYGULANMADI**
+
+**Durum:** 2026-08-16 itibarıyla rafta. Aşağıdakilerin hiçbiri koda girmedi.
+
+### Gözlem
+
+Kapalı ortamda, üç telsiz yan yanayken GCS tekne paneli **2-3 saniyede bir** yenileniyor.
+Tasarım 3,3 Hz (300 ms) yoklama, yani **10 kat yavaş**.
+
+> Ölçüm uyarısı: bu gözlem paketteki `t_ms` alanına bakılarak yapıldı ve o alan
+> `"%H:%M:%S"` biçiminde — **çözünürlüğü 1 saniye**. 300 ms ile 900 ms'yi ayırt edemez.
+> Yani "2-3 s" kaba bir okuma; işe başlamadan önce gerçek ölçüm gerekiyor (D5).
+
+### Gecikme bütçesi (hesaplandı)
+
+| Adım | Süre |
+|---|---|
+| Yoklama aralığı | 300 ms |
+| Hava gidiş-dönüş | ~50 ms |
+| nav_process (25 Hz, kuyruk her turda boşaltılıyor) | 40 ms |
+| telem_process (20 Hz) | 50 ms |
+| 369 B @ 57600 seri | 64 ms |
+| **Toplam en kötü** | **~500 ms** |
+
+**500 ms ile 2-3 s arasındaki 5 kat fark açıklanamadı.** Çarpışma hesabı da yetersiz:
+havadaki toplam meşguliyet saniyede ~51 ms, yani %5. %5 meşguliyet %55 kayıp üretmez.
+
+### Kök neden (kısmen): üç telsiz, iki düğümlük TDMA
+
+SiK firmware zamanı **iki** tarafa bölüyor. Üçüncü telsizin kendi dilimi yok, mecburen
+birininkini paylaşıyor; ikisi aynı anda konuşursa **iki paket birden** ölüyor. Aynı
+`NETID`'deki telsizler birlikte frekans atladığı için kazara ayrılmaları da mümkün değil.
+
+Bu yazılımla çözülemez — firmware seviyesinde. Trafiği azaltmak etkisini hafifletir.
+
+### Açıklanamayan farkın adayları
+
+| # | Aday | Nasıl ayırt edilir |
+|---|---|---|
+| A | TDMA dilim bekleme | gönderilen yoklama = gelen cevap, ama geç |
+| B | `Manager` sözlüğü tıkanması (4 işlem aynı anda) | teknede "komut geldi → paket çıktı" süresi uzun |
+| C | Gerçek paket kaybı | gönderilen yoklama ≫ gelen cevap |
+| D | Telsiz tampon / akış kontrolü | cevaplar kümeler hâlinde geliyor |
+
+### Öneriler
+
+**D5 — Ölçüm göstergesi.** GCS kendi saatiyle: gerçek Hz, en uzun boşluk, gönderilen
+yoklama / gelen cevap, cevap gecikmesi. Teknede: `report_status` → paket çıkışı süresi.
+**Dört adayı birbirinden ayıran deney bu.** Önce bu yapılmalı.
+
+**D1 — Yoklamayı kaldır, tekne kendisi yayınlasın.** Şu an her güncelleme için havada
+**iki** iletim gerekiyor ve ikisi de varmalı. Tek yönlü yayında bir tane.
+
+| yön başına başarı | yoklama (p²) | yayın (p) |
+|---|---|---|
+| 0,90 | %81 | %90 |
+| 0,70 | %49 | %70 |
+| 0,55 | %30 | %55 |
+
+Ayrıca havadaki iletim sayısı 9,6/s → 5,0/s'ye iner (az trafik = az çarpışma = `p` yükselir),
+ve şu adımlar telemetri yolundan tamamen silinir: yoklama iletimi, `CommandReceiver`,
+`mp.Queue`, `nav_process`, `Manager` sözlüğü. ArduPilot/MAVLink zaten böyle çalışır.
+
+**D2 — Seri hız 57600 → 115200.** Seri hat şu an havadan yavaş: 5,76 KB/s'ye karşı
+~12,5 KB/s etkin. 369 B paket havada 13 ms, kabloda **64 ms**. Darboğaz telsiz değil kablo.
+Üç telsizin ayarı + `config.py` + GCS birlikte değişmeli.
+
+**D3 — Paketi küçült (369 → ~250 B).** `"hlth":"GOOD"` sabit dize (15 B), görev adı uzun
+metin yerine sayı, alan adları kısaltılabilir (GCS aynı anda güncellenir). %32 daha az hava
+süresi.
+
+**D4 — Drone'u sadece gerektiğinde hızlandır.** Sabit 3 Hz yerine: renk değişince 3 s
+boyunca 3 Hz, sonra 1 Hz + GCS eşiği 6 s. Marj yine 6 paket, hava kullanımı ⅓'e iner.
+(3 Hz sabit kararı teknenin kanalından çaldı.)
+
+**D6 — Dördüncü telsiz (donanım, kesin çözüm).** GCS'e ikinci telsiz, drone ayrı
+`NETID`/kanala. Tekne↔GCS temiz iki-düğüm bağlantısı olur, çarpışma imkânsızlaşır.
+GCS kodunda `worker_2` altyapısı zaten duruyor, kullanılmıyor. Yedek telsiz varsa bu tek
+başına konuyu kapatır ve D1-D4'e gerek kalmaz.
+
+### Menzil endişesi — yersiz
+
+40-50 m açık suda **şu ankinden kötü olması beklenmiyor**. RFD900x 1 W ile kilometrelerce
+gidiyor. Üstelik kapalı ortam çok yollu sönümleme (duvar yansımaları) yüzünden daha kötü
+olabilir. Sorun menzil değil, üç telsizin tek kanalda çarpışması — ve **bu mesafeyle
+değişmiyor**.
+
+### Yarış gerçeği
+
+Task 2 ve 3 sırasında drone inmiş, tetik kapalı → **drone hiç konuşmuyor**, kanal tamamen
+teknenin. Üçü birden aktifken yapılan test **en kötü durum**, sürekli hâl değil.
+
+### Önerilen sıra
+
+`D5 (ölç) → D1 (yayın) → ölçüme göre D2/D3/D4`. Yedek telsiz varsa `D6` hepsinin önüne geçer.
 
 ---
 
