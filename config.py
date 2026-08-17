@@ -215,7 +215,23 @@ CORRIDOR_WINDOW_AHEAD_M = 15.0
 CORRIDOR_REQUIRE_BOTH_SIDES = True
 # A buoy counts once it has been seen this many times and was seen recently.
 CORRIDOR_CONFIRM_SIGHTINGS = 3
-CORRIDOR_CONFIRM_MAX_AGE_S = 1.5
+# How long a confirmed boundary buoy keeps counting after it was last actually SEEN.
+#
+# 1.5 s was far too strict, and it interacted badly with the camera geometry: the FOV is
+# +/-55 deg, so a buoy being passed abeam leaves the frame and 1.5 s later stopped being a
+# boundary - even though its position sits safely in the 20 s object memory. The cap was
+# therefore built only from buoys inside the forward cone AT THAT MOMENT, and on a course
+# with irregular spacing one side regularly had none, which voids the whole cap
+# (CORRIDOR_REQUIRE_BOTH_SIDES). Those gaps are when the boat slipped outside the oranges
+# and came back in - the intermittent on/off of the cap is exactly that signature, seen
+# about 1 run in 10.
+#
+# 6 s keeps a passed buoy constraining for ~3 m of travel at survey speed. The safety
+# filters that justify trusting it are unchanged: pos_ok (confirmed within 12 m), seen >= 3,
+# and the buoys are anchored - their position does not go stale the way a moving target's
+# would. This also makes CORRIDOR_WINDOW_BACK_M actually do something: with a 1.5 s age
+# limit nothing behind the boat could ever qualify.
+CORRIDOR_CONFIRM_MAX_AGE_S = 6.0
 # Extra clearance kept inside the boundary buoys, and the cost charged per cell beyond it.
 # The penalty is per grid cell, against a base step cost of 1.0, so 6.0 makes a 1 m
 # excursion (10 cells at 0.10 m/px) cost about 30 - far more than any sane detour.

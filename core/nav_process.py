@@ -324,6 +324,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     # machine helpers are closures rebuilt every cycle, so a local would not survive. Cleared
     # whenever the boat is in a Task 1 state, i.e. before every Task 2 run.
     t2_entry = {'aligned': False}
+    # Throttle for the A*-failure log below - planning runs at 5 Hz and a genuinely blocked
+    # goal would otherwise print five times a second.
+    last_astar_fail_log = 0.0
 
     # Same list with distant-only positions removed; see MAP_MAX_RANGE_M. Initialised here
     # because the vision read below is throttled to VISION_READ_HZ and the costmap block runs
@@ -1295,6 +1298,16 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                         current_path = None
                                         current_path_ts = 0.0
                                         path_progress_idx = 0
+                                        # Say so. This fallback used to be completely silent,
+                                        # which made a contact impossible to diagnose after the
+                                        # fact: "position error ate the margin" and "the planner
+                                        # quit and the blind PID drove straight at it" look
+                                        # identical on the water. Now the log tells them apart -
+                                        # if a hit happens with no line here, it was the margin.
+                                        if (start_time - last_astar_fail_log) >= 1.0:
+                                            last_astar_fail_log = start_time
+                                            print("[NAV_PROCESS] A* found no path - falling "
+                                                  "back to obstacle-blind PID toward target.")
 
                                 # Never follow a path older than A_STAR_MAX_PATH_AGE_S.
                                 max_age = getattr(cfg, 'A_STAR_MAX_PATH_AGE_S', 0.6)
