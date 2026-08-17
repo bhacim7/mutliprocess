@@ -323,7 +323,14 @@ TASK_CONTEXT_MAP = {
     "TASK1_STATE_MID": ProtoEnum.TASK_ENTRY_EXIT,
     "TASK1_STATE_EXIT": ProtoEnum.TASK_ENTRY_EXIT,
     "FINISHED": ProtoEnum.TASK_NONE,
-    "TASK2_START": ProtoEnum.TASK_NONE,
+    # TASK_NONE here meant the detection boxes were not drawn during the entrance approach,
+    # because that drawing sits inside `if t_ctx != TASK_NONE`. Detection itself was never
+    # affected - update_and_get_id() runs before this check, so the map and the corridor cap
+    # always had the objects - but on the water the HUD showed a clean picture with buoys
+    # plainly in shot, which reads as "the detector is blind" exactly when the entry is being
+    # decided. `ctx` is not read anywhere and current_frame_objects is never consumed, so this
+    # only affects what is drawn.
+    "TASK2_START": ProtoEnum.TASK_NAV_CHANNEL,
     "TASK2_GO_TO_MID": ProtoEnum.TASK_NAV_CHANNEL,
     "TASK2_GO_TO_END": ProtoEnum.TASK_NAV_CHANNEL,
     "T3_START": ProtoEnum.TASK_NONE,

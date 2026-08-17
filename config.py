@@ -232,8 +232,20 @@ CORRIDOR_BIN_M = 2.0
 # the shortest line to the entry waypoint can slip between the first and second buoys of a
 # boundary chain rather than through the mouth. Aiming at a point behind the entrance first
 # forces the last leg to be aligned with the corridor, whichever diagonal we arrive from.
-TASK2_APPROACH_OFFSET_M = 12.0
-TASK2_APPROACH_REACHED_M = 3.0  # approach point counts as reached inside this radius
+# How far BACK along the corridor axis the alignment point sits. This is the "from how far
+# out does it line itself up" number - not TASK2_APPROACH_LATERAL_M, which is a sideways
+# threshold and was once raised on the assumption that it controlled this.
+#
+# 12 m made the aligned run longer than it needed to be. 5 m still gives the boat about ten
+# seconds on the axis at survey speed, and the approach to the point stays cheap because the
+# point is on the way in: for the 2026-08-17 geometry (16.3 m out, 3.68 m off axis) the whole
+# detour works out at 0.14 m of extra travel.
+TASK2_APPROACH_OFFSET_M = 5.0
+# Radius counting as "arrived" at the alignment point. Scaled down with the offset above:
+# at 3 m it would have swallowed more than half of a 5 m run, so the latch could close with
+# only 2 m of aligned approach left. If the boat somehow never enters this radius nothing
+# jams - once it passes the point, s_along > -offset makes the branch fall through anyway.
+TASK2_APPROACH_REACHED_M = 2.0
 # Only route via the approach point when we are this far off the corridor axis.
 # Lined up in front of the mouth, a straight run at the entry is already aligned,
 # and keying on lateral offset keeps the switch one-way instead of oscillating.

@@ -320,6 +320,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     last_vision_read = 0.0
     last_publish = 0.0
     vision_objects = []
+    # Task 2 entrance alignment latch. A dict rather than a bare flag because the state
+    # machine helpers are closures rebuilt every cycle, so a local would not survive. Cleared
+    # whenever the boat is in a Task 1 state, i.e. before every Task 2 run.
+    t2_entry = {'aligned': False}
+
     # Same list with distant-only positions removed; see MAP_MAX_RANGE_M. Initialised here
     # because the vision read below is throttled to VISION_READ_HZ and the costmap block runs
     # every cycle.
@@ -657,6 +662,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 # Helper to execute task routing logic
                 def execute_task1(task_state, lat, lon):
+                    # Back in Task 1 means a fresh run at the Task 2 mouth is still to come,
+                    # so drop the entrance latch here rather than trying to spot the exact
+                    # moment Task 2 ends.
+                    t2_entry['aligned'] = False
                     if task_state == "TASK1_APPROACH": return "TASK1_STATE_ENTER", None, None
 
                     targets = {
@@ -736,9 +745,44 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 #   * a simple "within `reached` of the approach point" test
                                 #     flipped back the moment the boat moved past it toward
                                 #     the entry and left that radius again.
+                                #
+                                # The lateral test alone was not enough. On the 2026-08-17 run
+                                # the boat sat 16.3 m in front of the mouth but only 3.68 m off
+                                # the axis, so 3.68 > 8.0 was false, the approach point was
+                                # skipped, and it ran the whole 16.7 m diagonally - which is how
+                                # it came to enter on the far side of a boundary buoy when the
+                                # entry waypoint was placed near the edge of the course.
+                                #
+                                # So there is a second way in: if the boat is still BEHIND the
+                                # approach point, aim at it. Comparing s_along against -offset
+                                # is exactly the test for "have I passed it yet", because the
+                                # point sits at s = -offset by construction. Behind it, going
+                                # there is forward motion and costs almost nothing - 0.9 m of
+                                # extra travel for the run above. Past it, going there would
+                                # mean REVERSING away from the mouth, which is what made the
+                                # earlier 3 m lateral setting look like it was aligning from
+                                # much too far out, and why it was raised to 8 to suppress that.
+                                # This branch cannot reverse.
+                                #
+                                # The lateral branch stays at its tuned 8 m as a last resort:
+                                # close to the mouth but far off to the side is a bad enough
+                                # entry angle to be worth backing up for.
                                 lateral_tol = getattr(cfg, 'TASK2_APPROACH_LATERAL_M', 3.0)
-                                if s_along < 0.0 and d_across > lateral_tol and \
-                                        nav.haversine(lat, lon, a_lat, a_lon) > reached:
+                                dist_to_approach = nav.haversine(lat, lon, a_lat, a_lon)
+
+                                # Latch. Without it the boat ping-pongs: on leaving the approach
+                                # point towards the entry, its distance to that point grows past
+                                # `reached` again, the condition re-arms, and it turns back.
+                                # Flight log 03:59:02-03:59:31 recorded exactly that, HEDEF_HDG
+                                # swinging 143, 273, 296, 177, 100, 256. Once aligned, this run
+                                # never targets the point again.
+                                if dist_to_approach <= reached:
+                                    t2_entry['aligned'] = True
+
+                                if (not t2_entry['aligned']
+                                        and s_along < 0.0
+                                        and dist_to_approach > reached
+                                        and (s_along < -offset or d_across > lateral_tol)):
                                     return task_state, a_lat, a_lon
 
                         return task_state, t_lat, t_lon
