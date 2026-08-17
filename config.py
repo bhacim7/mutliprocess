@@ -295,6 +295,28 @@ T3_START_LON = 29.2622792
 T3_MID_LAT = 40.8096887
 T3_MID_LON = 29.2622795
 
+# --- ObjectMemoryManager: how long a buoy is remembered, and how its velocity is used ---
+#
+# The 2026-08-12 run created 292 tracks for 25-30 buoys, because a track was dropped after
+# 5 s and a buoy is routinely out of frame for longer than that. Each recycle re-converged
+# to a slightly different position, and A* - which re-reads the map every planning cycle -
+# saw the obstacle jump ~0.5 m and could change which side it passed on. That is the
+# between-track spread the costmap recorder prints; per-track precision was already 0.22 m.
+#
+# 20 s is a starting point, not a measured optimum. Raise it and stale detections linger
+# proportionally longer; lower it and tracks start recycling again. The recorder's
+# `tracks:` count is the number to watch - it should fall towards `buoys (clustered):`.
+OBJECT_MEMORY_S = 20.0
+
+# Velocity guards. These are what make the longer memory safe, and they are a fix in their
+# own right: buoys are anchored, so any velocity attributed to them is noise. It was
+# estimated over a single ~0.1 s frame gap, which turns 0.2 m of position noise into an
+# apparent 2 m/s. Require a real baseline before believing a velocity, and never project it
+# further ahead than a second - unclamped, a 0.4 m/s phantom velocity over a 20 s memory
+# predicts the buoy 8 m away, the match fails, and the track duplicates instead of merging.
+OBJECT_VEL_MIN_DT_S = 0.5       # ignore velocity updates computed over a shorter gap
+OBJECT_VEL_MAX_PREDICT_S = 1.0  # cap forward projection during matching
+
 TASK3_KAMIKAZE_COLOR = "black"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 

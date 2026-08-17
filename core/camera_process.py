@@ -121,6 +121,31 @@ class ObjectMemoryManager:
         self.id_counter = 1
         self.MERGE_DISTANCE = 2.5  # 2.5 meters merge distance
 
+        # How long a track survives without a sighting.
+        #
+        # This was a hardcoded 5.0 s, which is shorter than a buoy routinely spends out of
+        # frame. Every time one came back it was allocated a NEW id and its position
+        # re-converged to a slightly different answer - measured 292 tracks for the 25-30
+        # buoys of the 2026-08-12 run. A* re-reads the map every planning cycle, so each of
+        # those 292 recycles was a chance for an obstacle to jump ~0.5 m and for the planner
+        # to change which side it passes on.
+        #
+        # Only raise this together with the velocity guards below. Extrapolating a noisy
+        # velocity over 20 s throws the predicted position metres away from the buoy, the
+        # match fails anyway, and the stale track lingers as a phantom for the full window -
+        # strictly worse than the 5 s it replaced.
+        self.memory_s = float(getattr(cfg, 'OBJECT_MEMORY_S', 20.0))
+
+        # Velocity is estimated as (position change / dt). At the 10 Hz publish rate dt is
+        # ~0.1 s, so the ~0.2 m position noise divides up into an apparent 2 m/s - on a buoy
+        # that is anchored to the seabed. Smoothing damps it but leaves 0.3-0.5 m/s of pure
+        # noise standing. Requiring a longer baseline stops dividing by a tiny number, and
+        # capping how far ahead that velocity is projected bounds the damage when it is
+        # wrong. Genuinely moving objects keep a second of prediction, which is most of the
+        # benefit; anchored ones can no longer wander off on noise.
+        self.vel_min_dt_s = float(getattr(cfg, 'OBJECT_VEL_MIN_DT_S', 0.5))
+        self.vel_max_predict_s = float(getattr(cfg, 'OBJECT_VEL_MAX_PREDICT_S', 1.0))
+
     def update_and_get_id(self, lat, lon, obj_type, color, cid=None, cx=None, cy=None, obj_dist=None, area=None):
         """
         cx/cy/obj_dist/area are PER-FRAME (transient) values from the current detection.
@@ -144,14 +169,19 @@ class ObjectMemoryManager:
         best_match = None
         min_dist = float('inf')
 
-        # Clean up old objects (not seen in 5 seconds)
-        self.memory = [obj for obj in self.memory if (current_time - obj['last_seen']) < 5.0]
+        # Drop tracks that have not been seen for memory_s (see __init__).
+        self.memory = [obj for obj in self.memory
+                       if (current_time - obj['last_seen']) < self.memory_s]
 
         for obj in self.memory:
-            # Predict current position based on velocity
+            # Predict current position based on velocity, but never project further than
+            # vel_max_predict_s. Beyond that the term is dominated by velocity noise rather
+            # than by motion, and with a 20 s memory an unclamped projection puts the buoy
+            # metres from where it is - so the match fails and the track is duplicated.
             dt = current_time - obj['last_seen']
-            pred_lat = obj['lat'] + (obj['v_lat'] * dt)
-            pred_lon = obj['lon'] + (obj['v_lon'] * dt)
+            dt_pred = min(dt, self.vel_max_predict_s)
+            pred_lat = obj['lat'] + (obj['v_lat'] * dt_pred)
+            pred_lon = obj['lon'] + (obj['v_lon'] * dt_pred)
 
             # Calculate distance to predicted position
             dy = (pred_lat - lat) * 111139
@@ -165,9 +195,12 @@ class ObjectMemoryManager:
                     best_match = obj
 
         if best_match:
-            # Update velocity
+            # Update velocity, but only over a long enough baseline to mean anything.
+            # dt used to be whatever the frame interval happened to be (~0.1 s), and
+            # dividing the position noise by that manufactured metres per second of motion
+            # for an anchored buoy.
             dt = current_time - best_match['last_seen']
-            if dt > 0:
+            if dt >= self.vel_min_dt_s:
                 best_match['v_lat'] = best_match['v_lat'] * 0.8 + ((lat - best_match['lat']) / dt) * 0.2
                 best_match['v_lon'] = best_match['v_lon'] * 0.8 + ((lon - best_match['lon']) / dt) * 0.2
 
