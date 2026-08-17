@@ -2,7 +2,12 @@
 
 **Son güncelleme:** 2026-08-12
 **Durum:** Uygulandı ve sahada doğrulandı. Task 2 çarpmadan ve parkurdan çıkmadan tamamlanıyor.
-**Sıradaki test:** (a) GPS noktaları parkurun daha da kenarına atılarak koridor kapağının sınavı, (b) GCS röle butonlarının saha denemesi.
+**Sıradaki test (hiçbiri suda denenmedi):**
+(a) GPS noktaları parkurun kenarına atılarak koridor kapağının sınavı ·
+(b) GCS röle butonları — kumanda etkileşimi ·
+(c) drone renk zinciri (`DRONE_ACTIVE` yeni açıldı) ·
+(d) iz ömrü 20 s — costmap'te `tracks:` sayısı ·
+(e) costmap videosu — `.npz` düşüyor mu, `mp4v` kodlayıcısı teknede var mı
 
 **Kardeş belge:** Drone plaket rengi tespiti için → [`ANALIZ_DRONE_COLOR.md`](ANALIZ_DRONE_COLOR.md)
 
@@ -23,6 +28,8 @@
 11. [Değişiklik günlüğü](#11-değişiklik-günlüğü)
 12. [GCS'ten röle kontrolü](#12-gcsten-röle-kontrolü--uygulandı)
 13. [Telemetri akışını hızlandırma (öneri)](#13-telemetri-akışını-hızlandırma--öneri-uygulanmadi)
+14. [Drone renk zinciri](#14-drone-renk-zinciri--uygulandı)
+15. [Costmap videosu](#15-costmap-videosu--uygulandı)
 
 ---
 
@@ -334,13 +341,69 @@ HEADING_SOURCE            'ZED'     GCS polling               200 ms
 
 0,50 m konum hatasıyla "çarpmamak" ve "1,5 m geçit geçmek" aynı anda sağlanamıyor. Şu an 1,8 m altı geçitler kapalı; koridor kapağı bunun parkurdan çıkmaya dönüşmesini engelliyor.
 
-Konum hatasını düşürmenin üç yolu, **hiçbiri uygulanmadı**:
+Konum hatasını düşürmenin üç yolu:
 
-| Yol | Not |
+| Yol | Durum |
 |---|---|
-| **Pusula kaynağını değiştirmek** (`HEADING_SOURCE` → `'FC'`/`'FUSED'`) | 0,50 m ≈ 10 m'de 2,9° başlık hatası. Cube manyetometresi kalibre edilmediği için ertelendi |
-| **İz ömrünü uzatmak** (`ObjectMemoryManager` 5 s → 20-30 s) | Şamandıralar sabit; alfa filtresi ortalamaya devam ederse etkin hata 0,50 → 0,22'ye yaklaşır. **En ucuz seçenek, henüz denenmedi** |
-| **Yakın mesafe tepkisel katman** | Kamera kerterizi ~1° hassas ve pusuladan/GPS'ten bağımsız. Kullanıcı tarafından reddedildi: A\*'ın akıcılığını bozar |
+| **İz ömrünü uzatmak** (`ObjectMemoryManager`) | ✅ **uygulandı** — 5 s → 20 s, hız korumalarıyla birlikte. Ayrıntı aşağıda. Suda denenmedi |
+| **Pusula kaynağını değiştirmek** (`HEADING_SOURCE` → `'FC'`/`'FUSED'`) | ❌ 0,50 m ≈ 10 m'de 2,9° başlık hatası. Cube manyetometresi kalibre edilmediği için **ertelendi** |
+| **Yakın mesafe tepkisel katman** | ❌ Kamera kerterizi ~1° hassas ve pusuladan/GPS'ten bağımsız. **Kullanıcı reddetti**: A\*'ın akıcılığını bozar |
+
+#### İz ömrü — neyin düzeltildiği (ve neyin düzelmediği)
+
+**Belgenin önceki hâli yanlıştı**, düzeltiliyor. İki iddia hatalıydı:
+
+*"Tek sayı değişikliği"* — değil. Eşleştirme, izi **hızıyla ileri taşıyarak** yapıyor ve o hız
+tek kare aralığından (~0,1 s) hesaplanıyor. 0,2 m konum gürültüsünü 0,1 s'ye bölmek,
+demirli bir şamandıraya **2 m/s** görünür hız atfediyor; yumuşatma sonrası **0,43 m/s**
+kalıcı sahte hız ölçüldü. 20 saniyeye yayılınca tahmin şamandıradan metrelerce uzağa
+düşüyor, 2,5 m eşleşme yarıçapını aşıyor, iz yine ikizleniyor — üstelik bayat kopya
+4 kat uzun yaşıyor.
+
+*"Etkin hata 0,50 → 0,22'ye yaklaşır"* — yaklaşmaz. `x ← 0.8x + 0.2z` bir **üstel hareketli
+ortalama**; zaman sabiti ~5 örnek, yani 10 Hz'de yarım saniye. Koşunun tamamını ortalamıyor,
+**son okumaları takip ediyor**. Ömrü uzatmak bunu değiştirmez.
+
+Uygulanan üç değişiklik:
+
+| | Ne | Config |
+|---|---|---|
+| a1 | Hız sadece yeterli aralıkta güncellenir | `OBJECT_VEL_MIN_DT_S = 0.5` |
+| a2 | İleri tahmin sınırlandı | `OBJECT_VEL_MAX_PREDICT_S = 1.0` |
+| b | İz ömrü 5 s → 20 s | `OBJECT_MEMORY_S = 20.0` |
+
+Simülasyon — tek **sabit** şamandıra, 8 s aralarla 6 kez görünüyor, 0,2 m gürültü,
+doğru cevap **1 kimlik**:
+
+| | Kimlik | Sahte hız |
+|---|---|---|
+| Eski (5 s, sınırsız hız) | 6 | 0,43 m/s |
+| **Sadece (b)** — 20 s, sınırsız hız | **4** | 0,43 m/s |
+| Yeni (20 s + a1 + a2) | **1** ✅ | 0,01 m/s |
+
+Orta satır önemli: ömrü tek başına uzatmak işin ancak bir kısmını kurtarıyor.
+
+**Asıl kazanç doğruluk değil, kararlılık.** İz geri dönüşümü bittiği için A\* haritasındaki
+engel artık ~0,50 m zıplamıyor — 2026-08-12 koşusunda 292 kez zıplama fırsatı vardı.
+
+**Bedeli:** yanlış tespit 5 s yerine 20 s hayalet kalır. Arkadakiler yerel costmap'ten
+kendiliğinden çıkar (20 s'de 36 m), ama öndeki sahte engel planlayıcıyı daha uzun dolaştırır.
+`seen` sayacı hazır lever olarak duruyor.
+
+**Alfa filtresine bilerek dokunulmadı (c).** Düz koşan ortalama, uzaktan yapılan yüksek
+hatalı tespitlere yakındakilerle eşit ağırlık verirdi; mevcut EMA son (yakın, daha iyi)
+ölçümleri takip ederek kazara doğru olanı yapıyor. Düzgünü **mesafeye göre ağırlıklandırmak**,
+o da önce ölçüm istiyor.
+
+**Ölçüm tuzağı:** başarılı olursa `between-track spread` satırı **seyrelir veya kaybolur** —
+o satır sadece birden fazla ize sahip şamandıralar için basılıyor. **Kaybolması sonuçtur,
+eksik veri değil.** Bakılacak satır:
+
+```
+[COSTMAP]   tracks: 292   buoys (clustered): 30
+                    ▲                     ▲
+              30-60'a düşmeli        aynı kalmalı
+```
 
 ### Diğer ertelenenler
 
@@ -409,7 +472,11 @@ Konum hatasını düşürmenin üç yolu, **hiçbiri uygulanmadı**:
 | `e67dd76` | **Task 2 koridor kapağı** + şişirme 0,25 + yaklaşma noktası + GCS 200 ms + recorder kümeleme |
 | `90c2657` | Yaklaşma noktası kilitlenmesi düzeltildi |
 | `f12b191` | Şişirme 0,25 → 0,45 (yanlış istatistikten ayarlanmıştı) |
-| *(bu)* | Şişirme 0,45 → **0,50**, `TASK2_APPROACH_LATERAL_M` 3 → **8** (sahada doğrulandı) |
+| `2cb2a49` | Şişirme 0,45 → **0,50**, `TASK2_APPROACH_LATERAL_M` 3 → **8** (sahada doğrulandı) |
+| `60bdaf8` | **GCS'ten röle kontrolü** (§12) |
+| `1538042` | **Drone renk zinciri** — kapalı çevrim, paket kurtarma, `DRONE_ACTIVE` (§14) |
+| `3653cc7` | **Costmap videosu** + telemetri önerileri (§13, §15) |
+| `f31b409` | **İz ömrü 20 s + hız korumaları** (§9) |
 
 ---
 
@@ -594,10 +661,244 @@ teknenin. Üçü birden aktifken yapılan test **en kötü durum**, sürekli hâ
 
 ---
 
+## 14. DRONE RENK ZİNCİRİ — **uygulandı**
+
+**Durum:** Kod yazıldı, mantık doğrulandı, **uçurulmadı.**
+
+### Zincir
+
+```
+drone_color.py        →  {"id":3, "drone_color":"SIYAH"}
+GCSv1000.on_packet()  →  {"target_id":1, "cmd":"set_target_color", "color":"black"}
+nav_process           →  shared_state['drone_target_color'] = "black"
+Task 3                →  if cfg.DRONE_ACTIVE:  target_color = shared_state[...]
+```
+
+### Korunan üç kural
+
+Bunlar baştan doğru tasarlanmıştı, hiçbir değişiklik bunlara dokunmadı:
+
+1. **Sadece renk değişince gönder** — heartbeat aynı rengi tekrarlarken hat boş kalır
+2. **`BELIRSIZ` iletilmez** — drone anlık kararsızlaşınca teknenin elindeki renk silinmez
+3. **Son gelen kazanır, kilit yok** — `siyah → kırmızı` senaryosu kendi kendini düzeltir
+
+### Kapatılan delikler
+
+| Delik | Neydi | Çözüm |
+|---|---|---|
+| **`DRONE_ACTIVE = False`** | Tekne rengi alıyor, saklıyor, `Drone target color updated to ...` logluyor — **ama kullanmıyordu**. Task 3 `TASK3_KAMIKAZE_COLOR` ile gidiyordu. Zincir son adımda kapalıydı | `True` |
+| **Kaybolan komut asla tekrarlanmıyor** | GCS bir kez gönderip kendi defterine "gitti" yazıyordu. O tek paket kaybolursa drone dakikalarca KIRMIZI raporlar, GCS "değişmedi" deyip **susardı** | Kapalı çevrim (aşağıda) |
+| **Tekne yeniden başlarsa renk gider** | `shared_state` sıfırlanır, GCS yine susar | Aynı kapalı çevrim |
+| **Drone paneli tekneden 4 kat hassas** | 1 Hz heartbeat + 2500 ms eşik = **3** ardışık kayıpta "koptu". Tekne 5 Hz yoklamada 12 gerektiriyordu | 3 Hz + 4000 ms → **12** |
+| **Poz ayarı drone'u susturuyor** | `calibrate_exposure()` ana döngüde 1,5-4 s kare okuyor; o sürede hiç paket gitmiyordu. Eşikten uzun → **her poz ayarında garantili "Bağlantı Koptu"**, telsiz sağlamken | `link_keepalive` geri çağrısı okuma döngülerine geçirildi |
+| **Bozuk tekne paketi drone'unkini yutuyor** | GCS satır sonuna göre bölüyor. Havada bozulan tekne paketinin satır sonu gelmeyince yarım satır tamponda kalıyor, sıradaki paket ona yapışıyor, `json.loads` patlıyor, **ikisi de çöpe** gidiyordu. Tekne çok daha sık yayınladığı için kurban genelde **sapasağlam gelen drone paketi** oluyordu | `_parse_or_recover()` |
+| **GCS seri portunda `write_timeout` yok** | `flush()` akış kontrolünde süresiz bloklar; aynı thread okuma da yaptığı için **iki LED birden** kırmızıya döner | `write_timeout=0.5` |
+
+### Kapalı çevrim — röledeki ilkenin aynısı
+
+Tekne telemetrisi artık **elinde tuttuğu rengi ve kaynağını** taşıyor (~27 B):
+
+| Alan | Değerler |
+|---|---|
+| `tcol` | rengin kendisi, boş = henüz gelmedi |
+| `tsrc` | `"cfg"` = `DRONE_ACTIVE` kapalı, config karar veriyor · `"drone"` = drone karar veriyor |
+
+GCS ikisini karşılaştırıyor; uyuşmazsa komutu **tekrar gönderiyor** (2 s hız sınırıyla).
+Her şey yolundayken **tamamen sessiz** — "sadece değişince gönder" kuralı bozulmuyor.
+
+> *Son gönderdiğin komuta değil, aracın bildirdiği gerçek duruma bak.*
+
+### GCS'te TASK3 RENK göstergesi
+
+İHA panelinde, drone'un gördüğü rengin **altında** — üstteki drone'un gördüğü, alttaki
+**teknenin elindeki**. İkisi aynı şey değil ve fark tam olarak mesele:
+
+| Durum | Ekranda | Renk |
+|---|---|---|
+| `DRONE_ACTIVE = False` | `SIYAH (config)` | gri |
+| `True`, renk gelmedi | **`RENK YOK`** | turuncu |
+| Renk ulaştı | `KIRMIZI (drone)` | yeşil |
+
+Suda "siyahı kovalıyor çünkü drone öyle dedi" ile "siyahı kovalıyor çünkü drone hiç
+ulaşmadı, config öyle diyor" **birebir aynı görünür** ve çok farklı şeylerdir.
+
+### Yol boyunca çıkan gizli tehlike
+
+`CommandReceiver` telsizde duyduğu **her satırı** kuyruğa koyuyordu ve `nav_process`
+`target_id`'ye bakmadan işliyordu. **Drone'a gönderilen bir röle komutunu tekne de
+uygulardı.** Artık `VEHICLE_ID` ile filtreleniyor; `target_id` taşımayan eski komutlar
+çalışmaya devam ediyor.
+
+### Reddedilen öneri
+
+**Boştayken heartbeat** (tetik kapalıyken de "buradayım, boştayım" yollamak) — GCS'in
+"koptu" ile "boşta"yı ayırmasını sağlardı, maliyeti %0,4. **Kullanıcı reddetti:** drone
+sadece 1. görevde birkaç dakika uçuyor, tetik elle yönetiliyor, hat bütçesi buna
+harcanmasın.
+
+### Doğrulama (mantık düzeyinde)
+
+Paket kurtarma **8/8** — yarım tekne + tam drone, `MEVCUT_KONUM` ortasından kesik, üç paket
+zinciri, kurtarılamayan çöp. **İç içe süslü parantez tuzağı geçti:** sadece paket başlangıcı
+aranıyor, körü körüne süslü parantez aransaydı `{"lat":...,"lon":...}` geçerli JSON olarak
+kabul edilip **id'siz bir paket** olarak arayüze verilirdi (ve sessizce tekneninki sayılırdı).
+
+Kapalı çevrim **5/5** — uyuşmazlıkta tekrar, 2 s içinde sessiz, onayda susma, tekne yeniden
+başlayınca tekrar.
+
+### Hat bütçesi
+
+| | Önce | Sonra |
+|---|---|---|
+| Hat doluluğu | %33,8 | **%25,3** |
+| Drone kopma marjı | 3 ardışık | **12** |
+| Tekne kopma marjı | 12 | 8 (etkisiz: %4 kayıpta 8 ardışık ≈ 10⁻¹¹) |
+| Yoklama | 200 ms | 300 ms |
+
+### Sahada bakılacaklar
+
+1. Otonom komutu → **`RENK YOK`** yazmalı (artık `SIYAH (config)` değil)
+2. Trigger aç, plaket göster → **yeşil** `KIRMIZI (drone)`
+3. Drone LED'i poz ayarı sırasında artık kırmızıya düşmemeli
+4. Durum çubuğunda `tekrar gönderildi` çıkarsa → paket kaybı var **ama kendini onarıyor**
+5. `DRONE_ACTIVE` açık: drone hiç uçmazsa Task 3 yine `TASK3_KAMIKAZE_COLOR` ile gider
+   (güvenli geri düşüş) — ama GCS `RENK YOK` yazacağı için farkında olursunuz
+
+---
+
+## 15. COSTMAP VİDEOSU — **uygulandı**
+
+**Durum:** Kod yazıldı, **teknede çalıştırılmadı.**
+
+### Neden PNG'den video üretilemez
+
+PNG **tek kare**: koşunun bittiği andaki son hâl. İçinde zaman yok. Betik PNG'yi değil,
+**ayrı bir ham veri dosyasını** okuyor.
+
+### Eksik olan tek şey zamandı
+
+Kayıt üç katman tutuyordu ve ikisinde zaman bilgisi yoktu:
+
+| Katman | Zaman | Not |
+|---|---|---|
+| `track` | dolaylı | 5 Hz düzenli, sıra ≈ zaman |
+| `observations` | **yoktu** | 1 Hz toplu ekleniyor, **turlar arası ayraç yok**, tur boyu değişken → sıradan zaman çıkarılamaz |
+| `objects` | **yoktu** | sözlük, sadece **en son** konum |
+
+Çözüm: gözleme zaman damgası + ize ilk görülme anı.
+
+```
+observations: (x, y, cid)  →  (x, y, cid, t)
+objects[id]:  + 't0'
+```
+
+10 dakikalık koşuda ~70 KB. `render()` ve `_scatter_radii()` içindeki iki açma satırı
+güncellendi; **üretilen PNG piksel piksel aynı.**
+
+### Şamandıralar nihai konumlarıyla belirir
+
+Kümeleme sonda **bir kez** yapılır; her kare "ilk görülme anı ≤ T olan kümeleri" çizer.
+Şamandıralar **keşif sırasıyla belirir ve bir daha kıpırdamaz.**
+
+Alternatifi (her karede yeniden kümeleme) daha dürüst ama nokta titrer, bazen iki küme
+birleşip biri kaybolur — jüriye **hata gibi** görünür. Ve 600 kare × yeniden kümeleme.
+
+**Kaybedilen bilgi yok:** tahminin nasıl yakınsadığı zaten PNG'de — soluk gözlem bulutu ve
+saçılım halkaları tam olarak bunu gösteriyor.
+
+> **İş bölümü:** PNG **belirsizliği** gösterir, video **kronolojiyi**.
+
+Küçük incelik: "ilk görülme" tek bir gürültülü tespitle erkene kaymasın diye **3'ten az
+gözlemi olan izler** bu hesaba katılmıyor.
+
+### Render neden pahalı olurdu
+
+`_scatter_radii()` her gözlemi aynı sınıftaki her nesneyle karşılaştırıyor — kare başına
+~0,5-1 s. 600 kare = **10 dakika.** İki katmanlı çözüm:
+
+- **Saçılım halkaları videodan çıkarıldı** — istatistiksel teşhis, PNG'de kalıyor. Pahalı kısım buydu
+- **Kümeleme bir kez** → kare başına O(1)
+- Gözlem bulutu ve iz **artımlı** çiziliyor: her kare öncekinin üstüne ekleniyor, sıfırdan değil
+
+### Örnekleme ≠ oynatma
+
+```
+ÖRNEKLEME  1 Hz   verinin çözünürlüğü
+OYNATMA   15 fps  izleme hızı
+```
+
+İkisi de 1 olsa 10 dakikalık koşu = 10 dakikalık video. 15 fps ile **~40 saniye**.
+Her karede geçen süre yazılı, gerçek zamanlama okunabilir kalıyor.
+
+### Kapanma yolu — asıl risk
+
+`save()` **`atexit` ve sinyal işleyicisinden** çağrılıyor. Ctrl+C'ye basınca program hemen
+kapanmıyor, önce `save()` çalışıyor. Bugün ~1 s, videoyla 15-30 s.
+
+Asıl tehlike süre değil, **yeniden girme**:
+
+```python
+self.save()                          # ← 30 saniye burada
+signal.signal(sig, signal.SIG_DFL)   # ← varsayılan davranış ANCAK BURADA geri geliyor
+```
+
+O 30 saniye boyunca SIGINT hâlâ aynı işleyiciye gidiyor ve `_saved` bayrağı henüz
+kurulmadığı için **ikinci Ctrl+C render'ı en baştan başlatıyor.** Program Ctrl+C ile
+kapanmaz hâle gelir. Bugün pencere ~1 s olduğu için isabet ettirmek imkânsıza yakın;
+30 saniyede **kaçınmak** imkânsız olurdu — kullanıcının doğal tepkisi tam olarak budur.
+
+Ayrıca MP4'ün dizini (`moov atom`) `release()` ile yazılır. Süreç ondan önce ölürse dosyada
+kareler vardır ama dizin yoktur → *"yarım video"* değil, **hiç açılmayan dosya**.
+
+**Korunma:** PNG **önce** yazılır, `_saved` **hemen sonra** kurulur, video en sonda.
+İkinci Ctrl+C artık `if self._saved: return` ile anında dönüyor — video yarım kalır ama
+PNG garanti ve program **temiz kapanır**.
+
+### Neden ayrı betik
+
+Ham veri her zaman yazılıyor (milisaniyeler, risksiz). Video isteğe bağlı.
+
+| | Kapanışta render | Ayrı betik |
+|---|---|---|
+| Kapanma süresi | +30 s | **değişmez** |
+| Ctrl+C riski | var | **yok** |
+| Ayarı beğenmezseniz | koşuyu tekrarlayın | **betiği tekrar çalıştırın** |
+| Nerede çalışır | Jetson | **laptop (hızlı)** |
+| Kodlayıcı yoksa | veri kayıp | **veri elinizde** |
+
+### Teknede kontrol edilecek
+
+Kapanışta `.npz` düşüyor mu, ve `mp4v` kodlayıcısı var mı — ikincisi tek satırla sınanır
+(`VideoWriter` açılmalı ve dosya sıfır bayttan büyük olmalı). Açılmazsa `MJPG` + `.avi`
+kullanılır: dosya büyük ama her yerde çalışır.
+
+### Küçük ama canını yakacak ayrıntılar
+
+- **Sabit tuval:** MP4 sabit boyut ister. Sınırlar tüm veriden bir kez hesaplanır — yan etkisi güzel: harita boş çerçeveye **doğru büyür**
+- **Çift sayı zorunluluğu:** `mp4v` tek sayılı boyutlarda sessizce bozuk dosya üretir
+- **Çözünürlük:** 0,2 m/px'te tipik parkur ~500×300 px, video için küçük → ölçekleme gerekiyor
+
+---
+
 ## KAPANIŞ NOTU
 
 Bu süreçte en çok tekrar eden hata, **yanlış istatistiğe bakmak** oldu: şişirme değeri iz-içi saçılmadan ayarlandı ve tekne şamandıralara çarptı. Doğru sayı (izler arası fark) ancak recorder'a kümeleme eklenince ortaya çıktı.
 
 İkinci tekrar eden hata, **durum makinesi değişikliğini sahada test etmek**: yaklaşma noktası iki kez yanlış yazıldı, ikisi de ancak sudayken görüldü. Artık konum konum simülasyonla doğrulanıyor.
 
-Her ayar değişikliğinin gerekçesi `config.py` içinde yorumda duruyor — bir değeri değiştirmeden önce oradaki hesabı okuyun.
+Üçüncü tekrar eden hata, **tek atışa güvenmek**: röle komutu da renk komutu da bir kez
+gönderilip "gitti" sayılıyordu. İkisi de aynı ilkeyle düzeltildi — *son gönderdiğin komuta
+değil, aracın bildirdiği gerçek duruma bak.* Kayıp bir paketin sessizce yanlış bir duruma
+kilitlemesi, telsiz hattında istisna değil kuraldır.
+
+Dördüncüsü, **"tek sayı değişikliği" sanmak**: iz ömrünü 5 s'den 20 s'ye çıkarmak tek
+başına işin ancak yarısını kurtarıyordu, çünkü eşleştirme gürültüden doğan sahte bir hızla
+ileri tahmin yapıyordu. Bu belgede o iddia bir süre **yanlış** olarak durdu; simülasyon
+düzeltti.
+
+Her ayar değişikliğinin gerekçesi `config.py` içinde yorumda duruyor — bir değeri
+değiştirmeden önce oradaki hesabı okuyun.
+
+**Suda denenmemiş olanlar** (2026-08-17): röle kumanda etkileşimi, drone renk zinciri,
+iz ömrü 20 s, costmap videosu, kenar GPS noktalarıyla koridor kapağı sınavı. §13'teki
+telemetri önerilerinin **hiçbiri uygulanmadı**.
