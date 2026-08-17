@@ -146,6 +146,30 @@ class ObjectMemoryManager:
         self.vel_min_dt_s = float(getattr(cfg, 'OBJECT_VEL_MIN_DT_S', 0.5))
         self.vel_max_predict_s = float(getattr(cfg, 'OBJECT_VEL_MAX_PREDICT_S', 1.0))
 
+        # Beyond this range a sighting is not trusted to place a buoy on the map.
+        #
+        # The projected position is (boat GPS) + (distance) at (heading + pixel offset), so a
+        # heading error becomes a TANGENTIAL position error that grows linearly with range.
+        # Measured on the 2026-08-17 run by taking the principal axis of each buoy's sighting
+        # cloud and comparing it with the line of sight: 6 of 9 orange clouds were elongated
+        # ACROSS the line of sight (median 73.5 deg, 2.4x elongation, 0.68 m at 1 sigma), not
+        # along it. So the dominant error is heading, not ZED depth.
+        #
+        # What that costs at range, at the measured ~2.6 deg:
+        #     5 m -> 0.23 m     12 m -> 0.55 m     20 m -> 0.91 m     30 m -> 1.36 m
+        # Two encounters differ by roughly twice that, so buoys seen far away land 2-3 m
+        # apart - past the 2.5 m merge radius - and one real buoy becomes several tracks. That
+        # is why the run recorded 33 orange "buoys" whose median nearest-neighbour spacing was
+        # 2.91 m, and why 6 of them sat within hull-contact distance of the boat's own track:
+        # positions it is not physically possible for a buoy to occupy.
+        #
+        # Yellow, seen at 4-11 m, stayed under the merge radius and produced 7 clean tracks
+        # from the same code. The gate puts orange into that same regime.
+        #
+        # This also improves ACCURACY rather than merely tidying the count: the stored
+        # position stops being an average that includes 30 m sightings with 1.4 m of error.
+        self.map_max_range_m = float(getattr(cfg, 'MAP_MAX_RANGE_M', 12.0))
+
     def update_and_get_id(self, lat, lon, obj_type, color, cid=None, cx=None, cy=None, obj_dist=None, area=None):
         """
         cx/cy/obj_dist/area are PER-FRAME (transient) values from the current detection.
@@ -194,27 +218,45 @@ class ObjectMemoryManager:
                     min_dist = dist
                     best_match = obj
 
+        # A sighting from beyond map_max_range_m may keep a track ALIVE and refresh the
+        # per-frame fields Task 3 steers on, but it may not move the stored position, vote on
+        # the colour, or count towards the corridor's sighting confirmation. Task 3's visual
+        # servoing works off 'cx' in pixels and never reads lat/lon, so it is unaffected by
+        # this; the Task 2 costmap is exactly what needs protecting from it.
+        near = (obj_dist is None) or (float(obj_dist) <= self.map_max_range_m)
+
         if best_match:
             # Update velocity, but only over a long enough baseline to mean anything.
             # dt used to be whatever the frame interval happened to be (~0.1 s), and
             # dividing the position noise by that manufactured metres per second of motion
             # for an anchored buoy.
             dt = current_time - best_match['last_seen']
-            if dt >= self.vel_min_dt_s:
+            if near and dt >= self.vel_min_dt_s:
                 best_match['v_lat'] = best_match['v_lat'] * 0.8 + ((lat - best_match['lat']) / dt) * 0.2
                 best_match['v_lon'] = best_match['v_lon'] * 0.8 + ((lon - best_match['lon']) / dt) * 0.2
 
-            # Smooth position (Alpha filter)
-            best_match['lat'] = best_match['lat'] * 0.8 + lat * 0.2
-            best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
+            if near:
+                if best_match.get('pos_ok'):
+                    # Smooth position (Alpha filter)
+                    best_match['lat'] = best_match['lat'] * 0.8 + lat * 0.2
+                    best_match['lon'] = best_match['lon'] * 0.8 + lon * 0.2
+                else:
+                    # First trustworthy sighting of a track that was created from a distant
+                    # one. Take the new measurement outright instead of easing towards it -
+                    # the stored position is a bad projection and averaging it in only drags
+                    # the good measurement backwards.
+                    best_match['lat'] = lat
+                    best_match['lon'] = lon
+                    best_match['pos_ok'] = True
             best_match['last_seen'] = current_time
             # Sighting count. nav_process only lets a buoy constrain the Task 2 corridor
             # once it has been seen a few times - a spurious boundary buoy narrows the
             # corridor, and one that is too narrow is as unhelpful as none at all.
-            best_match['seen'] = best_match.get('seen', 1) + 1
+            if near:
+                best_match['seen'] = best_match.get('seen', 1) + 1
 
             # Colour vote: the winning class id decides both 'cid' and 'color'.
-            if cid is not None:
+            if cid is not None and near:
                 votes = best_match.setdefault('cid_votes', {})
                 votes[cid] = votes.get(cid, 0) + 1
                 winner = max(votes, key=votes.get)
@@ -243,6 +285,10 @@ class ObjectMemoryManager:
                 'v_lon': 0.0,
                 'cid': cid,
                 'cid_votes': {cid: 1} if cid is not None else {},
+                # False = this position came from a sighting too far away to trust. The track
+                # exists (so Task 3 can see the object) but consumers that place it on a map
+                # must skip it until a close sighting arrives and sets this True.
+                'pos_ok': near,
                 'cx': cx,
                 'cy': cy,
                 'dist': obj_dist,
@@ -603,6 +649,10 @@ def camera_worker(shared_state, hf_data):
                         # Used by the Task 2 corridor cap to tell a confirmed boundary buoy
                         # from a one-frame false positive.
                         "seen": obj.get('seen', 1),
+                        # False = position came only from sightings beyond MAP_MAX_RANGE_M and
+                        # is not yet trustworthy enough to put on a map. See the gate in
+                        # ObjectMemoryManager.
+                        "pos_ok": bool(obj.get('pos_ok', True)),
                     })
 
                 shared_state['vision_detected_objects'] = memory_objects

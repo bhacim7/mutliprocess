@@ -317,6 +317,32 @@ OBJECT_MEMORY_S = 20.0
 OBJECT_VEL_MIN_DT_S = 0.5       # ignore velocity updates computed over a shorter gap
 OBJECT_VEL_MAX_PREDICT_S = 1.0  # cap forward projection during matching
 
+# Maximum range at which a sighting is trusted to PLACE a buoy on the map.
+#
+# A detection becomes a position as (boat GPS) + (distance) along (heading + pixel offset), so
+# heading error turns into a tangential position error proportional to range. Measured on the
+# 2026-08-17 run: 6 of 9 orange sighting clouds were elongated ACROSS the line of sight rather
+# than along it (median 73.5 deg, 0.68 m at 1 sigma) - so heading, not ZED depth, dominates.
+# At the implied ~2.6 deg that is 0.55 m at 12 m but 1.36 m at 30 m, and two encounters differ
+# by about twice that. Past the 2.5 m merge radius one real buoy becomes several tracks: the
+# run logged 33 orange "buoys" at 2.91 m median spacing, 6 of them sitting within hull-contact
+# distance of the boat's own track - positions a buoy cannot physically occupy.
+#
+# Yellow, seen at 4-11 m, produced 7 clean tracks from identical code. 12 m puts orange in the
+# same regime. It also improves accuracy, not just the count: the stored position stops being
+# an average contaminated by 30 m sightings.
+#
+# Tuning: if `tracks:` in the costmap output still exceeds the real buoy count, lower it; if
+# obstacles appear too late, raise it. At 0.5 m/s, 12 m is 24 s of warning and the boat turns
+# in about 2 s, so there is a lot of headroom. Note A_STAR_GOAL_PROJECTION_M is 10 m, so the
+# planner's horizon stays inside this gate.
+#
+# Objects beyond the gate are NOT discarded - they stay in memory with pos_ok False, so Task 3
+# still sees them (it servos on the pixel column, never on lat/lon). Only map consumers skip
+# them, and the first close sighting replaces the bad position outright rather than averaging
+# into it.
+MAP_MAX_RANGE_M = 12.0
+
 TASK3_KAMIKAZE_COLOR = "black"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 

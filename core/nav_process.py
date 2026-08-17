@@ -173,6 +173,11 @@ def _confirmed_boundary_local(vision_objects, boat_lat, boat_lon, robot_x, robot
     for obj in vision_objects:
         if obj.get('cid') != 3:          # orange = boundary
             continue
+        # Position not yet confirmed by a close sighting - see MAP_MAX_RANGE_M. Building the
+        # corridor from distant projections is what put orange boundary marks 2-3 m from where
+        # the buoys actually were.
+        if not obj.get('pos_ok', True):
+            continue
         if int(obj.get('seen', 0)) < min_seen:
             continue
         last_seen = obj.get('last_seen')
@@ -315,6 +320,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     last_vision_read = 0.0
     last_publish = 0.0
     vision_objects = []
+    # Same list with distant-only positions removed; see MAP_MAX_RANGE_M. Initialised here
+    # because the vision read below is throttled to VISION_READ_HZ and the costmap block runs
+    # every cycle.
+    mappable_objects = []
     lidar_enabled = getattr(cfg, 'ENABLE_LIDAR', True)
     speed_mps = 0.0
 
@@ -591,11 +600,18 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 if (start_time - last_vision_read) >= VISION_READ_PERIOD_S:
                     last_vision_read = start_time
                     vision_objects = shared_state.get('vision_detected_objects', [])
+                    # Objects whose position rests only on distant sightings are dropped here,
+                    # once, so the costmap, the corridor and the recorder all see the same set.
+                    # Keeping the recorder in step matters: it is the instrument used to judge
+                    # whether the map is good, so it has to show what A* actually plans on.
+                    # Task 3 reads shared_state directly and is unaffected - it steers on the
+                    # pixel column, not on lat/lon.
+                    mappable_objects = [o for o in vision_objects if o.get('pos_ok', True)]
 
                 # --- UPDATE SEPARATE COSTMAP RECORDER ---
                 if costmap_recorder is not None:
                     # Use current raw gps location to feed global costmap
-                    costmap_recorder.update(ida_enlem, ida_boylam, vision_objects)
+                    costmap_recorder.update(ida_enlem, ida_boylam, mappable_objects)
 
                 # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
                 # Most logic has been moved to lidar_process (4-B Update)
@@ -609,9 +625,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     costmap_center_m = (robot_x, robot_y)
                     costmap_img.fill(127)
 
-                if vision_objects and costmap_ready:
+                if mappable_objects and costmap_ready:
                     # If we are using vision-only or fused, draw vision objects on whatever map we have
-                    for obj in vision_objects:
+                    for obj in mappable_objects:
                         if "TASK2" in mevcut_gorev and obj.get('cid') not in [1, 3]:
                             continue
 
