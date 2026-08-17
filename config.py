@@ -371,6 +371,26 @@ OBJECT_VEL_MAX_PREDICT_S = 1.0  # cap forward projection during matching
 # into it.
 MAP_MAX_RANGE_M = 12.0
 
+# --- TASK 3 search v2 (nav_process TASK3_SEARCH_KAMIKAZE) ---
+# The field this is sized for: three buoys (red/black/green, RANDOM order) on a line,
+# spacing up to 15 m so the span is <= 30 m; T3_MID is dropped by eye roughly 15 m short
+# of the line, not necessarily opposite the middle buoy. The ZED depth gate caps detection
+# at 15 m, so from T3_MID the far buoy can be ~30 m away - twice the ceiling. No stationary
+# pan can cover that; the search must move, and it must stop moving when it leaves the
+# plausible field.
+T3_STANDOFF_M = 8.0          # stop this far in front of an anchor buoy - an observation
+                             # distance, not a ramming one: from 8 m back the 15 m ceiling
+                             # keeps both directions of the line in view
+T3_PATROL_FIRST_LEG_M = 15.0   # first sweep along the line...
+T3_PATROL_SECOND_LEG_M = 30.0  # ...then twice as far the other way (order is random)
+T3_ADVANCE_STEP_M = 5.0      # nothing seen at all: creep toward the line and re-sweep
+T3_ADVANCE_MAX_STEPS = 2
+T3_BOUND_LATERAL_M = 30.0    # search box around the T3_MID waypoint; leaving it triggers
+T3_BOUND_FORWARD_M = 20.0    # a return to T3_MID and a mirrored restart
+T3_PAN_WIDE_DEG = 90.0       # opening sweep; with the +/-55 deg FOV this sees ~all around
+T3_HOLD_S = 2.0              # lost the visual lock inside T3_HOLD_MAX_DIST_M: hold course
+T3_HOLD_MAX_DIST_M = 5.0     # this long before falling back to the search
+
 TASK3_KAMIKAZE_COLOR = "black"  # Options: "red", "green", "black"
 TASK3_INVERT_STEERING = False  # Toggle if boat turns away from target
 

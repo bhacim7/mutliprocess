@@ -342,10 +342,22 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     # Store legacy PWM defaults
     extra = 50
 
-    # Task 3 Search State variables
-    t3_search_state = "INIT_SEARCH"
-    t3_original_heading = None
-    t3_search_move_target = None
+    # --- Task 3 search v2 state ---
+    # The old pattern was an unbounded zigzag: pan +/-45, crawl 3 m, repeat forever along
+    # whatever heading the boat happened to arrive with. Against the real field - three
+    # buoys on a line spanning up to 30 m, T3_MID dropped by eye ~15 m short of it, and a
+    # hard 15 m detection ceiling from the ZED depth gate - that pattern relied on luck:
+    # no stationary pan can cover a 30 m line from 15 m away, so the search MUST move,
+    # and it must stop moving when it leaves the plausible field.
+    t3_state = 'INIT'
+    t3_heading0 = None            # search frame axis, frozen at first search entry
+    t3_move_target = None         # (lat, lon) of the current pattern waypoint
+    t3_patrol_side = 1            # first patrol/pan side; flipped on every RETURN
+    t3_advance_count = 0
+    t3_lock_id = None             # visual-servo target lock (see selection block)
+    t3_last_servo_dist = None     # for the loss-of-lock hold
+    t3_last_servo_ts = None
+    T3_MAX_DETECTION_AGE_S = 0.3  # steer only on genuinely fresh pixels
 
     # --- Relay (motor power) ---
     # Retried rather than fired once: command_long_send waits for no ACK, so a dropped
@@ -809,6 +821,19 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                     return task_state, None, None
 
+                def t3_target_cid():
+                    """The colour Task 3 hunts, as a YOLO class id.
+
+                    Config first; the drone's reported colour overrides it when DRONE_ACTIVE
+                    and one has actually arrived. If the drone never delivers, the config
+                    colour stands - the boat hunts something rather than nothing, and the
+                    GCS shows RENK YOK so the operator knows which case is live."""
+                    color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')
+                    if getattr(cfg, 'DRONE_ACTIVE', False):
+                        color = shared_state.get('drone_target_color', color) or color
+                    return {'red': 0, 'yellow': 1, 'black': 2,
+                            'orange': 3, 'green': 4}.get(str(color).lower(), 0)
+
                 # Main State Router
                 target_lat = None
                 target_lon = None
@@ -845,149 +870,271 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         skip_default_nav = True
 
                     elif mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
-                        found_target = False
-                        target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
-
-                        if getattr(cfg, 'DRONE_ACTIVE', False):
-                            target_color = shared_state.get('drone_target_color', target_color)
-                            if target_color is not None:
-                                target_color = target_color.lower()
-
-                        target_cid = 0
-                        if target_color == "yellow":
-                            target_cid = 1
-                        elif target_color == "black":
-                            target_cid = 2
-                        elif target_color == "orange":
-                            target_cid = 3
-                        elif target_color == "green":
-                            target_cid = 4
-
-                        # camera_process keeps a detection in memory (and therefore in this
-                        # list) for 5 seconds after it was last actually seen. Steering on a
-                        # 'cx' that old makes the boat chase where the target USED to be -
-                        # which is what produced the circling behaviour that TASK3_INVERT_STEERING
-                        # was added to mask. Only servo on genuinely fresh pixels.
-                        T3_MAX_DETECTION_AGE_S = 0.3
+                        target_cid = t3_target_cid()
                         now_ts = time.time()
+                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                        t3_base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
 
+                        # ---- Target selection: nearest fresh candidate, held by an ID lock ----
+                        # The old loop took the FIRST fresh match in memory-insertion order,
+                        # which is neither the nearest nor stable: with two objects of the
+                        # target colour in view, a single missed YOLO frame on the first one
+                        # hopped the servo to the other and back, and a stale false-positive
+                        # track that happened to be inserted first outranked the real buoy
+                        # dead ahead. Selection is now by distance, and the winner's track id
+                        # is locked so the choice cannot flicker frame to frame. The lock is
+                        # identity, not position: the locked object's cx is re-read every
+                        # frame, so steering keeps correcting. It drops when the track goes
+                        # stale - or when the drone changes the colour mid-run, because a
+                        # different cid simply never enters `fresh`.
+                        fresh = []
                         for obj in vision_objects:
-                            if obj.get('cid') == target_cid:
-                                cx_val = obj.get('cx')
-                                if cx_val is None:
-                                    # No fresh pixel data for this tracked object this frame
-                                    # (defensive: avoids KeyError if 'cx' was never populated)
-                                    continue
+                            if obj.get('cid') != target_cid or obj.get('cx') is None:
+                                continue
+                            ls = obj.get('last_seen')
+                            if ls is None or (now_ts - ls) > T3_MAX_DETECTION_AGE_S:
+                                continue
+                            fresh.append(obj)
 
-                                last_seen = obj.get('last_seen')
-                                if last_seen is None or (now_ts - last_seen) > T3_MAX_DETECTION_AGE_S:
-                                    continue  # stale memory entry - keep searching instead
+                        target_obj = None
+                        if t3_lock_id is not None:
+                            for o in fresh:
+                                if o.get('id') == t3_lock_id:
+                                    target_obj = o
+                                    break
+                            if target_obj is None:
+                                t3_lock_id = None
+                        if target_obj is None and fresh:
+                            target_obj = min(fresh, key=lambda o: float(o.get('dist', 1e9)))
+                            t3_lock_id = target_obj.get('id')
+                            print(f"[TASK3] Locked target id={t3_lock_id} at "
+                                  f"{float(target_obj.get('dist', -1)):.1f} m")
 
-                                found_target = True
-                                dist_m = obj.get('dist', 10.0)
+                        if target_obj is not None:
+                            # --- Visual servoing (control law unchanged) ---
+                            target_lat, target_lon = None, None
+                            dist_m = float(target_obj.get('dist', 10.0))
+                            t3_last_servo_dist = dist_m
+                            t3_last_servo_ts = now_ts
 
-                                # Visual Servoing logic
-                                # Prevent GPS PID from interfering by setting targets to None
-                                target_lat, target_lon = None, None
+                            pixel_error = target_obj.get('cx') - (1280 / 2)
+                            kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
+                            if getattr(cfg, 'TASK3_INVERT_STEERING', False):
+                                steering_correction = -pixel_error * kp_pixel
+                            else:
+                                steering_correction = pixel_error * kp_pixel
+                            apply_motor_mixer(controller, t3_base_pwm, steering_correction)
 
-                                pixel_error = cx_val - (1280 / 2)  # Assuming 1280 width (ZED HD720)
+                            if dist_m < 1.0 or target_obj.get('area', 0) > 300000:
+                                print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
+                                apply_motor_mixer(controller, 1500, 0)
+                                mevcut_gorev = "FINISHED"
 
-                                # Simple P controller for pixel error to steering PWM
-                                kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
+                        elif (t3_last_servo_ts is not None
+                              and t3_last_servo_dist is not None
+                              and t3_last_servo_dist <= getattr(cfg, 'T3_HOLD_MAX_DIST_M', 5.0)
+                              and (now_ts - t3_last_servo_ts) <= getattr(cfg, 'T3_HOLD_S', 2.0)):
+                            # --- Loss-of-lock hold ---
+                            # Spray and glare routinely break detection for a few frames in
+                            # the last metres. Dropping straight back into the search here
+                            # made the boat yank sideways right next to its target; holding
+                            # course briefly lets the detector re-acquire, and if the target
+                            # was genuinely hit the collision check ends the run on
+                            # re-acquisition anyway.
+                            target_lat, target_lon = None, None
+                            apply_motor_mixer(controller, t3_base_pwm, 0)
 
-                                # Use inversion toggle to fix the circling bug
-                                if getattr(cfg, 'TASK3_INVERT_STEERING', False):
-                                    steering_correction = -pixel_error * kp_pixel
+                        else:
+                            # ==================== SEARCH v2 ====================
+                            # Wide pan first; any Task 3 buoy (not just the target colour)
+                            # found during a scan is used as an ANCHOR: the three buoys sit
+                            # on one line, so finding any of them is finding the line, and
+                            # the target is on it within ~30 m. Patrol runs parallel to that
+                            # line from a standoff point. Everything is bounded to a box
+                            # around T3_MID, and hitting a bound returns there and restarts
+                            # mirrored - no more unbounded zigzag toward the horizon.
+                            target_lat, target_lon = None, None
+
+                            mid_lat = getattr(cfg, 'T3_MID_LAT', 0.0)
+                            mid_lon = getattr(cfg, 'T3_MID_LON', 0.0)
+                            have_mid = bool(mid_lat and mid_lon)
+
+                            if t3_state == 'INIT':
+                                if t3_heading0 is None:
+                                    # Frozen once: the search frame must not rotate with the
+                                    # boat, or "lateral" would mean something new every leg.
+                                    t3_heading0 = magnetic_heading
+                                t3_advance_count = 0
+                                t3_state = 'PAN_A'
+                                print(f"[TASK3] Search start: axis {t3_heading0:.0f} deg, "
+                                      f"first side {'L' if t3_patrol_side < 0 else 'R'}")
+
+                            # --- Bounds: stay inside the plausible field ---
+                            # Frame is anchored at the T3_MID waypoint (the operator's own
+                            # reference), axis = t3_heading0. The old pattern had no bounds
+                            # at all and crawled ~3 m per cycle toward wherever the boat
+                            # happened to be pointing when the search began.
+                            if have_mid and t3_heading0 is not None and t3_state != 'RETURN':
+                                d_mid = nav.haversine(mid_lat, mid_lon, ida_enlem, ida_boylam)
+                                brg_mid = nav.calculate_bearing(mid_lat, mid_lon, ida_enlem, ida_boylam)
+                                rel_mid = math.radians(brg_mid - t3_heading0)
+                                s_fwd = d_mid * math.cos(rel_mid)
+                                d_side = abs(d_mid * math.sin(rel_mid))
+                                if (d_side > getattr(cfg, 'T3_BOUND_LATERAL_M', 30.0)
+                                        or s_fwd > getattr(cfg, 'T3_BOUND_FORWARD_M', 20.0)
+                                        or s_fwd < -10.0):
+                                    print("[TASK3] Search bound reached - returning to T3_MID.")
+                                    t3_state = 'RETURN'
+
+                            # --- Anchor scan (only while scanning, not mid-patrol) ---
+                            # pos_ok is deliberately NOT required: a buoy first seen at
+                            # 13-15 m carries a position error of a metre or so, and the
+                            # standoff point sits 8 m short of it - plenty of slack. Waiting
+                            # for a <=12 m confirmation would mean never anchoring on
+                            # exactly the sightings this search exists to exploit.
+                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C', 'ADVANCE'):
+                                anchor = None
+                                a_best = 1e9
+                                for obj in vision_objects:
+                                    if obj.get('cid') not in (0, 2, 4):
+                                        continue
+                                    ls = obj.get('last_seen')
+                                    if ls is None or (now_ts - ls) > T3_MAX_DETECTION_AGE_S:
+                                        continue
+                                    if int(obj.get('seen', 0)) < 3:
+                                        continue
+                                    o_lat, o_lon = obj.get('lat'), obj.get('lon')
+                                    if not o_lat or not o_lon:
+                                        continue
+                                    a_d = float(obj.get('dist', 1e9))
+                                    if a_d < a_best:
+                                        a_best = a_d
+                                        anchor = (o_lat, o_lon)
+                                if anchor is not None:
+                                    brg_away = nav.calculate_bearing(
+                                        anchor[0], anchor[1], ida_enlem, ida_boylam)
+                                    t3_move_target = calculate_obj_gps(
+                                        anchor[0], anchor[1],
+                                        getattr(cfg, 'T3_STANDOFF_M', 8.0), brg_away)
+                                    t3_state = 'GOTO_STANDOFF'
+                                    print(f"[TASK3] Anchor buoy at {a_best:.1f} m - "
+                                          "moving to standoff on the line.")
+
+                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C'):
+                                pan_deg = getattr(cfg, 'T3_PAN_WIDE_DEG', 90.0)
+                                if t3_state == 'PAN_A':
+                                    target_h = (t3_heading0 - t3_patrol_side * pan_deg) % 360
+                                elif t3_state == 'PAN_B':
+                                    target_h = (t3_heading0 + t3_patrol_side * pan_deg) % 360
                                 else:
-                                    steering_correction = pixel_error * kp_pixel
-
-                                base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
-                                apply_motor_mixer(controller, base_pwm, steering_correction)
-
-                                # Check collision condition
-                                if dist_m < 1.0 or obj.get('area', 0) > 300000:  # Bounding box fills screen or very close
-                                    print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    mevcut_gorev = "FINISHED"  # Finish mission
-                                break
-
-                        if not found_target:
-                            target_lat, target_lon = None, None  # Default to not using GPS PID unless moving
-                            spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 150)
-
-                            if t3_search_state == "INIT_SEARCH":
-                                t3_original_heading = magnetic_heading
-                                t3_search_state = "PAN_LEFT"
-
-                            elif t3_search_state == "PAN_LEFT":
-                                target_h = (t3_original_heading - 45) % 360
+                                    target_h = t3_heading0
                                 diff = nav.signed_angle_difference(magnetic_heading, target_h)
                                 if abs(diff) < 5.0:
                                     apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_RIGHT"
+                                    t3_state = {'PAN_A': 'PAN_B', 'PAN_B': 'PAN_C',
+                                                'PAN_C': 'ADVANCE_CALC'}[t3_state]
                                 else:
-                                    apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
+                                    apply_motor_mixer(controller, 1500,
+                                                      spot_pwm if diff > 0 else -spot_pwm)
 
-                            elif t3_search_state == "PAN_RIGHT":
-                                target_h = (t3_original_heading + 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "CALC_MOVE_L60"
+                            elif t3_state == 'ADVANCE_CALC':
+                                # Nothing seen from here at all: T3_MID was probably dropped
+                                # outside the 15 m detection ceiling. Step toward the line
+                                # and sweep again, a bounded number of times.
+                                if t3_advance_count >= getattr(cfg, 'T3_ADVANCE_MAX_STEPS', 2):
+                                    t3_state = 'RETURN'
                                 else:
-                                    apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
+                                    t3_advance_count += 1
+                                    t3_move_target = calculate_obj_gps(
+                                        ida_enlem, ida_boylam,
+                                        getattr(cfg, 'T3_ADVANCE_STEP_M', 5.0), t3_heading0)
+                                    t3_state = 'ADVANCE'
 
-                            elif t3_search_state == "CALC_MOVE_L60":
-                                target_h = (t3_original_heading - 60) % 360
-                                t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
-                                t3_search_move_target = (t_lat, t_lon)
-                                t3_search_state = "MOVE_L60"
-
-                            elif t3_search_state == "MOVE_L60":
-                                target_lat, target_lon = t3_search_move_target
-                                dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
-                                if dist < 1.5:
+                            elif t3_state == 'ADVANCE':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 1.5:
                                     apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_LEFT_2"
                                     target_lat, target_lon = None, None
+                                    t3_state = 'PAN_A'
 
-                            elif t3_search_state == "PAN_LEFT_2":
-                                target_h = (t3_original_heading - 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_RIGHT_2"
-                                else:
-                                    apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
-
-                            elif t3_search_state == "PAN_RIGHT_2":
-                                target_h = (t3_original_heading + 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "CALC_MOVE_R60"
-                                else:
-                                    apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
-
-                            elif t3_search_state == "CALC_MOVE_R60":
-                                target_h = (t3_original_heading + 60) % 360
-                                t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
-                                t3_search_move_target = (t_lat, t_lon)
-                                t3_search_state = "MOVE_R60"
-
-                            elif t3_search_state == "MOVE_R60":
-                                target_lat, target_lon = t3_search_move_target
-                                dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
-                                if dist < 1.5:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_LEFT"
+                            elif t3_state == 'GOTO_STANDOFF':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    # Patrol parallel to the buoy line (perpendicular to the
+                                    # approach axis). First leg one way, second leg twice as
+                                    # far the other way; driving each leg the camera faces
+                                    # along the line, so the 15 m ceiling extends coverage
+                                    # well past the leg ends. 15 + 30 covers a 30 m span
+                                    # from any anchor position on it, whichever side the
+                                    # target is on - the order is random by the rules.
+                                    lat_brg = (t3_heading0 + t3_patrol_side * 90.0) % 360
+                                    t3_move_target = calculate_obj_gps(
+                                        ida_enlem, ida_boylam,
+                                        getattr(cfg, 'T3_PATROL_FIRST_LEG_M', 15.0), lat_brg)
                                     target_lat, target_lon = None, None
+                                    t3_state = 'PATROL_1'
 
-                        # Only skip default nav if we didn't set a GPS target to drive to during the search phase
+                            elif t3_state == 'PATROL_1':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    lat_brg = (t3_heading0 - t3_patrol_side * 90.0) % 360
+                                    t3_move_target = calculate_obj_gps(
+                                        ida_enlem, ida_boylam,
+                                        getattr(cfg, 'T3_PATROL_SECOND_LEG_M', 30.0), lat_brg)
+                                    target_lat, target_lon = None, None
+                                    t3_state = 'PATROL_2'
+
+                            elif t3_state == 'PATROL_2':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    target_lat, target_lon = None, None
+                                    t3_state = 'RETURN'
+
+                            elif t3_state == 'RETURN':
+                                # User's choice over "stop and wait": come home to T3_MID
+                                # and run the whole pattern again mirrored. The bounding box
+                                # is what makes this loop safe to repeat indefinitely.
+                                if have_mid:
+                                    target_lat, target_lon = mid_lat, mid_lon
+                                    if nav.haversine(ida_enlem, ida_boylam, mid_lat, mid_lon) < 2.5:
+                                        target_lat, target_lon = None, None
+                                        t3_patrol_side = -t3_patrol_side
+                                        t3_state = 'INIT'
+                                        print("[TASK3] Back at T3_MID - restarting mirrored.")
+                                else:
+                                    t3_patrol_side = -t3_patrol_side
+                                    t3_state = 'INIT'
+
                         if target_lat is None:
                             skip_default_nav = True
                     else:
                         mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
+                        # --- Early engage, T3_MID leg only ---
+                        # Until now the boat drove all the way to the MID waypoint with the
+                        # target plainly in view, because the servo scan only ran inside the
+                        # search state. Three gates keep this from firing on garbage: the
+                        # track must have been seen >= 3 times (one YOLO misfire cannot
+                        # launch a full-throttle dive), it must be fresh, and the colour must
+                        # be COMMITTED - config-decided, or actually delivered by the drone.
+                        # While the GCS shows RENK YOK, no early dive. T3_START is excluded
+                        # deliberately: red and green are also Task 1 gate colours, and that
+                        # leg can still be near the gates.
+                        if mevcut_gorev == "T3_MID" and mission_active:
+                            _committed = ((not getattr(cfg, 'DRONE_ACTIVE', False))
+                                          or bool(shared_state.get('drone_target_color')))
+                            if _committed:
+                                _tc = t3_target_cid()
+                                _now_e = time.time()
+                                for obj in vision_objects:
+                                    if (obj.get('cid') == _tc
+                                            and obj.get('cx') is not None
+                                            and int(obj.get('seen', 0)) >= 3
+                                            and obj.get('last_seen') is not None
+                                            and (_now_e - obj['last_seen']) <= T3_MAX_DETECTION_AGE_S):
+                                        print("[TASK3] Target sighted on the T3_MID leg - engaging early.")
+                                        mevcut_gorev = "TASK3_SEARCH_KAMIKAZE"
+                                        target_lat, target_lon = None, None
+                                        break
 
                 if not mission_active:
                     # Roll back any state advance the routers above made. Driving the boat
