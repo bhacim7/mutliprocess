@@ -29,6 +29,7 @@ def telem_worker(shared_state, command_queue, hf_data):
     waypoint_refresh_s = float(getattr(cfg, 'TELEM_WAYPOINT_REFRESH_S', 10.0))
     last_waypoints_sent = None
     last_waypoints_ts = 0.0
+    wp_cycle_idx = 0        # which point of the set goes in this packet
 
     # Config-file defaults, used only until nav_process publishes the live set.
     _CFG_WAYPOINT_ATTRS = (
@@ -120,39 +121,59 @@ def telem_worker(shared_state, command_queue, hf_data):
 
             if shared_state.get('send_telemetry', False):
                 # --- Payload construction ---
-                # Field NAMES are deliberately unchanged: GCSv1000.on_packet() looks up
-                # 'pwm_L', 'spd', 'trg_hdg', 'MEVCUT_KONUM' and friends by name, so renaming
-                # them to save bytes would silently blank the whole GCS panel. All the size
-                # reduction comes from dropping dead weight and rounding instead.
+                # Keys are SHORT on the wire and expanded back to their long names by the
+                # GCS the moment the line is parsed, so every consumer downstream still sees
+                # 'pwm_L', 'MEVCUT_KONUM' and friends untouched.
+                #
+                # Why the size matters so much: the radio has a per-frame limit and splits
+                # anything larger, and it runs with Mavlink framing OFF, so it has no idea
+                # where a JSON line begins or ends - it cuts wherever its buffer fills. With
+                # three nodes on one channel, the drone's turn can fall BETWEEN two fragments
+                # of a boat packet, and its bytes land in the middle of our JSON. The result
+                # is a line the GCS cannot parse. Measured: the old packet was 378 B (750 B
+                # with waypoints) while every command is 38-76 B and the drone's is 36 B -
+                # the boat's telemetry was the only thing on the link big enough to be split,
+                # which is exactly why commands kept arriving while telemetry did not.
+                #
+                # The GCS also reassembles interrupted lines now, so this is the second line
+                # of defence rather than the only one - but a packet that never gets split
+                # cannot be corrupted this way at all.
                 payload = {
-                    "id": my_id,
-                    "t_ms": datetime.datetime.now().strftime('%H:%M:%S'),
-                    "pwm_L": int(pwm_l),
-                    "pwm_R": int(pwm_r),
-                    "pwm_FL": int(pwm_fl),
-                    "pwm_FR": int(pwm_fr),
-                    "pwm_STEER": int(pwm_steer),
-                    "spd": r(shared_state.get('horizontal_speed', 0.0), 2),
-                    "hdg": r(heading, 0) if heading is not None else 0,
-                    "trg_hdg": r(shared_state.get('adviced_course', 0.0), 1),
-                    "err_ang": r(shared_state.get('angle_error', 0.0), 1),
-                    "ctrl_err": r(shared_state.get('control_error', 0.0), 1),
-                    "hlth": "GOOD",  # Simplified for now, or read from shared state
-                    "task": mevcut_gorev,
-                    "MEVCUT_KONUM": {"lat": r(current_lat, 7), "lon": r(current_lon, 7)},
-                    "HEDEF_KONUM": {"lat": r(shared_state.get('target_lat', 0.0), 7),
-                                    "lon": r(shared_state.get('target_lon', 0.0), 7)},
-                    "dist": r(shared_state.get('target_dist', 0.0), 1),
-                    "mod": bool(manual_mode),
-                    "FPS": int(shared_state.get('camera_fps', 0) or 0),
+                    "i": my_id,
+                    "t": datetime.datetime.now().strftime('%H:%M:%S'),
+                    "a": int(pwm_l),
+                    "b": int(pwm_r),
+                    "c": int(pwm_fl),
+                    "d": int(pwm_fr),
+                    "s": int(pwm_steer),
+                    "v": r(shared_state.get('horizontal_speed', 0.0), 2),
+                    "h": r(heading, 0) if heading is not None else 0,
+                    "th": r(shared_state.get('adviced_course', 0.0), 1),
+                    "ea": r(shared_state.get('angle_error', 0.0), 1),
+                    "ce": r(shared_state.get('control_error', 0.0), 1),
+                    "k": mevcut_gorev,
+                    # Position flattened rather than nested: {"lat":..,"lon":..} costs 14 B of
+                    # punctuation and key names per point for no information.
+                    "la": r(current_lat, 7), "lo": r(current_lon, 7),
+                    "xa": r(shared_state.get('target_lat', 0.0), 7),
+                    "xo": r(shared_state.get('target_lon', 0.0), 7),
+                    "ds": r(shared_state.get('target_dist', 0.0), 1),
+                    "m": 1 if manual_mode else 0,
+                    "f": int(shared_state.get('camera_fps', 0) or 0),
                     # Motor-power relay as the VEHICLE reports it (RELAY_STATUS), not as we
                     # last commanded it - the RC transmitter can change it independently.
                     # -1 = the vehicle never reported, so the GCS shows "unknown".
-                    "relay": int(shared_state.get('relay_state', -1)),
+                    "r": int(shared_state.get('relay_state', -1)),
                 }
+                # 'hlth' is not transmitted: it has always been the constant "GOOD" (see the
+                # note this replaced), so the GCS fills it in locally instead of paying for
+                # it 3 times a second. If real health ever exists it gets its own field.
 
-                # TASK3 hedef rengi + kaynağı (~27 B). Bkz. task3_color().
-                payload["tcol"], payload["tsrc"] = task3_color()
+                # TASK3 target colour + source. Source travels as 0/1 rather than
+                # "cfg"/"drone"; the GCS expands it.
+                _tc, _tsrc = task3_color()
+                payload["tc"] = _tc
+                payload["ts"] = 1 if _tsrc == "drone" else 0
 
                 # 'objects' is deliberately NOT sent any more.
                 #
@@ -166,20 +187,31 @@ def telem_worker(shared_state, command_queue, hf_data):
                 # airtime. If the GCS ever needs detections, send a separate, trimmed,
                 # low-rate packet rather than reviving this field.
 
-                # Waypoints are ~513 B - over half the remaining packet. Send them only when
-                # they actually change, plus a slow refresh so a GCS that connects late (or
-                # missed the packet) still populates its map. on_packet() already guards its
-                # read with `if "GÖREV_NOKTALARI" in d`, so omitting it is safe.
+                # Waypoints: ONE point per packet, cycled, instead of all eight in a block.
+                #
+                # The block was 353 B on its own and pushed the packet to 750 B - three radio
+                # frames, two seams for another node to cut across, and losing any one of them
+                # lost all eight points. A single point is ~38 B, the packet stays in one
+                # frame, and a lost point is re-sent one cycle later instead of taking the
+                # whole set with it. The GCS accumulates them and rebuilds the same
+                # GÖREV_NOKTALARI dict its map code has always consumed.
                 wp = current_waypoints()
                 now_ts = time.time()
                 if wp != last_waypoints_sent or (now_ts - last_waypoints_ts) >= waypoint_refresh_s:
-                    payload["GÖREV_NOKTALARI"] = {
-                        "id": my_id,
-                        **{name: {"lat": r(lat, 7), "lon": r(lon, 7)}
-                           for name, (lat, lon) in wp.items()},
-                    }
-                    last_waypoints_sent = wp
-                    last_waypoints_ts = now_ts
+                    names = sorted(wp.keys(), key=lambda n: int(n.replace("GPS", "")))
+                    if names:
+                        name = names[wp_cycle_idx % len(names)]
+                        lat, lon = wp[name]
+                        payload["w"] = int(name.replace("GPS", ""))
+                        payload["wa"] = r(lat, 7)
+                        payload["wo"] = r(lon, 7)
+                        wp_cycle_idx += 1
+                        # The set counts as sent only once every point has had a turn, so a
+                        # change part-way through simply keeps the cycle running rather than
+                        # restarting it and starving the points at the end of the list.
+                        if wp_cycle_idx % len(names) == 0:
+                            last_waypoints_sent = wp
+                            last_waypoints_ts = now_ts
 
                 tx.send(payload)
                 shared_state['send_telemetry'] = False

@@ -298,38 +298,55 @@ def normalize_gps_dict(gps_raw):
 # -------------------- Serial Worker (Düzeltilmiş & Hızlandırılmış) --------------------
 def _parse_or_recover(line: str):
     """
-    Parse a received line, salvaging a whole packet glued behind a truncated one.
+    Parse a received line. Returns (obj_or_None, leftover_prefix).
 
-    The reader splits on '\\n'. When a packet is corrupted in the air its trailing '\\n'
-    never arrives, so the half-line stays in the buffer and the NEXT packet is appended
-    straight onto it:
+    Two different things corrupt a line on this link, and they need different answers.
 
-        {"id": 1, "pwm_L": 1500, "spd": 1.2{"id": 3, "drone_color": "KIRMIZI"}
+    The radio runs with Mavlink framing OFF, so it treats the serial stream as opaque bytes
+    and cuts wherever its per-frame buffer fills. A packet larger than one frame therefore
+    goes out in pieces - and with three nodes sharing the channel, another node's turn can
+    fall BETWEEN those pieces. Its bytes land inside our JSON:
 
-    json.loads() fails on that and BOTH packets were thrown away. The boat sends ~3 packets
-    a second and the drone 3, so the victim was very often the drone's - which is a large
-    part of why the drone panel appeared to disconnect while the boat's kept updating. The
-    drone packet in that example arrived perfectly intact and was discarded.
+        {"i":1,"t":"23:05:16","a":16{"id":3,"drone_color":"KIRMIZI"}
+        77,"b":1722,...,"ts":1}
 
-    Recovery looks for a later packet START, not merely a later '{'. Every packet on this
-    link begins with {"id" - a blind search for '{' would happily accept the nested
-    {"lat": ..., "lon": ...} inside MEVCUT_KONUM, which parses as valid JSON and would be
-    handed to the UI as a packet with no 'id' at all (silently treated as the boat's).
+    Note this is not a collision: nobody transmitted at the same time. It is ordinary TDMA
+    doing exactly what it should, on a message it was never told the boundaries of. It is
+    also why commands kept getting through while telemetry did not - at 38-76 B a command
+    never spans two frames, so there is no seam to cut across.
 
-    The leading fragment stays lost; it was corrupt to begin with.
+    Both halves are intact, so both are recoverable. The complete object at the END is
+    returned; the incomplete PREFIX is handed back so the caller can glue it to the next
+    line, which carries the rest of the interrupted packet.
+
+    Recovery looks for a packet START, not merely a later '{'. Every packet on this link
+    begins with {"i" (telemetry) or {"id" (drone). A blind search for '{' would happily
+    accept a nested object and hand the UI something that is not a packet at all.
     """
     try:
-        return json.loads(line)
+        return json.loads(line), ""
     except json.JSONDecodeError:
         pass
 
-    start = line.find('{"id"', 1)
-    while start != -1:
-        try:
-            return json.loads(line[start:])
-        except json.JSONDecodeError:
-            start = line.find('{"id"', start + 1)
-    return None
+    for marker in ('{"i"', '{"id"'):
+        start = line.find(marker, 1)
+        while start != -1:
+            try:
+                return json.loads(line[start:]), line[:start]
+            except json.JSONDecodeError:
+                start = line.find(marker, start + 1)
+    return None, ""
+
+
+# Wire keys are short to keep a packet inside one radio frame; they are expanded back to
+# the long names here, the moment the line is parsed, so on_packet() and everything below
+# it still reads 'pwm_L', 'MEVCUT_KONUM' and friends exactly as before.
+_WIRE_KEYS = {
+    "i": "id", "t": "t_ms", "a": "pwm_L", "b": "pwm_R", "c": "pwm_FL", "d": "pwm_FR",
+    "s": "pwm_STEER", "v": "spd", "h": "hdg", "th": "trg_hdg", "ea": "err_ang",
+    "ce": "ctrl_err", "k": "task", "ds": "dist", "m": "mod", "f": "FPS", "r": "relay",
+    "tc": "tcol",
+}
 
 
 # Drone reports colours in Turkish; the boat's config and detector speak English.
@@ -354,6 +371,64 @@ class SerialWorker(QThread):
         self._csv_writer = None
 
         self._rx_buffer = ""  # <--- YENİ: Yarım kalan verileri tutacak havuz
+        # Head of a packet that another node's transmission cut across; glued to the next
+        # line to put the packet back together. See _parse_or_recover().
+        self._pending_frag = ""
+        # Waypoints now arrive one point per packet instead of all eight in a block, so
+        # they are accumulated here and handed to the UI as the same complete dict its map
+        # code has always consumed. Losing one point no longer loses the whole set.
+        self._wp_accum = {}
+
+    def _expand(self, d: dict) -> dict:
+        """
+        Short wire keys -> the long names the UI has always used.
+
+        Packets from the drone arrive with their own long keys already and pass through
+        untouched. Doing the translation here rather than in on_packet() means the map,
+        the CSV writer and every label below it keep working without a single edit.
+        """
+        if "i" not in d:
+            return d                      # drone packet (or an already-expanded one)
+
+        out = {}
+        for k, v in d.items():
+            out[_WIRE_KEYS.get(k, k)] = v
+
+        # Position travels flat - two keys instead of a nested object with its own
+        # punctuation - and is re-nested here.
+        if "la" in d and "lo" in d:
+            out["MEVCUT_KONUM"] = {"lat": d["la"], "lon": d["lo"]}
+            out.pop("la", None); out.pop("lo", None)
+        if "xa" in d and "xo" in d:
+            out["HEDEF_KONUM"] = {"lat": d["xa"], "lon": d["xo"]}
+            out.pop("xa", None); out.pop("xo", None)
+
+        # 'ts' is 0/1 on the wire; the readout compares against these strings.
+        if "ts" in d:
+            out["tsrc"] = "drone" if int(d.get("ts", 0)) else "cfg"
+            out.pop("ts", None)
+
+        # Never transmitted: it has always been the constant "GOOD" on the boat, so paying
+        # for it three times a second bought nothing. Filled in so SENSOR_SAGLIK reads
+        # exactly as it did before.
+        out.setdefault("hlth", "GOOD")
+
+        # One waypoint per packet, accumulated into the full set.
+        if "w" in d and "wa" in d and "wo" in d:
+            try:
+                bid = int(d.get("i", 1))
+                store = self._wp_accum.setdefault(bid, {})
+                store[int(d["w"])] = (float(d["wa"]), float(d["wo"]))
+                out["GÖREV_NOKTALARI"] = {
+                    "id": bid,
+                    **{f"GPS{n}": {"lat": la, "lon": lo} for n, (la, lo) in store.items()},
+                }
+            except (TypeError, ValueError):
+                pass
+            for k in ("w", "wa", "wo"):
+                out.pop(k, None)
+
+        return out
 
     def configure(self, port: str, baud: int, csv_path: str | None):
         self.port = port
@@ -419,14 +494,27 @@ class SerialWorker(QThread):
                                 # Tamamlanmış satırları döngüye sok
                                 for line in lines:
                                     line = line.strip()
-                                    if line:
-                                        obj = _parse_or_recover(line)
-                                        if isinstance(obj, dict):
-                                            self.packet.emit(obj)  # UI'a gönder
+                                    if not line:
+                                        continue
 
-                                            # CSV Kayıt (Opsiyonel)
-                                            if self._csv_writer:
-                                                pass
+                                    # Glue on the head of a packet that was interrupted by
+                                    # another node - its tail is this line.
+                                    if self._pending_frag:
+                                        line = self._pending_frag + line
+                                        self._pending_frag = ""
+
+                                    obj, leftover = _parse_or_recover(line)
+                                    # A runaway fragment must not grow without bound: if it
+                                    # is already bigger than any real packet, whatever it is
+                                    # it is not the head of one.
+                                    self._pending_frag = leftover if len(leftover) < 2048 else ""
+
+                                    if isinstance(obj, dict):
+                                        self.packet.emit(self._expand(obj))  # UI'a gönder
+
+                                        # CSV Kayıt (Opsiyonel)
+                                        if self._csv_writer:
+                                            pass
 
                             # Bir paket havada bozulup '\n' hiç gelmezse yarım satır burada
                             # sonsuza kadar birikirdi. Makul bir paketten kat kat büyükse
