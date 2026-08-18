@@ -353,7 +353,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     t3_heading0 = None            # search frame axis, frozen at first search entry
     t3_move_target = None         # (lat, lon) of the current pattern waypoint
     t3_patrol_side = 1            # first patrol/pan side; flipped on every RETURN
-    t3_advance_count = 0
+    t3_sweep_wps = None           # expanding-transect waypoints, built per cycle
+    t3_sweep_idx = 0
     t3_lock_id = None             # visual-servo target lock (see selection block)
     t3_last_servo_dist = None     # for the loss-of-lock hold
     t3_last_servo_ts = None
@@ -964,7 +965,8 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                     # Frozen once: the search frame must not rotate with the
                                     # boat, or "lateral" would mean something new every leg.
                                     t3_heading0 = magnetic_heading
-                                t3_advance_count = 0
+                                t3_sweep_wps = None
+                                t3_sweep_idx = 0
                                 t3_state = 'PAN_A'
                                 print(f"[TASK3] Search start: axis {t3_heading0:.0f} deg, "
                                       f"first side {'L' if t3_patrol_side < 0 else 'R'}")
@@ -992,7 +994,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             # standoff point sits 8 m short of it - plenty of slack. Waiting
                             # for a <=12 m confirmation would mean never anchoring on
                             # exactly the sightings this search exists to exploit.
-                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C', 'ADVANCE'):
+                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C', 'SWEEP'):
                                 anchor = None
                                 a_best = 1e9
                                 for obj in vision_objects:
@@ -1029,33 +1031,80 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 else:
                                     target_h = t3_heading0
                                 diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
+                                # Proportional slow-down, same law as force_initial_alignment.
+                                # These pans used to run at a flat SPOT_TURN_PWM with a 5 deg
+                                # stop window - at the measured 35-57 deg/s the ZED heading
+                                # lags a few degrees behind the hull, the window was missed,
+                                # and the boat kept spinning: full extra circles on the
+                                # 2026-08-18 run (HDG 118 -> 20 -> 248 while chasing a 97 deg
+                                # target), 15-25 s lost per pan cycle and loops drawn all
+                                # over the costmap. Slowing into the target with a wider stop
+                                # window is exactly what the waypoint-alignment branch already
+                                # does, and that one does not overshoot.
+                                pan_tol = getattr(cfg, 'T3_PAN_TOL_DEG', 10.0)
+                                if abs(diff) < pan_tol:
                                     apply_motor_mixer(controller, 1500, 0)
                                     t3_state = {'PAN_A': 'PAN_B', 'PAN_B': 'PAN_C',
-                                                'PAN_C': 'ADVANCE_CALC'}[t3_state]
+                                                'PAN_C': 'SWEEP_CALC'}[t3_state]
                                 else:
+                                    ramp = min(1.0, abs(diff) / 45.0)
+                                    pan_pwm = int(60 + (spot_pwm - 60) * ramp)
                                     apply_motor_mixer(controller, 1500,
-                                                      spot_pwm if diff > 0 else -spot_pwm)
+                                                      pan_pwm if diff > 0 else -pan_pwm)
 
-                            elif t3_state == 'ADVANCE_CALC':
-                                # Nothing seen from here at all: T3_MID was probably dropped
-                                # outside the 15 m detection ceiling. Step toward the line
-                                # and sweep again, a bounded number of times.
-                                if t3_advance_count >= getattr(cfg, 'T3_ADVANCE_MAX_STEPS', 2):
+                            elif t3_state == 'SWEEP_CALC':
+                                # Nothing anchored from the opening pans: run an expanding
+                                # transect sweep over the whole search box.
+                                #
+                                # The old fallback stepped 5 m forward along a FIXED axis,
+                                # twice, then went home - and a mirrored restart only flips
+                                # the pan/patrol side, so with no anchor every cycle re-walked
+                                # the exact same ~10 m strip. The 2026-08-18 run showed it
+                                # plainly: two full cycles over identical ground, the buoy
+                                # line never inside the 15 m detection ceiling, nothing found.
+                                # Coverage has to GROW - the operator's expanding-V insight -
+                                # implemented as serpentine rows perpendicular to the axis,
+                                # each deeper than the last, because straight rows make the
+                                # coverage arithmetic checkable: rows every
+                                # T3_SWEEP_ROW_SPACING_M (well under the detection radius)
+                                # across +/-T3_SWEEP_HALF_WIDTH_M sweep the box without gaps
+                                # in a single pass. The rows sit inside the bounds box with
+                                # margin, the anchor scan and the servo stay live throughout,
+                                # and a mirrored restart runs the serpentine the other way.
+                                if not have_mid or t3_heading0 is None:
                                     t3_state = 'RETURN'
                                 else:
-                                    t3_advance_count += 1
-                                    t3_move_target = calculate_obj_gps(
-                                        ida_enlem, ida_boylam,
-                                        getattr(cfg, 'T3_ADVANCE_STEP_M', 5.0), t3_heading0)
-                                    t3_state = 'ADVANCE'
+                                    row_sp = getattr(cfg, 'T3_SWEEP_ROW_SPACING_M', 8.0)
+                                    half_w = getattr(cfg, 'T3_SWEEP_HALF_WIDTH_M', 25.0)
+                                    n_rows = int(getattr(cfg, 'T3_SWEEP_ROWS', 2))
+                                    pts = []
+                                    for kk in range(n_rows):
+                                        s_row = row_sp * (kk + 1)
+                                        d_first = half_w * t3_patrol_side * (1 if kk % 2 == 0 else -1)
+                                        pts.append((s_row, d_first))
+                                        pts.append((s_row, -d_first))
+                                    t3_sweep_wps = []
+                                    for s_f, d_l in pts:
+                                        w_dist = math.hypot(s_f, d_l)
+                                        w_brg = (t3_heading0
+                                                 + math.degrees(math.atan2(d_l, s_f))) % 360
+                                        t3_sweep_wps.append(
+                                            calculate_obj_gps(mid_lat, mid_lon, w_dist, w_brg))
+                                    t3_sweep_idx = 0
+                                    t3_state = 'SWEEP'
+                                    print(f"[TASK3] Transect sweep: {n_rows} rows x "
+                                          f"+/-{half_w:.0f} m, first side "
+                                          f"{'L' if t3_patrol_side < 0 else 'R'}")
 
-                            elif t3_state == 'ADVANCE':
-                                target_lat, target_lon = t3_move_target
-                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 1.5:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    target_lat, target_lon = None, None
-                                    t3_state = 'PAN_A'
+                            elif t3_state == 'SWEEP':
+                                if not t3_sweep_wps or t3_sweep_idx >= len(t3_sweep_wps):
+                                    t3_state = 'RETURN'
+                                else:
+                                    target_lat, target_lon = t3_sweep_wps[t3_sweep_idx]
+                                    if nav.haversine(ida_enlem, ida_boylam,
+                                                     target_lat, target_lon) < 2.5:
+                                        t3_sweep_idx += 1
+                                        target_lat, target_lon = None, None
 
                             elif t3_state == 'GOTO_STANDOFF':
                                 target_lat, target_lon = t3_move_target

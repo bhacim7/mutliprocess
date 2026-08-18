@@ -389,8 +389,17 @@ T3_STANDOFF_M = 8.0          # stop this far in front of an anchor buoy - an obs
                              # keeps both directions of the line in view
 T3_PATROL_FIRST_LEG_M = 15.0   # first sweep along the line...
 T3_PATROL_SECOND_LEG_M = 30.0  # ...then twice as far the other way (order is random)
-T3_ADVANCE_STEP_M = 5.0      # nothing seen at all: creep toward the line and re-sweep
-T3_ADVANCE_MAX_STEPS = 2
+# No anchor from the opening pans: expanding transect sweep. Serpentine rows
+# perpendicular to the axis, each row deeper than the last. Row spacing is kept well
+# under the 15 m detection ceiling so the pass has no coverage gaps; 2 rows x +/-25 m
+# sweeps the whole 60 x 20 m search box in one cycle (~2 min at survey speed). This
+# replaced a fixed 2 x 5 m creep along the axis that re-walked the same strip forever
+# when the buoy line was out of range - measured doing exactly that on 2026-08-18.
+T3_SWEEP_ROW_SPACING_M = 8.0
+T3_SWEEP_HALF_WIDTH_M = 25.0   # stays inside T3_BOUND_LATERAL_M with 5 m margin
+T3_SWEEP_ROWS = 2              # 2 x 8 = 16 m deep, inside T3_BOUND_FORWARD_M
+T3_PAN_TOL_DEG = 10.0          # pan stop window; 5 deg was missed at speed (ZED heading
+                               # lags the hull) and the boat spun full extra circles
 T3_BOUND_LATERAL_M = 30.0    # search box around the T3_MID waypoint; leaving it triggers
 T3_BOUND_FORWARD_M = 20.0    # a return to T3_MID and a mirrored restart
 T3_PAN_WIDE_DEG = 90.0       # opening sweep; with the +/-55 deg FOV this sees ~all around
