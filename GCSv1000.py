@@ -341,6 +341,13 @@ def _parse_or_recover(line: str):
 # Wire keys are short to keep a packet inside one radio frame; they are expanded back to
 # the long names here, the moment the line is parsed, so on_packet() and everything below
 # it still reads 'pwm_L', 'MEVCUT_KONUM' and friends exactly as before.
+_TASK_NAMES = {
+    0: "TASK1_APPROACH", 1: "TASK1_STATE_ENTER", 2: "TASK1_STATE_MID",
+    3: "TASK1_STATE_EXIT", 4: "TASK2_START", 5: "TASK2_GO_TO_MID",
+    6: "TASK2_GO_TO_END", 7: "T3_START", 8: "T3_MID",
+    9: "TASK3_SEARCH_KAMIKAZE", 10: "FINISHED", 11: "TASK_UNKNOWN",
+}
+
 _WIRE_KEYS = {
     "i": "id", "t": "t_ms", "a": "pwm_L", "b": "pwm_R", "c": "pwm_FL", "d": "pwm_FR",
     "s": "pwm_STEER", "v": "spd", "h": "hdg", "th": "trg_hdg", "ea": "err_ang",
@@ -412,6 +419,15 @@ class SerialWorker(QThread):
         # for it three times a second bought nothing. Filled in so SENSOR_SAGLIK reads
         # exactly as it did before.
         out.setdefault("hlth", "GOOD")
+
+        # Task states travel as small integers; unknown values pass through as-is.
+        if isinstance(out.get("task"), int):
+            out["task"] = _TASK_NAMES.get(out["task"], str(out["task"]))
+
+        # ZAMAN is stamped at ARRIVAL rather than transmitted. The boat's clock cost 15 B
+        # per packet to deliver 1-second resolution; the arrival time is what the operator
+        # actually wants to know (is this data fresh?) and it is free.
+        out.setdefault("t_ms", time.strftime("%H:%M:%S"))
 
         # One waypoint per packet, accumulated into the full set.
         if "w" in d and "wa" in d and "wo" in d:
@@ -3133,6 +3149,13 @@ class MainWindow(QtWidgets.QMainWindow):
         b_estop.clicked.connect(lambda: self._confirm_estop(bid))
         g.addWidget(b_estop, 5, 0, 1, 2)
 
+        # Bağlantı kalitesi - teknenin sıra numaralarından canlı ölçüm. Yeşil: sağlıklı,
+        # turuncu: aksıyor, kırmızı: kötü. "Akıcı değil" hissinin yerini rakam alsın diye.
+        self.link_lbl = QtWidgets.QLabel("LINK: veri yok")
+        self.link_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self.link_lbl.setStyleSheet("color:#90a4ae; font-weight:bold;")
+        g.addWidget(self.link_lbl, 6, 0, 1, 2)
+
         # 5. Bilgi
         info_text = "[↑]İleri  [↓]Geri  [←][→]Yön  [SPACE]Dur"
         lbl_info = QtWidgets.QLabel(info_text)
@@ -3202,6 +3225,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         task_str = d.get("task", "")
 
+        # --- Link istatistiği: varış zamanı + sıra numarası ---
+        # 'q' üst üste artan bir sayaçtır; aradaki atlama = kaybolan paket sayısı. Bu ayrım
+        # önemli: "kayıp" ile "geç geldi" farklı hastalıklardır ve şimdiye kadar ikisini
+        # ayıracak hiçbir ölçüm yoktu.
+        if bid == 1:
+            st = getattr(self, "_lk", None)
+            if st is None:
+                st = self._lk = {"times": [], "last_q": None, "got": 0, "lost": 0}
+            st["times"].append(time.time())
+            if len(st["times"]) > 200:
+                del st["times"][:100]
+            q = d.get("q")
+            if q is not None:
+                try:
+                    q = int(q)
+                    if st["last_q"] is not None:
+                        delta = (q - st["last_q"]) % 100000
+                        if 0 < delta < 500:          # makul aralık: sayaç sıçraması değil
+                            st["got"] += 1
+                            st["lost"] += delta - 1
+                        else:                         # tekne yeniden başladı: sayaçları koru
+                            st["got"] += 1
+                    else:
+                        st["got"] += 1
+                    st["last_q"] = q
+                except (TypeError, ValueError):
+                    pass
+
         # LED
         led = self.usv1_led if bid == 1 else getattr(self, "usv2_led", self.usv1_led)
         if led:
@@ -3249,6 +3300,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- YARDIMCI GÜNCELLEME FONKSİYONU ---
         def s(k, v="-"):
+            # Alan pakette HİÇ yoksa dokunma: son değer ekranda kalsın. Waypoint artık
+            # kendi mini paketinde geliyor ve o pakette panel alanları yok - eski davranış
+            # 10 saniyede bir bütün paneli "-" yapıp titretirdi. "-" yalnızca alan gelip
+            # değeri None olduğunda yazılır.
+            if v not in d:
+                return
             raw_val = d.get(v, "-")
 
             # Eğer veri yoksa veya None ise
@@ -3753,8 +3810,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_status("Bağlantı kesildi.")
 
     def _perform_polling(self):
-        """Her iki araca da kendi özel hatlarından AYNI ANDA durum sorgusu atar."""
-        if self.worker_1: self.worker_1.queue_send({"target_id": 1, "cmd": "report_status"})
+        """
+        No longer polls. The boat broadcasts on its own clock now (TELEM_BROADCAST_S),
+        which deletes the whole six-hop request round trip - the GCS GUI timer, the air
+        uplink, the boat's CommandReceiver sleep, the nav_process flag relay and the
+        telem_process flag poll all used to sit between "timer fired" and "packet sent",
+        and their combined jitter was as large as the polling interval itself. That is
+        what an uneven, stuttering panel actually was. This timer now just refreshes the
+        link-quality readout computed from what arrives.
+        """
+        self._update_link_stats()
+
+    def _update_link_stats(self):
+        """Live link quality from the boat's sequence numbers and arrival times."""
+        if not hasattr(self, "link_lbl"):
+            return
+        st = getattr(self, "_lk", None)
+        now = time.time()
+        if not st or not st["times"]:
+            self.link_lbl.setText("LINK: veri yok")
+            self.link_lbl.setStyleSheet("color:#90a4ae; font-weight:bold;")
+            return
+
+        # Rate and largest arrival gap over the last 10 s; loss over the last ~100 packets.
+        recent = [t for t in st["times"] if now - t <= 10.0]
+        rate = len(recent) / 10.0
+        gaps = [b - a for a, b in zip(recent, recent[1:])]
+        tail_gap = now - st["times"][-1]
+        max_gap = max(gaps + [tail_gap]) if gaps else tail_gap
+        total = st["got"] + st["lost"]
+        loss = (100.0 * st["lost"] / total) if total else 0.0
+
+        self.link_lbl.setText(
+            f"LINK: {rate:.1f} Hz · kayıp %{loss:.0f} · boşluk {max_gap:.1f}s")
+        if rate >= 2.5 and loss < 10.0:
+            style = "color:#00e676; font-weight:bold;"       # sağlıklı
+        elif rate >= 1.5:
+            style = "color:#ffa726; font-weight:bold;"       # aksıyor
+        else:
+            style = "color:#ff5252; font-weight:bold;"       # kötü
+        self.link_lbl.setStyleSheet(style)
 
     def _on_map_changed(self):
         d = self.MAP_PRESETS[self.cmb_maps.currentText()]

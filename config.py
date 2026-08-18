@@ -74,6 +74,12 @@ SERIAL_BAUD = 57600
 # onto the next packet and json.loads() throws, so BOTH packets are lost silently.
 # The payload is kept well under this; the guard in utils/telem.py is the safety net.
 TELEM_MAX_PAYLOAD_B = 1500
+
+# Telemetry leaves on the boat's OWN clock at this interval - the GCS no longer polls.
+# The poll round trip (GCS GUI timer -> air -> CommandReceiver sleep -> nav_process flag ->
+# telem_process flag poll -> air) had jitter comparable to the interval itself, which is
+# what an uneven, stuttering panel actually was. Same rate as the old 300 ms polling.
+TELEM_BROADCAST_S = 0.3
 # Mission waypoints are ~513 B of the packet. Send them only when they change, plus a
 # periodic refresh so a GCS that connects late still gets them.
 TELEM_WAYPOINT_REFRESH_S = 10.0

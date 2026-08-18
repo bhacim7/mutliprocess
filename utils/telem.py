@@ -101,10 +101,28 @@ class TelemetrySender:
         print("[TelemetrySender] Closed.")
 
 class CommandReceiver:
+    """
+    Reads command lines from the radio and forwards them to nav_process.
+
+    Rewritten from readline() to a buffered read, for three reasons measured on the water:
+
+      * readline() blocks up to the port's 1 s timeout when a line arrives in two radio
+        frames - in_waiting sees the first fragment, readline() then sits waiting for the
+        newline. Every command behind it (the emergency stop included) waited too.
+      * One line per 100 ms iteration capped intake at 10 lines/s, and the boat's radio
+        hears EVERYTHING on the channel - the drone's 3 Hz packets included - so the real
+        inbound rate sat uncomfortably close to that ceiling and bursts backed up.
+      * Those drone packets were queued for nav_process, which shuttled them over a
+        Manager queue only to ignore them. Anything without a "cmd" key is dropped here.
+
+    read(in_waiting) never blocks; all complete lines in the buffer are processed in one
+    pass; a partial line simply stays in the buffer for the next pass.
+    """
     def __init__(self, telemetry, cmd_queue):
         self.telemetry = telemetry
         self.cmd_queue = cmd_queue
         self.running = False
+        self._buf = b""
         import threading
         self.thread = threading.Thread(target=self._listen)
         self.thread.daemon = True
@@ -117,18 +135,35 @@ class CommandReceiver:
     def stop(self):
         self.running = False
 
+    def _process_bytes(self, data):
+        """Append raw bytes; queue every complete command line found."""
+        self._buf += data
+        if len(self._buf) > 8192:      # newline lost in a corrupt stretch: resync
+            self._buf = b""
+            return
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cmd = json.loads(line.decode('utf-8'))
+            except Exception:
+                continue
+            # Commands all carry "cmd". The drone's telemetry (and our own, if the radio
+            # ever echoes) does not, and forwarding it was pure IPC noise.
+            if isinstance(cmd, dict) and cmd.get("cmd"):
+                self.cmd_queue.put(cmd)
+
     def _listen(self):
         while self.running:
-            if self.telemetry.ser and self.telemetry.ser.is_open:
-                try:
-                    if self.telemetry.ser.in_waiting > 0:
-                        line = self.telemetry.ser.readline().decode('utf-8').strip()
-                        if line:
-                            cmd = json.loads(line)
-                            self.cmd_queue.put(cmd)
-                except Exception:
-                    pass
-            time.sleep(0.1)
+            try:
+                ser = self.telemetry.ser
+                if ser and ser.is_open and ser.in_waiting > 0:
+                    self._process_bytes(ser.read(ser.in_waiting))
+            except Exception:
+                pass
+            time.sleep(0.05)
 
 class TelemetryTx:
     def __init__(self, telemetry, max_hz=10):

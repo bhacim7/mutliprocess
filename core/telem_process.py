@@ -25,6 +25,24 @@ def telem_worker(shared_state, command_queue, hf_data):
 
     my_id = 1
 
+    # --- Self-clocked broadcast (replaces GCS polling) ---
+    # Telemetry used to leave only as the ANSWER to a report_status poll, which made every
+    # panel refresh depend on a six-hop round trip: GCS timer (on its GUI thread) -> air ->
+    # CommandReceiver's 100 ms sleep and a readline() that can block a full second on a
+    # fragmented line -> mp.Queue -> nav_process's 25 Hz loop setting a flag -> this loop
+    # noticing the flag. The jitter of that chain is about as large as the polling interval
+    # itself, so arrivals wobbled between ~100 and ~600 ms even with ZERO packet loss -
+    # which reads as a stuttering panel. Broadcasting on our own clock deletes every one of
+    # those hops, halves the number of transmissions in the air, and turns the update
+    # success rate from (uplink survives AND downlink survives) into just (downlink
+    # survives). The rate itself is unchanged: one packet per 300 ms either way.
+    broadcast_s = float(getattr(cfg, 'TELEM_BROADCAST_S', 0.3))
+    next_send = 0.0
+    # Sequence number. Without one, the GCS cannot tell "packet lost" from "packet late" -
+    # two different diseases with different cures - and three rounds of tuning this link
+    # have been done by feel for exactly that reason. ~8 bytes buys the diagnosis.
+    seq = 0
+
     # --- Waypoint block state (see the GÖREV_NOKTALARI handling below) ---
     waypoint_refresh_s = float(getattr(cfg, 'TELEM_WAYPOINT_REFRESH_S', 10.0))
     last_waypoints_sent = None
@@ -75,6 +93,16 @@ def telem_worker(shared_state, command_queue, hf_data):
     drone_active = bool(getattr(cfg, 'DRONE_ACTIVE', False))
     cfg_color = str(getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')).lower()
 
+    # Task names travel as small integers - "TASK3_SEARCH_KAMIKAZE" is 23 bytes of
+    # payload to say what fits in one. The GCS expands them back; a state missing from
+    # the table goes as the raw string and still displays.
+    _TASK_CODES = {
+        "TASK1_APPROACH": 0, "TASK1_STATE_ENTER": 1, "TASK1_STATE_MID": 2,
+        "TASK1_STATE_EXIT": 3, "TASK2_START": 4, "TASK2_GO_TO_MID": 5,
+        "TASK2_GO_TO_END": 6, "T3_START": 7, "T3_MID": 8,
+        "TASK3_SEARCH_KAMIKAZE": 9, "FINISHED": 10, "TASK_UNKNOWN": 11,
+    }
+
     def task3_color():
         """
         Returns (colour, source) for the GCS.
@@ -119,7 +147,16 @@ def telem_worker(shared_state, command_queue, hf_data):
 
             # --- TELEMETRY BROADCAST ---
 
-            if shared_state.get('send_telemetry', False):
+            # nav_process still sets 'send_telemetry' when a legacy report_status poll
+            # arrives; it is deliberately ignored here so an old GCS polling away cannot
+            # double the send rate. The clock below is the only trigger.
+            if start_time >= next_send:
+                # Anchored to the previous deadline, not to now, so processing time does
+                # not accumulate into the period.
+                next_send = (start_time + broadcast_s if next_send == 0.0
+                             else next_send + broadcast_s)
+                if next_send < start_time:      # fell behind (e.g. serial stall): resync
+                    next_send = start_time + broadcast_s
                 # --- Payload construction ---
                 # Keys are SHORT on the wire and expanded back to their long names by the
                 # GCS the moment the line is parsed, so every consumer downstream still sees
@@ -140,24 +177,24 @@ def telem_worker(shared_state, command_queue, hf_data):
                 # cannot be corrupted this way at all.
                 payload = {
                     "i": my_id,
-                    "t": datetime.datetime.now().strftime('%H:%M:%S'),
+                    "q": seq,
                     "a": int(pwm_l),
                     "b": int(pwm_r),
                     "c": int(pwm_fl),
                     "d": int(pwm_fr),
                     "s": int(pwm_steer),
-                    "v": r(shared_state.get('horizontal_speed', 0.0), 2),
+                    "v": r(shared_state.get('horizontal_speed', 0.0), 1),
                     "h": r(heading, 0) if heading is not None else 0,
-                    "th": r(shared_state.get('adviced_course', 0.0), 1),
-                    "ea": r(shared_state.get('angle_error', 0.0), 1),
-                    "ce": r(shared_state.get('control_error', 0.0), 1),
-                    "k": mevcut_gorev,
+                    "th": int(r(shared_state.get('adviced_course', 0.0), 0)),
+                    "ea": int(r(shared_state.get('angle_error', 0.0), 0)),
+                    "ce": int(r(shared_state.get('control_error', 0.0), 0)),
+                    "k": _TASK_CODES.get(mevcut_gorev, mevcut_gorev),
                     # Position flattened rather than nested: {"lat":..,"lon":..} costs 14 B of
                     # punctuation and key names per point for no information.
-                    "la": r(current_lat, 7), "lo": r(current_lon, 7),
-                    "xa": r(shared_state.get('target_lat', 0.0), 7),
-                    "xo": r(shared_state.get('target_lon', 0.0), 7),
-                    "ds": r(shared_state.get('target_dist', 0.0), 1),
+                    "la": r(current_lat, 6), "lo": r(current_lon, 6),
+                    "xa": r(shared_state.get('target_lat', 0.0), 6),
+                    "xo": r(shared_state.get('target_lon', 0.0), 6),
+                    "ds": int(r(shared_state.get('target_dist', 0.0), 0)),
                     "m": 1 if manual_mode else 0,
                     "f": int(shared_state.get('camera_fps', 0) or 0),
                     # Motor-power relay as the VEHICLE reports it (RELAY_STATUS), not as we
@@ -187,14 +224,19 @@ def telem_worker(shared_state, command_queue, hf_data):
                 # airtime. If the GCS ever needs detections, send a separate, trimmed,
                 # low-rate packet rather than reviving this field.
 
-                # Waypoints: ONE point per packet, cycled, instead of all eight in a block.
+                # Waypoints go in their OWN mini packet that REPLACES this tick's
+                # telemetry, instead of riding along inside it.
                 #
-                # The block was 353 B on its own and pushed the packet to 750 B - three radio
-                # frames, two seams for another node to cut across, and losing any one of them
-                # lost all eight points. A single point is ~38 B, the packet stays in one
-                # frame, and a lost point is re-sent one cycle later instead of taking the
-                # whole set with it. The GCS accumulates them and rebuilds the same
-                # GÖREV_NOKTALARI dict its map code has always consumed.
+                # Piggybacking looked cheaper but pushed the worst-case packet to ~252 B -
+                # exactly at the radio frame boundary we are trying to stay under, with
+                # zero margin for a longer float. A dedicated packet is ~50 B, keeps the
+                # telemetry packet at a constant ~216 B worst case, and the panel misses
+                # one 300 ms refresh every 10 s, which is invisible. The GCS accumulates
+                # the points and its field setters skip keys that are absent, so a mini
+                # packet no longer blanks the panel.
+                #
+                # The old single 750 B block had the further flaw that losing one radio
+                # frame lost all eight points; here a lost point is re-sent a cycle later.
                 wp = current_waypoints()
                 now_ts = time.time()
                 if wp != last_waypoints_sent or (now_ts - last_waypoints_ts) >= waypoint_refresh_s:
@@ -202,9 +244,13 @@ def telem_worker(shared_state, command_queue, hf_data):
                     if names:
                         name = names[wp_cycle_idx % len(names)]
                         lat, lon = wp[name]
-                        payload["w"] = int(name.replace("GPS", ""))
-                        payload["wa"] = r(lat, 7)
-                        payload["wo"] = r(lon, 7)
+                        payload = {
+                            "i": my_id,
+                            "q": payload["q"],       # sequence continues across both kinds
+                            "w": int(name.replace("GPS", "")),
+                            "wa": r(lat, 6),
+                            "wo": r(lon, 6),
+                        }
                         wp_cycle_idx += 1
                         # The set counts as sent only once every point has had a turn, so a
                         # change part-way through simply keeps the cycle running rather than
@@ -214,6 +260,7 @@ def telem_worker(shared_state, command_queue, hf_data):
                             last_waypoints_ts = now_ts
 
                 tx.send(payload)
+                seq = (seq + 1) % 100000
                 shared_state['send_telemetry'] = False
 
             shared_state['telem_heartbeat'] = time.time()
