@@ -389,17 +389,40 @@ T3_STANDOFF_M = 8.0          # stop this far in front of an anchor buoy - an obs
                              # keeps both directions of the line in view
 T3_PATROL_FIRST_LEG_M = 15.0   # first sweep along the line...
 T3_PATROL_SECOND_LEG_M = 30.0  # ...then twice as far the other way (order is random)
-# No anchor from the opening pans: expanding transect sweep. Serpentine rows
-# perpendicular to the axis, each row deeper than the last. Row spacing is kept well
-# under the 15 m detection ceiling so the pass has no coverage gaps; 2 rows x +/-25 m
-# sweeps the whole 60 x 20 m search box in one cycle (~2 min at survey speed). This
-# replaced a fixed 2 x 5 m creep along the axis that re-walked the same strip forever
-# when the buoy line was out of range - measured doing exactly that on 2026-08-18.
-T3_SWEEP_ROW_SPACING_M = 8.0
-T3_SWEEP_HALF_WIDTH_M = 25.0   # stays inside T3_BOUND_LATERAL_M with 5 m margin
-T3_SWEEP_ROWS = 2              # 2 x 8 = 16 m deep, inside T3_BOUND_FORWARD_M
+# --- Expanding V fan (operator's design, replaces the rectangular transect sweep) ---
+# T3_MID is dropped by hand FACING the buoy line from ~15 m, so the targets are almost
+# certainly in the forward cone - the fan searches there first instead of opening with a
+# 26 m drive to a side corner like the rectangle did. Per round, both arms are flown:
+# diagonal leg from T3_MID at +/-deg, then an 8 m PROBE further along the arrival axis,
+# a short tip pan there (the probe is what covers the dead-ahead 20-30 m zone), back to
+# T3_MID, mirror arm. Angle AND radius grow per round; round 3 reaches the flanks and
+# slightly behind the beam. All three rounds empty -> mirrored restart from round 1.
+# NOTE: round 3's lateral reach (30*sin100 = 29.5 m) runs right at T3_BOUND_LATERAL_M;
+# drift can trip the bound there, which safely restarts the fan mirrored.
+T3_V_ROUND_DEG = (45.0, 70.0, 100.0)
+T3_V_ROUND_LEG_M = (10.0, 20.0, 30.0)
+T3_V_PROBE_M = 8.0
+T3_V_TIP_PAN_DEG = 45.0        # tip pans face the axis and sweep short - the forward band
+                               # is what matters there; the +/-90 opening pan stays as is
 T3_PAN_TOL_DEG = 10.0          # pan stop window; 5 deg was missed at speed (ZED heading
                                # lags the hull) and the boat spun full extra circles
+
+# Anchor shortcut on/off. True: any Task 3 buoy seen mid-search snaps to the
+# standoff/patrol path (proved itself on the red-buoy run). False: the V fan runs pure -
+# for field experiments comparing the pattern's own performance.
+T3_ANCHOR_ENABLED = True
+
+# Turn authority in Task 3 only. The search is corner-heavy and 200 spun the hull at a
+# measured 35-57 deg/s - frantic to watch, and fast enough that the ZED-filtered heading
+# lagged the hull and pan stop windows were missed. 140 gives ~22-38 deg/s. Task 1/2
+# alignment and in-drive spot turns keep SPOT_TURN_PWM.
+T3_SPOT_TURN_PWM = 140
+
+# Servo lock fidelity window. Without it the lock dropped on ONE missed freshness check
+# and instantly re-locked the nearest other candidate - on 2026-08-18 the rudder swung to
+# an object 8.6 m away while the true target sat 3.4 m ahead, weaving the final approach.
+# Within this grace the boat steers on the locked track's last pixel column instead.
+T3_LOCK_GRACE_S = 0.6
 T3_BOUND_LATERAL_M = 30.0    # search box around the T3_MID waypoint; leaving it triggers
 T3_BOUND_FORWARD_M = 20.0    # a return to T3_MID and a mirrored restart
 T3_PAN_WIDE_DEG = 90.0       # opening sweep; with the +/-55 deg FOV this sees ~all around
