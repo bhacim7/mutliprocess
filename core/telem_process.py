@@ -3,6 +3,30 @@ import datetime
 import config as cfg
 import utils.telem as telem
 
+# Competition deliverable "File 2" - vehicle telemetry CSV. First row must be a header
+# describing the data; the rest at >= 1 Hz. Column notes:
+#   * hiz_set_pwm: this platform has no closed speed loop - the commanded quantity IS the
+#     thrust PWM, so the speed set point is logged as the mean commanded rear-thruster
+#     PWM (1500 = neutral). Documented here and in the delivery notes.
+#   * yon_set_deg: the heading set point the controllers steer to (HEDEF_HDG).
+VEHICLE_CSV_HEADER = ("zaman,enlem_deg,boylam_deg,yer_hizi_mps,roll_deg,pitch_deg,"
+                      "heading_deg,hiz_set_pwm,yon_set_deg")
+
+
+def vehicle_csv_row(ts, lat, lon, spd, roll, pitch, hdg, hiz_set_pwm, yon_set_deg):
+    """One CSV line, fixed decimals so the file stays regular and diff-able."""
+    def f(v, nd, default=0.0):
+        try:
+            return f"{float(v):.{nd}f}"
+        except (TypeError, ValueError):
+            return f"{default:.{nd}f}"
+    return ",".join([
+        ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        f(lat, 7), f(lon, 7), f(spd, 2),
+        f(roll, 1), f(pitch, 1), f(hdg, 1),
+        f(hiz_set_pwm, 0), f(yon_set_deg, 1),
+    ])
+
 def telem_worker(shared_state, command_queue, hf_data):
     """
     Independent process handling GCS communication.
@@ -42,6 +66,21 @@ def telem_worker(shared_state, command_queue, hf_data):
     # two different diseases with different cures - and three rounds of tuning this link
     # have been done by feel for exactly that reason. ~8 bytes buys the diagnosis.
     seq = 0
+
+    # --- Vehicle telemetry CSV (competition file 2) ---
+    csv_f = None
+    csv_last = 0.0
+    csv_period = 1.0 / max(0.2, float(getattr(cfg, 'VEHICLE_CSV_HZ', 2.0)))
+    if getattr(cfg, 'RECORD_VEHICLE_CSV', True):
+        try:
+            _csv_name = datetime.datetime.now().strftime('arac_telemetri_%Y%m%d_%H%M%S.csv')
+            csv_f = open(_csv_name, 'w', encoding='utf-8')
+            csv_f.write(VEHICLE_CSV_HEADER + "\n")
+            csv_f.flush()
+            print(f"[TELEM_PROCESS] Vehicle CSV log: {_csv_name}")
+        except Exception as e:
+            print(f"[TELEM_PROCESS] Vehicle CSV could not be opened: {e}")
+            csv_f = None
 
     # --- Waypoint block state (see the GÖREV_NOKTALARI handling below) ---
     waypoint_refresh_s = float(getattr(cfg, 'TELEM_WAYPOINT_REFRESH_S', 10.0))
@@ -144,6 +183,22 @@ def telem_worker(shared_state, command_queue, hf_data):
 
             # In a real scenario, incoming commands from GCS (set_gps, emergency_stop, set_task)
             # would be read by the serial thread and pushed into command_queue for NavProcess to handle.
+
+            # --- Vehicle CSV row (2 Hz, flushed per row so a hard kill loses nothing) ---
+            if csv_f is not None and (start_time - csv_last) >= csv_period:
+                csv_last = start_time
+                try:
+                    csv_f.write(vehicle_csv_row(
+                        datetime.datetime.now(), current_lat, current_lon,
+                        shared_state.get('horizontal_speed', 0.0),
+                        shared_state.get('imu_roll_deg', 0.0),
+                        shared_state.get('imu_pitch_deg', 0.0),
+                        heading,
+                        (int(pwm_l) + int(pwm_r)) / 2.0,
+                        shared_state.get('adviced_course', 0.0)) + "\n")
+                    csv_f.flush()
+                except Exception:
+                    pass
 
             # --- TELEMETRY BROADCAST ---
 
@@ -277,5 +332,7 @@ def telem_worker(shared_state, command_queue, hf_data):
         try:
             cmd_rx.stop()
             telemetry_sender.close()
+            if csv_f is not None:
+                csv_f.close()
         except:
             pass

@@ -428,6 +428,7 @@ def camera_worker(shared_state, hf_data):
     zed_pose = sl.Pose()
 
     magnetic_filter = KalmanFilter(process_variance=1e-3, measurement_variance=1e-1)
+    last_imu_pub = 0.0   # throttle for the roll/pitch publish below (vehicle CSV log)
 
     print("[CAM_PROCESS] Camera initialized and ready.")
     last_printed_task = None
@@ -492,6 +493,16 @@ def camera_worker(shared_state, hf_data):
                         shared_state['lidar_wave_stable'] = False
                     else:
                         shared_state['lidar_wave_stable'] = True
+
+                    # Roll/pitch for the competition's vehicle CSV (file 2). They were
+                    # computed here all along but only consumed as a boolean stability
+                    # flag; the log needs the angles themselves. Throttled - the CSV
+                    # samples at 2 Hz, publishing at 5 Hz is already generous and two
+                    # more Manager-dict writes per frame at 30 fps would not be.
+                    if (time.time() - last_imu_pub) >= 0.2:
+                        last_imu_pub = time.time()
+                        shared_state['imu_roll_deg'] = float(robot_roll_deg)
+                        shared_state['imu_pitch_deg'] = float(robot_pitch_deg)
 
                 # 2. READ FRAME & DEPTH
                 zed.retrieve_image(image, sl.VIEW.LEFT)

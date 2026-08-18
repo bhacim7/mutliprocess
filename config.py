@@ -121,6 +121,14 @@ LIDAR_OCCUPIED_GAIN = 80
 LIDAR_KORIDOR_KP = 30.0
 MAP_DECAY_AMOUNT = 1
 
+# --- Competition deliverable: vehicle telemetry CSV ("File 2") ---
+# Written by telem_process next to the code, one file per run, header row first as the
+# rules require. >= 1 Hz is the requirement; 2 Hz gives margin. Roll/pitch come from the
+# ZED pose (published by camera_process); the speed set point is the mean commanded rear
+# PWM because the platform has no closed speed loop - the PWM IS the commanded quantity.
+RECORD_VEHICLE_CSV = True
+VEHICLE_CSV_HZ = 2.0
+
 # --- POST-MISSION COSTMAP RECORDER (diagnostics only, no effect on control) ---
 # The old recorder stamped every 1 Hz sighting into a fixed 500 m canvas at 0.5 m/px and
 # never erased anything, so a single buoy smeared into a ~14 m blob and ~90% of the saved
