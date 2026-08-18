@@ -25,10 +25,24 @@ CH_FRONT_RIGHT = getattr(cfg, 'FRONT_SAG_MOTOR', 4)
 CH_STEER = getattr(cfg, 'FRONT_STEER_SERVO', 5)
 
 
-def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
+def _slew(target, prev, max_delta):
+    """Limit one channel's per-cycle change to +/- max_delta."""
+    if max_delta is None or max_delta <= 0 or prev is None:
+        return int(target)
+    if target > prev + max_delta:
+        return int(prev + max_delta)
+    if target < prev - max_delta:
+        return int(prev - max_delta)
+    return int(target)
+
+
+def apply_motor_mixer(controller, forward_pwm, yaw_pwm, slew=True):
     """
     Control Mixer: Distributes Forward Effort and Yaw Effort across 5 channels.
     Implements Steering Deadband for smooth turns and push-pull differential.
+
+    `slew=False` bypasses the rate limiter - use it for emergency braking and for the
+    SIGTERM neutralise, where an instantaneous command is the whole point.
     """
     base = getattr(cfg, 'BASE_PWM', 1500)
 
@@ -84,13 +98,100 @@ def apply_motor_mixer(controller, forward_pwm, yaw_pwm):
     rear_right = int(np.clip(rear_right, 1100, 1900))
     front_left = int(np.clip(front_left, 1100, 1900))
     front_right = int(np.clip(front_right, 1100, 1900))
+    steer_out = int(steer_out)
+
+    # --- Slew-rate limiting (cfg.MAX_PWM_CHANGE) ---
+    # This limit has been sitting in config.py unused since the beginning. Flight data
+    # shows why it matters: at 23:48:08 the mixer went 1100/1900 -> 1831/1528 -> 1900/1109
+    # in 0.25 s, an ~800 PWM reversal on every thruster inside a quarter second. That is
+    # not control, it is chatter - and with the hull's ~1 s yaw time constant the boat
+    # simply keeps rotating through it. The previous PWM is read back from the controller's
+    # own cache, so no extra state has to be threaded through here.
+    if slew:
+        max_delta = getattr(cfg, 'MAX_PWM_CHANGE', 60)
+        rear_left = _slew(rear_left, controller.get_servo_pwm(CH_REAR_LEFT), max_delta)
+        rear_right = _slew(rear_right, controller.get_servo_pwm(CH_REAR_RIGHT), max_delta)
+        front_left = _slew(front_left, controller.get_servo_pwm(CH_FRONT_LEFT), max_delta)
+        front_right = _slew(front_right, controller.get_servo_pwm(CH_FRONT_RIGHT), max_delta)
+        steer_out = _slew(steer_out, controller.get_servo_pwm(CH_STEER), max_delta)
 
     # Command the hardware
-    controller.set_servo(CH_REAR_LEFT, rear_left)
-    controller.set_servo(CH_REAR_RIGHT, rear_right)
-    controller.set_servo(CH_FRONT_LEFT, front_left)
-    controller.set_servo(CH_FRONT_RIGHT, front_right)
-    controller.set_servo(CH_STEER, int(steer_out))
+    force = not slew  # emergency / neutralise paths must not be rate limited downstream
+    controller.set_servo(CH_REAR_LEFT, rear_left, force=force)
+    controller.set_servo(CH_REAR_RIGHT, rear_right, force=force)
+    controller.set_servo(CH_FRONT_LEFT, front_left, force=force)
+    controller.set_servo(CH_FRONT_RIGHT, front_right, force=force)
+    controller.set_servo(CH_STEER, steer_out, force=force)
+
+
+def _latlon_to_local(origin_lat, origin_lon, lat, lon):
+    """(North, East) metres from the local frame origin - the same frame robot_x/robot_y use."""
+    d = nav.haversine(origin_lat, origin_lon, lat, lon)
+    b = math.radians(nav.calculate_bearing(origin_lat, origin_lon, lat, lon))
+    return d * math.cos(b), d * math.sin(b)
+
+
+def _task2_axis_local(origin_lat, origin_lon):
+    """
+    Task 2 reference axis in local coordinates: first waypoint -> last waypoint.
+
+    This is the only geometry the rules guarantee - a straight line between those two points
+    stays inside the course - and unlike a boat->goal axis it does not rotate with the
+    approach, so "left" and "right" stay meaningful when entering diagonally.
+    Returns (p0, p1) as numpy arrays, or None if the points are unset or degenerate.
+    """
+    e_lat = getattr(cfg, 'T2_ZONE_ENTRY_LAT', 0.0)
+    e_lon = getattr(cfg, 'T2_ZONE_ENTRY_LON', 0.0)
+    x_lat = getattr(cfg, 'T2_ZONE_END_LAT', 0.0)
+    x_lon = getattr(cfg, 'T2_ZONE_END_LON', 0.0)
+    if not (e_lat and e_lon and x_lat and x_lon):
+        return None
+    if nav.haversine(e_lat, e_lon, x_lat, x_lon) < 5.0:
+        return None
+    p0 = np.array(_latlon_to_local(origin_lat, origin_lon, e_lat, e_lon), dtype=float)
+    p1 = np.array(_latlon_to_local(origin_lat, origin_lon, x_lat, x_lon), dtype=float)
+    return p0, p1
+
+
+def _confirmed_boundary_local(vision_objects, boat_lat, boat_lon, robot_x, robot_y):
+    """
+    Local (x, y) of the boundary buoys that are trustworthy enough to constrain on.
+
+    Confirmation matters here in a way it does not for plain obstacle avoidance: a spurious
+    orange narrows the corridor, and a corridor that is too narrow is as bad as none at all.
+    A buoy counts once it has been seen CORRIDOR_CONFIRM_SIGHTINGS times and was seen in the
+    last CORRIDOR_CONFIRM_MAX_AGE_S seconds.
+    """
+    if not vision_objects or not boat_lat:
+        return []
+
+    min_seen = int(getattr(cfg, 'CORRIDOR_CONFIRM_SIGHTINGS', 3))
+    max_age = float(getattr(cfg, 'CORRIDOR_CONFIRM_MAX_AGE_S', 1.5))
+    now = time.time()
+
+    out = []
+    for obj in vision_objects:
+        if obj.get('cid') != 3:          # orange = boundary
+            continue
+        # Position not yet confirmed by a close sighting - see MAP_MAX_RANGE_M. Building the
+        # corridor from distant projections is what put orange boundary marks 2-3 m from where
+        # the buoys actually were.
+        if not obj.get('pos_ok', True):
+            continue
+        if int(obj.get('seen', 0)) < min_seen:
+            continue
+        last_seen = obj.get('last_seen')
+        if last_seen is None or (now - last_seen) > max_age:
+            continue
+        o_lat, o_lon = obj.get('lat'), obj.get('lon')
+        if not o_lat or not o_lon:
+            continue
+        dist = nav.haversine(boat_lat, boat_lon, o_lat, o_lon)
+        if not (0.0 < dist < 20.0):
+            continue
+        brg = math.radians(nav.calculate_bearing(boat_lat, boat_lon, o_lat, o_lon))
+        out.append((robot_x + dist * math.cos(brg), robot_y + dist * math.sin(brg)))
+    return out
 
 
 def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
@@ -124,6 +225,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
     local_costmap = np.full((LOCAL_SIZE, LOCAL_SIZE), 127, dtype=np.uint8)
 
+    # Physical buoy footprint painted into the costmap. Safety margin is NOT included here -
+    # it belongs to the inflation step, which applies it with the correct geometry.
+    buoy_radius_px = max(1, int(round(getattr(cfg, 'BUOY_RADIUS_M', 0.25) / COSTMAP_RES_M_PER_PX)))
+
     # These follow whatever map we are currently holding. When lidar_process pushes a
     # costmap it comes with its own geometry (its own size, centred on world origin),
     # so they must not be hardcoded to the local map's constants.
@@ -131,6 +236,32 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     costmap_size_px = (LOCAL_SIZE, LOCAL_SIZE)   # (width, height)
     costmap_center_m = (0.0, 0.0)
     costmap_ready = True
+
+    def publish_mission_points():
+        """
+        Mirror the current waypoint set into shared_state.
+
+        `set_gps` below mutates this process's `cfg` module. With mp.set_start_method('spawn')
+        every worker imports its OWN copy of config.py, so telem_process never saw those
+        updates - it kept echoing the config-file defaults back to the GCS while nav steered
+        to the operator's points. Publishing them here is what makes the GCS display (and the
+        change-detection in telem_process) reflect reality.
+        """
+        try:
+            shared_state['mission_points'] = {
+                "GPS1": (float(cfg.T1_GATE_ENTER_LAT), float(cfg.T1_GATE_ENTER_LON)),
+                "GPS2": (float(cfg.T1_GATE_MID_LAT), float(cfg.T1_GATE_MID_LON)),
+                "GPS3": (float(cfg.T1_GATE_EXIT_LAT), float(cfg.T1_GATE_EXIT_LON)),
+                "GPS4": (float(cfg.T2_ZONE_ENTRY_LAT), float(cfg.T2_ZONE_ENTRY_LON)),
+                "GPS5": (float(cfg.T2_ZONE_MID_LAT), float(cfg.T2_ZONE_MID_LON)),
+                "GPS6": (float(cfg.T2_ZONE_END_LAT), float(cfg.T2_ZONE_END_LON)),
+                "GPS7": (float(cfg.T3_START_LAT), float(cfg.T3_START_LON)),
+                "GPS8": (float(cfg.T3_MID_LAT), float(cfg.T3_MID_LON)),
+            }
+        except Exception as e:
+            print(f"[NAV_PROCESS][WARNING] Could not publish mission points: {e}")
+
+    publish_mission_points()
 
     def world_to_pixel(world_x, world_y):
         w, h = costmap_size_px
@@ -148,8 +279,10 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     direct_drive_prev_error = 0.0
 
     current_path = None
+    current_path_ts = 0.0             # when current_path was produced (A_STAR_MAX_PATH_AGE_S)
     path_progress_idx = 0
     active_controller = None          # 'PP' or 'PID' - used to reset stale derivative state
+    pp_spot_turn_active = False       # hysteresis latch for the PP spot-turn guard
     plan_timer = 0
     prev_heading_error = 0.0
     hybrid_local_target = None
@@ -171,7 +304,36 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     robot_x, robot_y, robot_yaw = 0.0, 0.0, 0.0
 
     last_loop_time = time.time()
-    loop_dt = 0.02
+    NAV_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'NAV_LOOP_HZ', 25.0))
+    loop_dt = NAV_PERIOD_S
+
+    # --- IPC throttling (see cfg.VISION_READ_HZ / cfg.NAV_PUBLISH_HZ) ---
+    # shared_state is a multiprocessing.Manager dict: EVERY access is a pickle round trip
+    # over a socket. The nav loop was making ~25 of them per iteration at 50 Hz (~1250/s),
+    # and the single most expensive entry - 'vision_detected_objects', a list of 10-30
+    # dicts - was being unpickled on every single cycle. That cost is what pushed loop_dt
+    # around, and because dt_scale() rescales the D/I terms by loop_dt, the effective
+    # damping was changing from cycle to cycle. That is the direct cause of "sometimes it
+    # runs beautifully, sometimes it does not" on identical code.
+    VISION_READ_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'VISION_READ_HZ', 10.0))
+    PUBLISH_PERIOD_S = 1.0 / max(1.0, getattr(cfg, 'NAV_PUBLISH_HZ', 10.0))
+    last_vision_read = 0.0
+    last_publish = 0.0
+    vision_objects = []
+    # Task 2 entrance alignment latch. A dict rather than a bare flag because the state
+    # machine helpers are closures rebuilt every cycle, so a local would not survive. Cleared
+    # whenever the boat is in a Task 1 state, i.e. before every Task 2 run.
+    t2_entry = {'aligned': False}
+    # Throttle for the A*-failure log below - planning runs at 5 Hz and a genuinely blocked
+    # goal would otherwise print five times a second.
+    last_astar_fail_log = 0.0
+
+    # Same list with distant-only positions removed; see MAP_MAX_RANGE_M. Initialised here
+    # because the vision read below is throttled to VISION_READ_HZ and the costmap block runs
+    # every cycle.
+    mappable_objects = []
+    lidar_enabled = getattr(cfg, 'ENABLE_LIDAR', True)
+    speed_mps = 0.0
 
     # Give up on the in-place spot turn after this long and let the normal controllers
     # take over, rather than pivoting forever on a bad heading.
@@ -180,10 +342,36 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     # Store legacy PWM defaults
     extra = 50
 
-    # Task 3 Search State variables
-    t3_search_state = "INIT_SEARCH"
-    t3_original_heading = None
-    t3_search_move_target = None
+    # --- Task 3 search v2 state ---
+    # The old pattern was an unbounded zigzag: pan +/-45, crawl 3 m, repeat forever along
+    # whatever heading the boat happened to arrive with. Against the real field - three
+    # buoys on a line spanning up to 30 m, T3_MID dropped by eye ~15 m short of it, and a
+    # hard 15 m detection ceiling from the ZED depth gate - that pattern relied on luck:
+    # no stationary pan can cover a 30 m line from 15 m away, so the search MUST move,
+    # and it must stop moving when it leaves the plausible field.
+    t3_state = 'INIT'
+    t3_heading0 = None            # search frame axis, frozen at first search entry
+    t3_move_target = None         # (lat, lon) of the current pattern waypoint
+    t3_patrol_side = 1            # first patrol/pan side; flipped on every RETURN
+    t3_sweep_wps = None           # expanding-transect waypoints, built per cycle
+    t3_sweep_idx = 0
+    t3_lock_id = None             # visual-servo target lock (see selection block)
+    t3_last_servo_dist = None     # for the loss-of-lock hold
+    t3_last_servo_ts = None
+    T3_MAX_DETECTION_AGE_S = 0.3  # steer only on genuinely fresh pixels
+
+    # --- Relay (motor power) ---
+    # Retried rather than fired once: command_long_send waits for no ACK, so a dropped
+    # safety command would go unnoticed. Retries stop as soon as RELAY_STATUS confirms the
+    # vehicle agrees, and they are spread across nav cycles rather than slept through, so
+    # the control loop keeps running.
+    MY_ID = getattr(cfg, 'VEHICLE_ID', 1)
+    RELAY_MAX_RETRIES = getattr(cfg, 'RELAY_COMMAND_RETRIES', 5)
+    RELAY_RETRY_INTERVAL_S = getattr(cfg, 'RELAY_RETRY_INTERVAL_S', 0.25)
+    relay_target = None          # state we are trying to reach, None = nothing pending
+    relay_retries = 0
+    relay_last_tx = 0.0
+    relay_reported = None        # last state read back from RELAY_STATUS
 
     costmap_recorder = None
     if getattr(cfg, 'RECORD_COSTMAP', False):
@@ -202,7 +390,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     def _on_terminate(signum, frame):
         print("[NAV_PROCESS] SIGTERM received - neutralising thrusters.")
         try:
-            apply_motor_mixer(controller, 1500, 0)
+            apply_motor_mixer(controller, 1500, 0, slew=False)
             controller.disarm_vehicle()
         except Exception:
             pass
@@ -232,15 +420,38 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 hf_data['gps_lat'].value = ida_enlem
                 hf_data['gps_lon'].value = ida_boylam
 
-                # Fetch and store horizontal speed
+                # Fetch horizontal speed. Kept in a LOCAL variable - Pure Pursuit reads it
+                # every cycle and round-tripping it through the Manager dict just to read it
+                # back was pure overhead. It is published to shared_state at NAV_PUBLISH_HZ
+                # further down for the HUD/telemetry.
                 try:
-                    shared_state['horizontal_speed'] = controller.get_horizontal_speed()
-                except AttributeError:
+                    _spd = controller.get_horizontal_speed()
+                    if _spd is not None:
+                        speed_mps = float(_spd)
+                except (AttributeError, TypeError, ValueError):
                     pass  # Fallback if get_horizontal_speed doesn't exist on dummy controller
 
                 fc_hdg = controller.get_heading()
-                if fc_hdg is not None:
-                    shared_state['fc_heading'] = fc_hdg
+
+                # --- Relay: read back, then retry any pending command ---
+                # The transmitter can change this relay too (RC7_OPTION=28), so the truth
+                # comes from the vehicle rather than from what we last sent.
+                try:
+                    relay_reported = controller.get_relay_state()
+                except AttributeError:
+                    relay_reported = None
+
+                if relay_target is not None:
+                    if relay_reported is not None and int(relay_reported) == relay_target:
+                        relay_target = None          # vehicle agrees, done
+                    elif relay_retries <= 0:
+                        print("[NAV_PROCESS][WARNING] Relay command not confirmed after "
+                              f"{RELAY_MAX_RETRIES} attempts.")
+                        relay_target = None
+                    elif (start_time - relay_last_tx) >= RELAY_RETRY_INTERVAL_S:
+                        relay_last_tx = start_time
+                        relay_retries -= 1
+                        controller.set_relay(relay_target)
 
                 # Compute actual magnetic_heading based on HEADING_SOURCE
                 zed_heading = shared_state.get('zed_heading', 0.0)
@@ -262,7 +473,23 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         cmd = command_queue.get_nowait()
                         cmd_str = cmd.get("cmd")
 
-                        if cmd_str == "emergency_stop":
+                        # The RFD link is shared with the drone, and CommandReceiver puts
+                        # every line it hears on this queue regardless of who it was for.
+                        # Ignoring a command addressed elsewhere matters most for the relay,
+                        # which cuts motor power.
+                        _tgt = cmd.get("target_id")
+                        if _tgt is not None and int(_tgt) != MY_ID:
+                            continue
+
+                        if cmd_str == "set_relay":
+                            want = 1 if cmd.get("value") else 0
+                            relay_target = want
+                            relay_retries = RELAY_MAX_RETRIES
+                            relay_last_tx = 0.0     # send on this very cycle
+                            print(f"[NAV_PROCESS] Relay command received: "
+                                  f"{'ON' if want else 'OFF'}")
+
+                        elif cmd_str == "emergency_stop":
                             print("[NAV_PROCESS] Emergency Stop Received!")
                             shared_state['shutdown'] = True
                         elif cmd_str == "report_status":
@@ -296,6 +523,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                                 cfg.T3_MID_LAT = lat;
                                 cfg.T3_MID_LON = lon
                             print(f"[NAV_PROCESS] Updated GPS Point {idx}")
+                            publish_mission_points()
                         elif cmd_str == "set_task":
                             new_task = cmd.get("task_name")
                             if new_task:
@@ -348,19 +576,27 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                 robot_yaw = math.radians(magnetic_heading)
 
-                center_danger = shared_state.get('lidar_center_blocked', False)
-                left_d = shared_state.get('lidar_left_dist', float('inf'))
-                center_d = shared_state.get('lidar_center_dist', float('inf'))
-                right_d = shared_state.get('lidar_right_dist', float('inf'))
+                # With ENABLE_LIDAR off these four Manager-dict reads happen every cycle and
+                # can never be anything but their defaults - the lidar process is not even
+                # started (see main_orchestrator). Skip them entirely.
+                if lidar_enabled:
+                    center_danger = shared_state.get('lidar_center_blocked', False)
+                    left_d = shared_state.get('lidar_left_dist', float('inf'))
+                    center_d = shared_state.get('lidar_center_dist', float('inf'))
+                    right_d = shared_state.get('lidar_right_dist', float('inf'))
+                else:
+                    center_danger = False
+                    left_d = center_d = right_d = float('inf')
 
                 # --- 4-A UPDATE: Pull from Queue instead of shared_state ---
                 lidar_data = None
-                try:
-                    # Empty the queue, only keeping the absolute newest frame
-                    while True:
-                        lidar_data = lidar_queue.get_nowait()
-                except queue.Empty:
-                    pass
+                if lidar_enabled:
+                    try:
+                        # Empty the queue, only keeping the absolute newest frame
+                        while True:
+                            lidar_data = lidar_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
                 got_lidar_map = False
                 if lidar_data and isinstance(lidar_data, tuple) and len(lidar_data) == 2:
@@ -379,12 +615,24 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     lidar_ts = 0.0  # Fallback
                 # -----------------------------------------------------------
 
-                vision_objects = shared_state.get('vision_detected_objects', [])
+                # Throttled read - this is the heaviest Manager-dict entry by far.
+                # camera_process only refreshes it at the ZED frame rate anyway, so reading
+                # it 50x/s never produced new information.
+                if (start_time - last_vision_read) >= VISION_READ_PERIOD_S:
+                    last_vision_read = start_time
+                    vision_objects = shared_state.get('vision_detected_objects', [])
+                    # Objects whose position rests only on distant sightings are dropped here,
+                    # once, so the costmap, the corridor and the recorder all see the same set.
+                    # Keeping the recorder in step matters: it is the instrument used to judge
+                    # whether the map is good, so it has to show what A* actually plans on.
+                    # Task 3 reads shared_state directly and is unaffected - it steers on the
+                    # pixel column, not on lat/lon.
+                    mappable_objects = [o for o in vision_objects if o.get('pos_ok', True)]
 
                 # --- UPDATE SEPARATE COSTMAP RECORDER ---
                 if costmap_recorder is not None:
                     # Use current raw gps location to feed global costmap
-                    costmap_recorder.update(ida_enlem, ida_boylam, vision_objects)
+                    costmap_recorder.update(ida_enlem, ida_boylam, mappable_objects)
 
                 # --- D. UPDATE LOCAL COSTMAP (TEMPORAL BUFFER) ---
                 # Most logic has been moved to lidar_process (4-B Update)
@@ -398,9 +646,9 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     costmap_center_m = (robot_x, robot_y)
                     costmap_img.fill(127)
 
-                if vision_objects and costmap_ready:
+                if mappable_objects and costmap_ready:
                     # If we are using vision-only or fused, draw vision objects on whatever map we have
-                    for obj in vision_objects:
+                    for obj in mappable_objects:
                         if "TASK2" in mevcut_gorev and obj.get('cid') not in [1, 3]:
                             continue
 
@@ -418,13 +666,22 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 p_virtual = world_to_pixel(obj_world_x, obj_world_y)
                                 if p_virtual:
-                                    cv2.circle(costmap_img, p_virtual, 6, 0, -1)
+                                    # The radius used to be a hardcoded 6 px (0.60 m), which
+                                    # silently doubled as safety margin. It now represents the
+                                    # buoy's actual size; ALL clearance comes from the
+                                    # inflation step in planner.get_inflated_nav_map(), where
+                                    # the robot radius is applied with the correct geometry.
+                                    cv2.circle(costmap_img, p_virtual, buoy_radius_px, 0, -1)
 
                 # --- E. FULL STATE MACHINE ---
                 # 3-A UPDATE: Refactored modular state machine
 
                 # Helper to execute task routing logic
                 def execute_task1(task_state, lat, lon):
+                    # Back in Task 1 means a fresh run at the Task 2 mouth is still to come,
+                    # so drop the entrance latch here rather than trying to spot the exact
+                    # moment Task 2 ends.
+                    t2_entry['aligned'] = False
                     if task_state == "TASK1_APPROACH": return "TASK1_STATE_ENTER", None, None
 
                     targets = {
@@ -455,8 +712,95 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                     if task_state in targets:
                         t_lat, t_lon, next_state = targets[task_state]
-                        if nav.haversine(lat, lon, t_lat, t_lon) < 3.0:
-                            task_state = next_state
+                        dist_to_target = nav.haversine(lat, lon, t_lat, t_lon)
+                        if dist_to_target < 3.0:
+                            return next_state, t_lat, t_lon
+
+                        # Entrance approach. Arriving at the mouth very obliquely, the
+                        # straight line to the entry waypoint can pass between the first and
+                        # second buoy of a boundary chain instead of through the mouth - the
+                        # chain spacing leaves a gap wide enough for A* to slip through.
+                        # Aiming at a point set back along the corridor axis first forces the
+                        # final leg to be aligned with the corridor, from either diagonal.
+                        if task_state == "TASK2_START":
+                            end_lat = getattr(cfg, 'T2_ZONE_END_LAT', 0)
+                            end_lon = getattr(cfg, 'T2_ZONE_END_LON', 0)
+                            if end_lat and end_lon and \
+                                    nav.haversine(t_lat, t_lon, end_lat, end_lon) > 5.0:
+                                offset = getattr(cfg, 'TASK2_APPROACH_OFFSET_M', 12.0)
+                                reached = getattr(cfg, 'TASK2_APPROACH_REACHED_M', 3.0)
+                                axis_brg = nav.calculate_bearing(t_lat, t_lon, end_lat, end_lon)
+                                a_lat, a_lon = calculate_obj_gps(
+                                    t_lat, t_lon, offset, (axis_brg + 180.0) % 360.0)
+
+                                # Position relative to the corridor axis, measured from the
+                                # entry: s along the axis (negative = still outside, in front
+                                # of the mouth) and d across it.
+                                brg_to_boat = nav.calculate_bearing(t_lat, t_lon, lat, lon)
+                                r_boat = nav.haversine(t_lat, t_lon, lat, lon)
+                                rel = math.radians(brg_to_boat - axis_brg)
+                                s_along = r_boat * math.cos(rel)
+                                d_across = abs(r_boat * math.sin(rel))
+
+                                # The approach point exists for one reason: make the last leg
+                                # into the mouth run ALONG the corridor, so an oblique line
+                                # cannot slip between the first two buoys of a boundary
+                                # chain. It is therefore needed only while we are off to the
+                                # side - once we are lined up in front of the mouth, heading
+                                # straight for the entry is already aligned.
+                                #
+                                # Keying it on lateral offset also makes the switch one-way.
+                                # Two earlier versions oscillated instead:
+                                #   * comparing distance to the ENTRY against an 8 m
+                                #     threshold while the approach point sat 12 m further
+                                #     back meant that on reaching it the boat was still 12 m
+                                #     from the entry, so it kept targeting the point it was
+                                #     already standing on and never left TASK2_START. Flight
+                                #     log 03:59:02-03:59:31: HEDEFE_MESAFE cycling 0.6-3.5 m
+                                #     with HEDEF_HDG swinging 143, 273, 296, 177, 100, 256.
+                                #   * a simple "within `reached` of the approach point" test
+                                #     flipped back the moment the boat moved past it toward
+                                #     the entry and left that radius again.
+                                #
+                                # The lateral test alone was not enough. On the 2026-08-17 run
+                                # the boat sat 16.3 m in front of the mouth but only 3.68 m off
+                                # the axis, so 3.68 > 8.0 was false, the approach point was
+                                # skipped, and it ran the whole 16.7 m diagonally - which is how
+                                # it came to enter on the far side of a boundary buoy when the
+                                # entry waypoint was placed near the edge of the course.
+                                #
+                                # So there is a second way in: if the boat is still BEHIND the
+                                # approach point, aim at it. Comparing s_along against -offset
+                                # is exactly the test for "have I passed it yet", because the
+                                # point sits at s = -offset by construction. Behind it, going
+                                # there is forward motion and costs almost nothing - 0.9 m of
+                                # extra travel for the run above. Past it, going there would
+                                # mean REVERSING away from the mouth, which is what made the
+                                # earlier 3 m lateral setting look like it was aligning from
+                                # much too far out, and why it was raised to 8 to suppress that.
+                                # This branch cannot reverse.
+                                #
+                                # The lateral branch stays at its tuned 8 m as a last resort:
+                                # close to the mouth but far off to the side is a bad enough
+                                # entry angle to be worth backing up for.
+                                lateral_tol = getattr(cfg, 'TASK2_APPROACH_LATERAL_M', 3.0)
+                                dist_to_approach = nav.haversine(lat, lon, a_lat, a_lon)
+
+                                # Latch. Without it the boat ping-pongs: on leaving the approach
+                                # point towards the entry, its distance to that point grows past
+                                # `reached` again, the condition re-arms, and it turns back.
+                                # Flight log 03:59:02-03:59:31 recorded exactly that, HEDEF_HDG
+                                # swinging 143, 273, 296, 177, 100, 256. Once aligned, this run
+                                # never targets the point again.
+                                if dist_to_approach <= reached:
+                                    t2_entry['aligned'] = True
+
+                                if (not t2_entry['aligned']
+                                        and s_along < 0.0
+                                        and dist_to_approach > reached
+                                        and (s_along < -offset or d_across > lateral_tol)):
+                                    return task_state, a_lat, a_lon
+
                         return task_state, t_lat, t_lon
 
                     return task_state, None, None
@@ -477,6 +821,19 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         return task_state, t_lat, t_lon
 
                     return task_state, None, None
+
+                def t3_target_cid():
+                    """The colour Task 3 hunts, as a YOLO class id.
+
+                    Config first; the drone's reported colour overrides it when DRONE_ACTIVE
+                    and one has actually arrived. If the drone never delivers, the config
+                    colour stands - the boat hunts something rather than nothing, and the
+                    GCS shows RENK YOK so the operator knows which case is live."""
+                    color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red')
+                    if getattr(cfg, 'DRONE_ACTIVE', False):
+                        color = shared_state.get('drone_target_color', color) or color
+                    return {'red': 0, 'yellow': 1, 'black': 2,
+                            'orange': 3, 'green': 4}.get(str(color).lower(), 0)
 
                 # Main State Router
                 target_lat = None
@@ -514,149 +871,319 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         skip_default_nav = True
 
                     elif mevcut_gorev == "TASK3_SEARCH_KAMIKAZE":
-                        found_target = False
-                        target_color = getattr(cfg, 'TASK3_KAMIKAZE_COLOR', 'red').lower()
-
-                        if getattr(cfg, 'DRONE_ACTIVE', False):
-                            target_color = shared_state.get('drone_target_color', target_color)
-                            if target_color is not None:
-                                target_color = target_color.lower()
-
-                        target_cid = 0
-                        if target_color == "yellow":
-                            target_cid = 1
-                        elif target_color == "black":
-                            target_cid = 2
-                        elif target_color == "orange":
-                            target_cid = 3
-                        elif target_color == "green":
-                            target_cid = 4
-
-                        # camera_process keeps a detection in memory (and therefore in this
-                        # list) for 5 seconds after it was last actually seen. Steering on a
-                        # 'cx' that old makes the boat chase where the target USED to be -
-                        # which is what produced the circling behaviour that TASK3_INVERT_STEERING
-                        # was added to mask. Only servo on genuinely fresh pixels.
-                        T3_MAX_DETECTION_AGE_S = 0.3
+                        target_cid = t3_target_cid()
                         now_ts = time.time()
+                        spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 200)
+                        t3_base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
 
+                        # ---- Target selection: nearest fresh candidate, held by an ID lock ----
+                        # The old loop took the FIRST fresh match in memory-insertion order,
+                        # which is neither the nearest nor stable: with two objects of the
+                        # target colour in view, a single missed YOLO frame on the first one
+                        # hopped the servo to the other and back, and a stale false-positive
+                        # track that happened to be inserted first outranked the real buoy
+                        # dead ahead. Selection is now by distance, and the winner's track id
+                        # is locked so the choice cannot flicker frame to frame. The lock is
+                        # identity, not position: the locked object's cx is re-read every
+                        # frame, so steering keeps correcting. It drops when the track goes
+                        # stale - or when the drone changes the colour mid-run, because a
+                        # different cid simply never enters `fresh`.
+                        fresh = []
                         for obj in vision_objects:
-                            if obj.get('cid') == target_cid:
-                                cx_val = obj.get('cx')
-                                if cx_val is None:
-                                    # No fresh pixel data for this tracked object this frame
-                                    # (defensive: avoids KeyError if 'cx' was never populated)
-                                    continue
+                            if obj.get('cid') != target_cid or obj.get('cx') is None:
+                                continue
+                            ls = obj.get('last_seen')
+                            if ls is None or (now_ts - ls) > T3_MAX_DETECTION_AGE_S:
+                                continue
+                            fresh.append(obj)
 
-                                last_seen = obj.get('last_seen')
-                                if last_seen is None or (now_ts - last_seen) > T3_MAX_DETECTION_AGE_S:
-                                    continue  # stale memory entry - keep searching instead
+                        target_obj = None
+                        if t3_lock_id is not None:
+                            for o in fresh:
+                                if o.get('id') == t3_lock_id:
+                                    target_obj = o
+                                    break
+                            if target_obj is None:
+                                t3_lock_id = None
+                        if target_obj is None and fresh:
+                            target_obj = min(fresh, key=lambda o: float(o.get('dist', 1e9)))
+                            t3_lock_id = target_obj.get('id')
+                            print(f"[TASK3] Locked target id={t3_lock_id} at "
+                                  f"{float(target_obj.get('dist', -1)):.1f} m")
 
-                                found_target = True
-                                dist_m = obj.get('dist', 10.0)
+                        if target_obj is not None:
+                            # --- Visual servoing (control law unchanged) ---
+                            target_lat, target_lon = None, None
+                            dist_m = float(target_obj.get('dist', 10.0))
+                            t3_last_servo_dist = dist_m
+                            t3_last_servo_ts = now_ts
 
-                                # Visual Servoing logic
-                                # Prevent GPS PID from interfering by setting targets to None
-                                target_lat, target_lon = None, None
+                            pixel_error = target_obj.get('cx') - (1280 / 2)
+                            kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
+                            if getattr(cfg, 'TASK3_INVERT_STEERING', False):
+                                steering_correction = -pixel_error * kp_pixel
+                            else:
+                                steering_correction = pixel_error * kp_pixel
+                            apply_motor_mixer(controller, t3_base_pwm, steering_correction)
 
-                                pixel_error = cx_val - (1280 / 2)  # Assuming 1280 width (ZED HD720)
+                            if dist_m < 1.0 or target_obj.get('area', 0) > 300000:
+                                print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
+                                apply_motor_mixer(controller, 1500, 0)
+                                mevcut_gorev = "FINISHED"
 
-                                # Simple P controller for pixel error to steering PWM
-                                kp_pixel = getattr(cfg, 'Kp_PIXEL', 0.3)
+                        elif (t3_last_servo_ts is not None
+                              and t3_last_servo_dist is not None
+                              and t3_last_servo_dist <= getattr(cfg, 'T3_HOLD_MAX_DIST_M', 5.0)
+                              and (now_ts - t3_last_servo_ts) <= getattr(cfg, 'T3_HOLD_S', 2.0)):
+                            # --- Loss-of-lock hold ---
+                            # Spray and glare routinely break detection for a few frames in
+                            # the last metres. Dropping straight back into the search here
+                            # made the boat yank sideways right next to its target; holding
+                            # course briefly lets the detector re-acquire, and if the target
+                            # was genuinely hit the collision check ends the run on
+                            # re-acquisition anyway.
+                            target_lat, target_lon = None, None
+                            apply_motor_mixer(controller, t3_base_pwm, 0)
 
-                                # Use inversion toggle to fix the circling bug
-                                if getattr(cfg, 'TASK3_INVERT_STEERING', False):
-                                    steering_correction = -pixel_error * kp_pixel
+                        else:
+                            # ==================== SEARCH v2 ====================
+                            # Wide pan first; any Task 3 buoy (not just the target colour)
+                            # found during a scan is used as an ANCHOR: the three buoys sit
+                            # on one line, so finding any of them is finding the line, and
+                            # the target is on it within ~30 m. Patrol runs parallel to that
+                            # line from a standoff point. Everything is bounded to a box
+                            # around T3_MID, and hitting a bound returns there and restarts
+                            # mirrored - no more unbounded zigzag toward the horizon.
+                            target_lat, target_lon = None, None
+
+                            mid_lat = getattr(cfg, 'T3_MID_LAT', 0.0)
+                            mid_lon = getattr(cfg, 'T3_MID_LON', 0.0)
+                            have_mid = bool(mid_lat and mid_lon)
+
+                            if t3_state == 'INIT':
+                                if t3_heading0 is None:
+                                    # Frozen once: the search frame must not rotate with the
+                                    # boat, or "lateral" would mean something new every leg.
+                                    t3_heading0 = magnetic_heading
+                                t3_sweep_wps = None
+                                t3_sweep_idx = 0
+                                t3_state = 'PAN_A'
+                                print(f"[TASK3] Search start: axis {t3_heading0:.0f} deg, "
+                                      f"first side {'L' if t3_patrol_side < 0 else 'R'}")
+
+                            # --- Bounds: stay inside the plausible field ---
+                            # Frame is anchored at the T3_MID waypoint (the operator's own
+                            # reference), axis = t3_heading0. The old pattern had no bounds
+                            # at all and crawled ~3 m per cycle toward wherever the boat
+                            # happened to be pointing when the search began.
+                            if have_mid and t3_heading0 is not None and t3_state != 'RETURN':
+                                d_mid = nav.haversine(mid_lat, mid_lon, ida_enlem, ida_boylam)
+                                brg_mid = nav.calculate_bearing(mid_lat, mid_lon, ida_enlem, ida_boylam)
+                                rel_mid = math.radians(brg_mid - t3_heading0)
+                                s_fwd = d_mid * math.cos(rel_mid)
+                                d_side = abs(d_mid * math.sin(rel_mid))
+                                if (d_side > getattr(cfg, 'T3_BOUND_LATERAL_M', 30.0)
+                                        or s_fwd > getattr(cfg, 'T3_BOUND_FORWARD_M', 20.0)
+                                        or s_fwd < -10.0):
+                                    print("[TASK3] Search bound reached - returning to T3_MID.")
+                                    t3_state = 'RETURN'
+
+                            # --- Anchor scan (only while scanning, not mid-patrol) ---
+                            # pos_ok is deliberately NOT required: a buoy first seen at
+                            # 13-15 m carries a position error of a metre or so, and the
+                            # standoff point sits 8 m short of it - plenty of slack. Waiting
+                            # for a <=12 m confirmation would mean never anchoring on
+                            # exactly the sightings this search exists to exploit.
+                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C', 'SWEEP'):
+                                anchor = None
+                                a_best = 1e9
+                                for obj in vision_objects:
+                                    if obj.get('cid') not in (0, 2, 4):
+                                        continue
+                                    ls = obj.get('last_seen')
+                                    if ls is None or (now_ts - ls) > T3_MAX_DETECTION_AGE_S:
+                                        continue
+                                    if int(obj.get('seen', 0)) < 3:
+                                        continue
+                                    o_lat, o_lon = obj.get('lat'), obj.get('lon')
+                                    if not o_lat or not o_lon:
+                                        continue
+                                    a_d = float(obj.get('dist', 1e9))
+                                    if a_d < a_best:
+                                        a_best = a_d
+                                        anchor = (o_lat, o_lon)
+                                if anchor is not None:
+                                    brg_away = nav.calculate_bearing(
+                                        anchor[0], anchor[1], ida_enlem, ida_boylam)
+                                    t3_move_target = calculate_obj_gps(
+                                        anchor[0], anchor[1],
+                                        getattr(cfg, 'T3_STANDOFF_M', 8.0), brg_away)
+                                    t3_state = 'GOTO_STANDOFF'
+                                    print(f"[TASK3] Anchor buoy at {a_best:.1f} m - "
+                                          "moving to standoff on the line.")
+
+                            if t3_state in ('PAN_A', 'PAN_B', 'PAN_C'):
+                                pan_deg = getattr(cfg, 'T3_PAN_WIDE_DEG', 90.0)
+                                if t3_state == 'PAN_A':
+                                    target_h = (t3_heading0 - t3_patrol_side * pan_deg) % 360
+                                elif t3_state == 'PAN_B':
+                                    target_h = (t3_heading0 + t3_patrol_side * pan_deg) % 360
                                 else:
-                                    steering_correction = pixel_error * kp_pixel
-
-                                base_pwm = getattr(cfg, 'BASE_PWM', 1500) + getattr(cfg, 'T3_SPEED_PWM', 100)
-                                apply_motor_mixer(controller, base_pwm, steering_correction)
-
-                                # Check collision condition
-                                if dist_m < 1.0 or obj.get('area', 0) > 300000:  # Bounding box fills screen or very close
-                                    print("[TASK3] KAMIKAZE COLLISION CONFIRMED! STOPPING VEHICLE.")
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    mevcut_gorev = "FINISHED"  # Finish mission
-                                break
-
-                        if not found_target:
-                            target_lat, target_lon = None, None  # Default to not using GPS PID unless moving
-                            spot_pwm = getattr(cfg, 'SPOT_TURN_PWM', 150)
-
-                            if t3_search_state == "INIT_SEARCH":
-                                t3_original_heading = magnetic_heading
-                                t3_search_state = "PAN_LEFT"
-
-                            elif t3_search_state == "PAN_LEFT":
-                                target_h = (t3_original_heading - 45) % 360
+                                    target_h = t3_heading0
                                 diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
+                                # Proportional slow-down, same law as force_initial_alignment.
+                                # These pans used to run at a flat SPOT_TURN_PWM with a 5 deg
+                                # stop window - at the measured 35-57 deg/s the ZED heading
+                                # lags a few degrees behind the hull, the window was missed,
+                                # and the boat kept spinning: full extra circles on the
+                                # 2026-08-18 run (HDG 118 -> 20 -> 248 while chasing a 97 deg
+                                # target), 15-25 s lost per pan cycle and loops drawn all
+                                # over the costmap. Slowing into the target with a wider stop
+                                # window is exactly what the waypoint-alignment branch already
+                                # does, and that one does not overshoot.
+                                pan_tol = getattr(cfg, 'T3_PAN_TOL_DEG', 10.0)
+                                if abs(diff) < pan_tol:
                                     apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_RIGHT"
+                                    t3_state = {'PAN_A': 'PAN_B', 'PAN_B': 'PAN_C',
+                                                'PAN_C': 'SWEEP_CALC'}[t3_state]
                                 else:
-                                    apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
+                                    ramp = min(1.0, abs(diff) / 45.0)
+                                    pan_pwm = int(60 + (spot_pwm - 60) * ramp)
+                                    apply_motor_mixer(controller, 1500,
+                                                      pan_pwm if diff > 0 else -pan_pwm)
 
-                            elif t3_search_state == "PAN_RIGHT":
-                                target_h = (t3_original_heading + 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "CALC_MOVE_L60"
+                            elif t3_state == 'SWEEP_CALC':
+                                # Nothing anchored from the opening pans: run an expanding
+                                # transect sweep over the whole search box.
+                                #
+                                # The old fallback stepped 5 m forward along a FIXED axis,
+                                # twice, then went home - and a mirrored restart only flips
+                                # the pan/patrol side, so with no anchor every cycle re-walked
+                                # the exact same ~10 m strip. The 2026-08-18 run showed it
+                                # plainly: two full cycles over identical ground, the buoy
+                                # line never inside the 15 m detection ceiling, nothing found.
+                                # Coverage has to GROW - the operator's expanding-V insight -
+                                # implemented as serpentine rows perpendicular to the axis,
+                                # each deeper than the last, because straight rows make the
+                                # coverage arithmetic checkable: rows every
+                                # T3_SWEEP_ROW_SPACING_M (well under the detection radius)
+                                # across +/-T3_SWEEP_HALF_WIDTH_M sweep the box without gaps
+                                # in a single pass. The rows sit inside the bounds box with
+                                # margin, the anchor scan and the servo stay live throughout,
+                                # and a mirrored restart runs the serpentine the other way.
+                                if not have_mid or t3_heading0 is None:
+                                    t3_state = 'RETURN'
                                 else:
-                                    apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
+                                    row_sp = getattr(cfg, 'T3_SWEEP_ROW_SPACING_M', 8.0)
+                                    half_w = getattr(cfg, 'T3_SWEEP_HALF_WIDTH_M', 25.0)
+                                    n_rows = int(getattr(cfg, 'T3_SWEEP_ROWS', 2))
+                                    pts = []
+                                    for kk in range(n_rows):
+                                        s_row = row_sp * (kk + 1)
+                                        d_first = half_w * t3_patrol_side * (1 if kk % 2 == 0 else -1)
+                                        pts.append((s_row, d_first))
+                                        pts.append((s_row, -d_first))
+                                    t3_sweep_wps = []
+                                    for s_f, d_l in pts:
+                                        w_dist = math.hypot(s_f, d_l)
+                                        w_brg = (t3_heading0
+                                                 + math.degrees(math.atan2(d_l, s_f))) % 360
+                                        t3_sweep_wps.append(
+                                            calculate_obj_gps(mid_lat, mid_lon, w_dist, w_brg))
+                                    t3_sweep_idx = 0
+                                    t3_state = 'SWEEP'
+                                    print(f"[TASK3] Transect sweep: {n_rows} rows x "
+                                          f"+/-{half_w:.0f} m, first side "
+                                          f"{'L' if t3_patrol_side < 0 else 'R'}")
 
-                            elif t3_search_state == "CALC_MOVE_L60":
-                                target_h = (t3_original_heading - 60) % 360
-                                t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
-                                t3_search_move_target = (t_lat, t_lon)
-                                t3_search_state = "MOVE_L60"
+                            elif t3_state == 'SWEEP':
+                                if not t3_sweep_wps or t3_sweep_idx >= len(t3_sweep_wps):
+                                    t3_state = 'RETURN'
+                                else:
+                                    target_lat, target_lon = t3_sweep_wps[t3_sweep_idx]
+                                    if nav.haversine(ida_enlem, ida_boylam,
+                                                     target_lat, target_lon) < 2.5:
+                                        t3_sweep_idx += 1
+                                        target_lat, target_lon = None, None
 
-                            elif t3_search_state == "MOVE_L60":
-                                target_lat, target_lon = t3_search_move_target
-                                dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
-                                if dist < 1.5:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_LEFT_2"
+                            elif t3_state == 'GOTO_STANDOFF':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    # Patrol parallel to the buoy line (perpendicular to the
+                                    # approach axis). First leg one way, second leg twice as
+                                    # far the other way; driving each leg the camera faces
+                                    # along the line, so the 15 m ceiling extends coverage
+                                    # well past the leg ends. 15 + 30 covers a 30 m span
+                                    # from any anchor position on it, whichever side the
+                                    # target is on - the order is random by the rules.
+                                    lat_brg = (t3_heading0 + t3_patrol_side * 90.0) % 360
+                                    t3_move_target = calculate_obj_gps(
+                                        ida_enlem, ida_boylam,
+                                        getattr(cfg, 'T3_PATROL_FIRST_LEG_M', 15.0), lat_brg)
                                     target_lat, target_lon = None, None
+                                    t3_state = 'PATROL_1'
 
-                            elif t3_search_state == "PAN_LEFT_2":
-                                target_h = (t3_original_heading - 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_RIGHT_2"
-                                else:
-                                    apply_motor_mixer(controller, 1500, -spot_pwm if diff < 0 else spot_pwm)
-
-                            elif t3_search_state == "PAN_RIGHT_2":
-                                target_h = (t3_original_heading + 45) % 360
-                                diff = nav.signed_angle_difference(magnetic_heading, target_h)
-                                if abs(diff) < 5.0:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "CALC_MOVE_R60"
-                                else:
-                                    apply_motor_mixer(controller, 1500, spot_pwm if diff > 0 else -spot_pwm)
-
-                            elif t3_search_state == "CALC_MOVE_R60":
-                                target_h = (t3_original_heading + 60) % 360
-                                t_lat, t_lon = calculate_obj_gps(ida_enlem, ida_boylam, 3.0, target_h)
-                                t3_search_move_target = (t_lat, t_lon)
-                                t3_search_state = "MOVE_R60"
-
-                            elif t3_search_state == "MOVE_R60":
-                                target_lat, target_lon = t3_search_move_target
-                                dist = nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon)
-                                if dist < 1.5:
-                                    apply_motor_mixer(controller, 1500, 0)
-                                    t3_search_state = "PAN_LEFT"
+                            elif t3_state == 'PATROL_1':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    lat_brg = (t3_heading0 - t3_patrol_side * 90.0) % 360
+                                    t3_move_target = calculate_obj_gps(
+                                        ida_enlem, ida_boylam,
+                                        getattr(cfg, 'T3_PATROL_SECOND_LEG_M', 30.0), lat_brg)
                                     target_lat, target_lon = None, None
+                                    t3_state = 'PATROL_2'
 
-                        # Only skip default nav if we didn't set a GPS target to drive to during the search phase
+                            elif t3_state == 'PATROL_2':
+                                target_lat, target_lon = t3_move_target
+                                if nav.haversine(ida_enlem, ida_boylam, target_lat, target_lon) < 2.0:
+                                    target_lat, target_lon = None, None
+                                    t3_state = 'RETURN'
+
+                            elif t3_state == 'RETURN':
+                                # User's choice over "stop and wait": come home to T3_MID
+                                # and run the whole pattern again mirrored. The bounding box
+                                # is what makes this loop safe to repeat indefinitely.
+                                if have_mid:
+                                    target_lat, target_lon = mid_lat, mid_lon
+                                    if nav.haversine(ida_enlem, ida_boylam, mid_lat, mid_lon) < 2.5:
+                                        target_lat, target_lon = None, None
+                                        t3_patrol_side = -t3_patrol_side
+                                        t3_state = 'INIT'
+                                        print("[TASK3] Back at T3_MID - restarting mirrored.")
+                                else:
+                                    t3_patrol_side = -t3_patrol_side
+                                    t3_state = 'INIT'
+
                         if target_lat is None:
                             skip_default_nav = True
                     else:
                         mevcut_gorev, target_lat, target_lon = execute_task3(mevcut_gorev, ida_enlem, ida_boylam)
+                        # --- Early engage, T3_MID leg only ---
+                        # Until now the boat drove all the way to the MID waypoint with the
+                        # target plainly in view, because the servo scan only ran inside the
+                        # search state. Three gates keep this from firing on garbage: the
+                        # track must have been seen >= 3 times (one YOLO misfire cannot
+                        # launch a full-throttle dive), it must be fresh, and the colour must
+                        # be COMMITTED - config-decided, or actually delivered by the drone.
+                        # While the GCS shows RENK YOK, no early dive. T3_START is excluded
+                        # deliberately: red and green are also Task 1 gate colours, and that
+                        # leg can still be near the gates.
+                        if mevcut_gorev == "T3_MID" and mission_active:
+                            _committed = ((not getattr(cfg, 'DRONE_ACTIVE', False))
+                                          or bool(shared_state.get('drone_target_color')))
+                            if _committed:
+                                _tc = t3_target_cid()
+                                _now_e = time.time()
+                                for obj in vision_objects:
+                                    if (obj.get('cid') == _tc
+                                            and obj.get('cx') is not None
+                                            and int(obj.get('seen', 0)) >= 3
+                                            and obj.get('last_seen') is not None
+                                            and (_now_e - obj['last_seen']) <= T3_MAX_DETECTION_AGE_S):
+                                        print("[TASK3] Target sighted on the T3_MID leg - engaging early.")
+                                        mevcut_gorev = "TASK3_SEARCH_KAMIKAZE"
+                                        target_lat, target_lon = None, None
+                                        break
 
                 if not mission_active:
                     # Roll back any state advance the routers above made. Driving the boat
@@ -684,6 +1211,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         start_lat = None
                         start_lon = None
                         current_path = None  # Discard old A* path when target changes
+                        current_path_ts = 0.0
                         path_progress_idx = 0
 
                     # Fix 1: Do not lock the start position if the GPS is 0.0 (uninitialized)
@@ -767,8 +1295,11 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     # (cfg.A_STAR_CROP_RADIUS_M is the SAME constant used below to build that window -
                     # keeping these tied together is what prevents the out-of-bounds-goal freeze from
                     # silently coming back if the crop radius is ever retuned).
-                    _a_star_crop_radius_m = getattr(cfg, 'A_STAR_CROP_RADIUS_M', 20.0)
-                    projection_dist = min(hedefe_mesafe, _a_star_crop_radius_m * 0.75)
+                    # Kept shorter than the 15 m at which obstacles stop being drawn, so the
+                    # goal always sits inside well-observed space rather than on the ragged
+                    # outer edge of the costmap.
+                    projection_dist = min(hedefe_mesafe,
+                                          getattr(cfg, 'A_STAR_GOAL_PROJECTION_M', 10.0))
 
                     # The local costmap is built using raw compass bearings mapped directly into math.cos/sin.
                     # We must plot the target exactly the same way we plot the vision obstacles.
@@ -784,26 +1315,29 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 else:
                     # 1. Reactive Avoidance (Vector-Assisted Braking)
                     if center_danger:
+                        # Emergency braking bypasses the slew limiter: an instantaneous
+                        # reversal is exactly what is wanted here.
                         if not acil_durum_aktif_mi:
                             shock_brake_pwm = cfg.BASE_PWM - getattr(cfg, 'shock_pwm', 250)
                             # Braking: Reverse thrust, hard steer away
                             avoid_turn = 400 if (left_d > right_d) else -400
-                            apply_motor_mixer(controller, shock_brake_pwm, avoid_turn)
+                            apply_motor_mixer(controller, shock_brake_pwm, avoid_turn, slew=False)
                             time.sleep(0.1)
                             acil_durum_aktif_mi = True
 
                         escape_pwm = cfg.BASE_PWM - getattr(cfg, 'ESCAPE_PWM', 300)
                         avoid_turn = 400 if (left_d > right_d) else -400
-                        apply_motor_mixer(controller, escape_pwm, avoid_turn)
+                        apply_motor_mixer(controller, escape_pwm, avoid_turn, slew=False)
                         time.sleep(0.4)
 
                         spot_turn_val = getattr(cfg, 'SPOT_TURN_PWM', 200)
                         if left_d > right_d:
-                            apply_motor_mixer(controller, cfg.BASE_PWM, -spot_turn_val)
+                            apply_motor_mixer(controller, cfg.BASE_PWM, -spot_turn_val, slew=False)
                         else:
-                            apply_motor_mixer(controller, cfg.BASE_PWM, spot_turn_val)
+                            apply_motor_mixer(controller, cfg.BASE_PWM, spot_turn_val, slew=False)
                         time.sleep(0.3)
                         current_path = None  # Force replan
+                        current_path_ts = 0.0
                         path_progress_idx = 0
 
                         # This branch blocks for ~0.8s and then `continue`s, skipping the
@@ -859,6 +1393,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                             if not use_astar_planner:
                                 current_path = None
+                                current_path_ts = 0.0
                                 path_progress_idx = 0
 
                             if use_astar_planner:
@@ -887,24 +1422,95 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 nav_map, _ = planner.get_inflated_nav_map(cropped_costmap)
 
-                                # Replan at ~10 Hz, or immediately if we have no path at all.
+                                # --- Task 2 corridor cap (soft) ---
+                                # Orange boundary buoys are otherwise indistinguishable from
+                                # yellow obstacles, so routing around the OUTSIDE of the
+                                # course is both legal and shorter whenever a waypoint sits
+                                # near the boundary. That is what took the boat out of the
+                                # course on the 2026-08-12 run.
+                                corridor_cost = None
+                                if (getattr(cfg, 'ENABLE_TASK2_CORRIDOR', True)
+                                        and "TASK2" in mevcut_gorev and origin_lat is not None):
+                                    axis = _task2_axis_local(origin_lat, origin_lon)
+                                    if axis is not None:
+                                        boundary = _confirmed_boundary_local(
+                                            vision_objects, ida_enlem, ida_boylam,
+                                            robot_x, robot_y)
+                                        corridor_cost = planner.build_corridor_cost(
+                                            nav_map.shape, cropped_center_m,
+                                            COSTMAP_RES_M_PER_PX, axis[0], axis[1],
+                                            boundary, (robot_x, robot_y))
+
+                                # --- Planning is decoupled from control ---
+                                # A* runs every A_STAR_PLAN_DIVISOR cycles (5 Hz at 25 Hz
+                                # loop) with A_STAR_TIME_BUDGET_S; Pure Pursuit below runs
+                                # every cycle on the last good path.
+                                plan_divisor = max(1, int(getattr(cfg, 'A_STAR_PLAN_DIVISOR', 5)))
                                 plan_timer += 1
-                                if (plan_timer > 4 or not current_path) and tx_world is not None:
+                                if (plan_timer >= plan_divisor or not current_path) and tx_world is not None:
                                     plan_timer = 0
                                     new_path = None
+                                    _los_cost = getattr(cfg, 'CORRIDOR_LOS_BLOCK_COST', 3.0)
                                     if planner.check_line_of_sight((robot_x, robot_y), (tx_world, ty_world), nav_map,
                                                                    cropped_center_m, COSTMAP_RES_M_PER_PX,
-                                                                   cropped_size_px):
+                                                                   cropped_size_px,
+                                                                   corridor_cost, _los_cost):
                                         new_path = [(robot_x, robot_y), (tx_world, ty_world)]
                                     else:
                                         new_path = planner.get_path_plan(
                                             (robot_x, robot_y), (tx_world, ty_world),
                                             nav_map, cropped_center_m,
                                             COSTMAP_RES_M_PER_PX, cropped_size_px,
-                                            heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5))
+                                            heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5),
+                                            max_expansions=40000, time_budget_s=0.15,
+                                            cost_map=corridor_cost, los_max_cost=_los_cost)
+
+                                        # Fallback ladder. Staying inside the corridor is a
+                                        # preference, not a hard requirement: if the cap
+                                        # leaves no route at all, an obstacle-avoiding path
+                                        # that steps outside beats the alternative, which is
+                                        # dropping to the obstacle-BLIND Direct-Drive PID.
+                                        if new_path is None and corridor_cost is not None:
+                                            new_path = planner.get_path_plan(
+                                                (robot_x, robot_y), (tx_world, ty_world),
+                                                nav_map, cropped_center_m,
+                                                COSTMAP_RES_M_PER_PX, cropped_size_px,
+                                                heuristic_weight=getattr(cfg, 'A_STAR_HEURISTIC_WEIGHT', 2.5))
+                                            if new_path:
+                                                print("[NAV_PROCESS] Corridor cap left no route "
+                                                      "- replanning without it.")
                                     if new_path and len(new_path) >= 2:
                                         current_path = new_path
+                                        current_path_ts = time.time()
                                         path_progress_idx = 0
+                                    else:
+                                        # A* gave up (no route, expansion cap, or time budget).
+                                        # The old code left `current_path` untouched here, so
+                                        # the boat kept following a path planned from a pose it
+                                        # had long since left - and find_lookahead_point would
+                                        # then latch onto a node behind it. Dropping the path
+                                        # hands control to the Direct-Drive PID below: obstacle
+                                        # blind, but smooth, and far safer than a stale route.
+                                        current_path = None
+                                        current_path_ts = 0.0
+                                        path_progress_idx = 0
+                                        # Say so. This fallback used to be completely silent,
+                                        # which made a contact impossible to diagnose after the
+                                        # fact: "position error ate the margin" and "the planner
+                                        # quit and the blind PID drove straight at it" look
+                                        # identical on the water. Now the log tells them apart -
+                                        # if a hit happens with no line here, it was the margin.
+                                        if (start_time - last_astar_fail_log) >= 1.0:
+                                            last_astar_fail_log = start_time
+                                            print("[NAV_PROCESS] A* found no path - falling "
+                                                  "back to obstacle-blind PID toward target.")
+
+                                # Never follow a path older than A_STAR_MAX_PATH_AGE_S.
+                                max_age = getattr(cfg, 'A_STAR_MAX_PATH_AGE_S', 0.6)
+                                if current_path and (time.time() - current_path_ts) > max_age:
+                                    current_path = None
+                                    current_path_ts = 0.0
+                                    path_progress_idx = 0
                                 # ------------------------------------------------
 
                             # Follow the planned path with Pure Pursuit.
@@ -916,24 +1522,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             # PID for 4 out of every 5 cycles - two controllers with different
                             # gains fighting each other, each with a stale prev_error.
                             if current_path and len(current_path) >= 2:
-                                base_pwm = getattr(cfg, 'BASE_PWM', 1500)
+                                cruise_offset = getattr(cfg, 'CRUISE_PWM', 80)
                                 if mevcut_gorev.startswith("T3_") or "TASK3" in mevcut_gorev:
-                                    base_pwm += getattr(cfg, 'T3_SPEED_PWM', 100)
-                                else:
-                                    base_pwm += getattr(cfg, 'CRUISE_PWM', 80)
+                                    cruise_offset = getattr(cfg, 'T3_SPEED_PWM', 100)
+                                base_pwm = getattr(cfg, 'BASE_PWM', 1500) + cruise_offset
 
                                 if active_controller != 'PP':
                                     prev_heading_error = 0.0   # avoid a derivative kick on handover
                                     active_controller = 'PP'
+                                    pp_spot_turn_active = False
 
                                 # Ground speed in m/s - NOT a PWM offset. Feeding PWM here pinned
                                 # the lookahead at PURE_PURSUIT_MAX_LOOKAHEAD permanently.
-                                speed_mps = shared_state.get('horizontal_speed', 0.0)
-                                try:
-                                    speed_mps = float(speed_mps)
-                                except (TypeError, ValueError):
-                                    speed_mps = 0.0
-
+                                # `speed_mps` is now a local updated once per cycle from the FC
+                                # (see section A) instead of a Manager-dict round trip.
                                 p_base, p_steer, raw_target, current_error, path_progress_idx = \
                                     planner.pure_pursuit_control(
                                         robot_x, robot_y, robot_yaw, current_path,
@@ -943,18 +1545,49 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
 
                                 prev_heading_error = current_error
 
+                                # --- Throttle taper + spot-turn guard ---
+                                # The Direct-Drive PID branch below has always had
+                                # SPOT_TURN_THRESHOLD; the Pure Pursuit branch had nothing. So
+                                # the boat held full cruise thrust while commanding maximum
+                                # differential at 150 deg of heading error - which traces a
+                                # circle by construction. That is precisely what the 23:47:59 to
+                                # 23:48:08 flight segment shows.
+                                abs_err = abs(current_error)
+                                enter_deg = getattr(cfg, 'PP_SPOT_TURN_ENTER_DEG', 60.0)
+                                exit_deg = getattr(cfg, 'PP_SPOT_TURN_EXIT_DEG', 35.0)
+
+                                if pp_spot_turn_active:
+                                    if abs_err < exit_deg:
+                                        pp_spot_turn_active = False
+                                elif abs_err > enter_deg:
+                                    pp_spot_turn_active = True
+
+                                if pp_spot_turn_active:
+                                    # Pivot in place until we are pointing roughly the right way.
+                                    p_base = getattr(cfg, 'BASE_PWM', 1500)
+                                else:
+                                    # Smoothly bleed off forward thrust as the error grows, so the
+                                    # boat stops skidding sideways through its own turn.
+                                    taper_min = getattr(cfg, 'PP_THROTTLE_TAPER_MIN', 0.25)
+                                    taper = math.cos(math.radians(min(abs_err, 90.0)))
+                                    taper = max(taper_min, taper)
+                                    p_base = getattr(cfg, 'BASE_PWM', 1500) + (cruise_offset * taper)
+
                                 apply_motor_mixer(controller, p_base, p_steer)
 
                                 # Path consumed: force a fresh plan on the next cycle.
                                 end_pt = current_path[-1]
                                 if math.hypot(end_pt[0] - robot_x, end_pt[1] - robot_y) < 0.5:
                                     current_path = None
+                                    current_path_ts = 0.0
                                     path_progress_idx = 0
 
                             # If no path, or we are NOT in Task 2 (meaning Task 1 or 3), use PID Direct Drive
                             else:
                                 current_path = None  # Force a fresh A* attempt on the next plan_timer cycle
+                                current_path_ts = 0.0
                                 path_progress_idx = 0
+                                pp_spot_turn_active = False
                                 if target_lat is not None and target_lon is not None:
                                     # Always use Direct Drive PID (and spot turns) as a fallback when A* has no path
                                     # This prevents the boat from freezing if A* inflation blocks the target
@@ -1028,14 +1661,24 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                     elif not skip_default_nav:
                         apply_motor_mixer(controller, 1500, 0)
 
-                # Record final PWMs
-                # Note: We rely on the USVController object stub tracking state,
-                # but we can push directly to shared_state for safety
-                shared_state['motor_pwm_left'] = controller.get_servo_pwm(CH_REAR_LEFT)
-                shared_state['motor_pwm_right'] = controller.get_servo_pwm(CH_REAR_RIGHT)
-                shared_state['motor_pwm_front_left'] = controller.get_servo_pwm(CH_FRONT_LEFT)
-                shared_state['motor_pwm_front_right'] = controller.get_servo_pwm(CH_FRONT_RIGHT)
-                shared_state['motor_pwm_steer'] = controller.get_servo_pwm(CH_STEER)
+                # Record final PWMs + speed for the HUD and the GCS.
+                # These are display-only: nothing in the control loop reads them back, so
+                # publishing them at 50 Hz was 6 pickled Manager-dict writes per cycle for
+                # values that are consumed by a 30 fps overlay and a 2 Hz telemetry link.
+                if (start_time - last_publish) >= PUBLISH_PERIOD_S:
+                    last_publish = start_time
+                    shared_state['motor_pwm_left'] = controller.get_servo_pwm(CH_REAR_LEFT)
+                    shared_state['motor_pwm_right'] = controller.get_servo_pwm(CH_REAR_RIGHT)
+                    shared_state['motor_pwm_front_left'] = controller.get_servo_pwm(CH_FRONT_LEFT)
+                    shared_state['motor_pwm_front_right'] = controller.get_servo_pwm(CH_FRONT_RIGHT)
+                    shared_state['motor_pwm_steer'] = controller.get_servo_pwm(CH_STEER)
+                    shared_state['horizontal_speed'] = speed_mps
+                    if fc_hdg is not None:
+                        shared_state['fc_heading'] = fc_hdg
+                    # -1 means the vehicle never reported RELAY_STATUS, so the GCS can say
+                    # "unknown" instead of showing a state it cannot actually vouch for.
+                    shared_state['relay_state'] = (-1 if relay_reported is None
+                                                   else int(relay_reported))
 
                 # Heartbeat: p.is_alive() in the orchestrator watchdog only detects a dead process,
                 # not one blocked on a hung call (e.g. a serial write). This timestamp lets the
@@ -1049,14 +1692,20 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                 # until it was re-armed by hand from the RC. Neutralise, log, keep looping.
                 print(f"[NAV_PROCESS][ERROR] Iteration failed: {loop_err}")
                 try:
-                    apply_motor_mixer(controller, 1500, 0)
+                    apply_motor_mixer(controller, 1500, 0, slew=False)
                 except Exception:
                     pass
                 shared_state['nav_heartbeat'] = time.time()
 
 
+            # Loop rate is cfg.NAV_LOOP_HZ (25 Hz), down from a hardcoded 50 Hz. A USV's yaw
+            # time constant is 1-2 s, so 25 Hz is still 12-25x oversampled - but it halves the
+            # MAVLink command rate to the flight controller and the Manager-dict IPC traffic,
+            # both of which were measurably starving the rest of the system (camera FPS fell
+            # 30 -> 17 and GPS updates stalled for ~1.5 s during the failure window).
             elapsed = time.time() - start_time
-            if elapsed < 0.02: time.sleep(0.02 - elapsed)
+            if elapsed < NAV_PERIOD_S:
+                time.sleep(NAV_PERIOD_S - elapsed)
 
     except Exception as e:
         print(f"[NAV_PROCESS][ERROR] Brain crashed: {e}")
@@ -1065,7 +1714,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
         if costmap_recorder is not None:
             costmap_recorder.save()
         try:
-            apply_motor_mixer(controller, 1500, 0)
+            apply_motor_mixer(controller, 1500, 0, slew=False)
 
             controller.disarm_vehicle()
         except:
