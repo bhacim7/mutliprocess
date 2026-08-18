@@ -9,6 +9,7 @@ PATCH: Arayüzde bütünlüğü sağlamak için bu çok yerinde bir karar. Tüm 
 """
 from __future__ import annotations
 import sys, os, json, csv, time, math
+from collections import deque
 from typing import Optional, Dict, Any
 
 from PySide6 import QtCore, QtWidgets, QtGui
@@ -2629,6 +2630,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Workerlar
         self.worker_1 = None
+        # --- Reliable command channel (R1) ---
+        # Why: telemetry became a broadcast and the drone heartbeats at 3 Hz, which made
+        # the GCS the quietest node on a channel where the other two never stop talking.
+        # A one-shot command that collides is simply gone - streams self-heal, commands
+        # did not. Every command now carries a sequence number (cq), the boat echoes the
+        # last processed one in telemetry (aq), and the head of this queue is resent every
+        # 600 ms until echoed. One press does the whole job, emergency stop included.
+        # The seq is time-seeded so a GCS restart cannot collide with acks of an older
+        # session; manual_control stays OUTSIDE the queue - resending stale stick values
+        # late would be worse than losing them.
+        self._cmd_pending = deque()
+        self._cmd_seq = int(time.time()) % 1000000
+        self._cmd_tries = 0
+        self._cmd_last_tx = 0.0
+        self._cmd_last_aq = -1
         self._connected = False
         self.heartbeat_timer = QtCore.QTimer(self);
         self.heartbeat_timer.timeout.connect(self._on_hb_timeout);
@@ -2901,13 +2917,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if not task_name: return
 
             # Komutu hazırla ve gönder
-            w = self.worker_1 if bid == 1 else self.worker_2
-            if w:
-                w.queue_send({
-                    "target_id": bid,
-                    "cmd": "set_task",
-                    "task_name": task_name
-                })
+            self._send_reliable({
+                "target_id": bid,
+                "cmd": "set_task",
+                "task_name": task_name
+            })
 
     # MainWindow içindeki bu fonksiyonu değiştir:
     def _refresh_map_mission(self, bid, sync_other=True):
@@ -3356,6 +3370,19 @@ class MainWindow(QtWidgets.QMainWindow):
         s("SENSOR_SAGLIK", "hlth")
 
         # Role durumu: -1 = arac RELAY_STATUS bildirmiyor -> "bilinmiyor" de, tahmin etme.
+        # R1 ack intake. If the boat remembers a LARGER sequence than anything this
+        # session has sent (it survived a GCS restart), jump past it - otherwise our
+        # fresh, smaller numbers would appear already-acknowledged.
+        if "aq" in d:
+            try:
+                _aq = int(d["aq"])
+                if _aq > self._cmd_seq:
+                    self._cmd_seq = _aq
+                self._cmd_last_aq = _aq
+            except (TypeError, ValueError):
+                pass
+            self._service_cmds()
+
         if hasattr(self, "relay_lbl") and "relay" in d:
             try:
                 rv = int(d.get("relay", -1))
@@ -3453,14 +3480,50 @@ class MainWindow(QtWidgets.QMainWindow):
         btn.clicked.connect(lambda: self._send_manual_pwm(b, l, r))
         return btn
 
+    def _send_reliable(self, payload):
+        """Queue a command for delivery-with-confirmation. See the init note."""
+        if not self.worker_1:
+            return
+        self._cmd_seq += 1
+        payload = dict(payload)
+        payload["cq"] = self._cmd_seq
+        self._cmd_pending.append(payload)
+        if len(self._cmd_pending) == 1:
+            self._service_cmds(force_head=True)
+
+    def _service_cmds(self, force_head=False):
+        """Driven by the 300 ms UI timer and by every ack that arrives."""
+        q = self._cmd_pending
+        if not q or not self.worker_1:
+            return
+        # Acks are cumulative: the boat processes the single radio stream in order, so
+        # aq >= cq means that command (and everything before it) landed.
+        while q and self._cmd_last_aq >= q[0]["cq"]:
+            q.popleft()
+            self._cmd_tries = 0
+            self._cmd_last_tx = 0.0
+            force_head = bool(q)          # send the next one right away
+        if not q:
+            return
+        now = time.time()
+        if force_head or (now - self._cmd_last_tx) >= 0.6:
+            if self._cmd_tries >= 8:
+                dead = q.popleft()
+                self._cmd_tries = 0
+                self.on_status(f"⚠ KOMUT ULAŞMADI: {dead.get('cmd')} (8 deneme)")
+                if not q:
+                    return
+            self.worker_1.queue_send(q[0])
+            self._cmd_last_tx = now
+            self._cmd_tries += 1
+
     def _send_cmd(self, bid, cmd, val):
-        if self.worker_1: self.worker_1.queue_send({"target_id": 1, "cmd": cmd, "value": val})
+        self._send_reliable({"target_id": 1, "cmd": cmd, "value": val})
         self.on_status(f"TX[USV1]: {cmd}->{val}")
 
     def _send_relay(self, bid, state):
         """Motor gucu rolesini ac/kapat. Kumandadaki anahtarla ayni roleye gider."""
-        if self.worker_1:
-            self.worker_1.queue_send({"target_id": 1, "cmd": "set_relay", "value": int(state)})
+        self._send_reliable({"target_id": 1, "cmd": "set_relay", "value": int(state)})
         self.on_status(f"TX[USV{bid}]: RÖLE -> {'AÇ' if state else 'KAPAT'}")
 
     def _send_target_color(self):
@@ -3479,8 +3542,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not self.worker_1 or not getattr(self, "_want_color_en", None):
             return
-        self.worker_1.queue_send({"target_id": 1, "cmd": "set_target_color",
-                                  "color": self._want_color_en})
+        self._send_reliable({"target_id": 1, "cmd": "set_target_color",
+                             "color": self._want_color_en})
         self._last_color_tx = time.time()
 
     def _send_manual_pwm(self, bid, l, r):
@@ -3648,16 +3711,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     lat = float(item_lat.text())
                     lon = float(item_lon.text())
 
-                    w = self.worker_1 if bid == 1 else self.worker_2
-                    if w:
-                        w.queue_send({
-                            "target_id": bid,
-                            "cmd": "set_gps",
-                            "index": i + 1,
-                            "lat": lat,
-                            "lon": lon
-                        })
-                        sent_count += 1
+                    self._send_reliable({
+                        "target_id": bid,
+                        "cmd": "set_gps",
+                        "index": i + 1,
+                        "lat": lat,
+                        "lon": lon
+                    })
+                    sent_count += 1
                 else:
                     self.on_status(f"HATA: Satır {i + 1} boş veya geçersiz!")
             except ValueError:
@@ -3820,6 +3881,7 @@ class MainWindow(QtWidgets.QMainWindow):
         link-quality readout computed from what arrives.
         """
         self._update_link_stats()
+        self._service_cmds()
 
     def _update_link_stats(self):
         """Live link quality from the boat's sequence numbers and arrival times."""

@@ -376,6 +376,7 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
     relay_retries = 0
     relay_last_tx = 0.0
     relay_reported = None        # last state read back from RELAY_STATUS
+    last_cmd_cq = None           # sequence of the last processed GCS command (R1 ack)
 
     costmap_recorder = None
     if getattr(cfg, 'RECORD_COSTMAP', False):
@@ -485,6 +486,15 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                         if _tgt is not None and int(_tgt) != MY_ID:
                             continue
 
+                        # R1 reliable commands: the GCS resends until our telemetry echoes
+                        # the command's sequence number back. A resend of something already
+                        # processed is skipped here - the ack is already on the air - so
+                        # retries cannot double-execute or spam the log. Commands without
+                        # cq (old GCS) flow through unchanged.
+                        _cq = cmd.get("cq")
+                        if _cq is not None and _cq == last_cmd_cq:
+                            continue
+
                         if cmd_str == "set_relay":
                             want = 1 if cmd.get("value") else 0
                             relay_target = want
@@ -546,6 +556,14 @@ def nav_worker(shared_state, command_queue, hf_data, lidar_queue):
                             if color:
                                 shared_state['drone_target_color'] = color
                                 print(f"[NAV_PROCESS] Drone target color updated to {color}")
+
+                        # Ack AFTER the dispatch above ran to completion: if it raised, the
+                        # outer except swallows the iteration and no ack goes out, so the
+                        # GCS retries and the command gets a second chance instead of being
+                        # falsely confirmed.
+                        if _cq is not None:
+                            last_cmd_cq = int(_cq)
+                            shared_state['last_cmd_ack'] = last_cmd_cq
                 except:
                     pass
 

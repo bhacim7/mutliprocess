@@ -267,6 +267,11 @@ def telem_worker(shared_state, command_queue, hf_data):
                 payload["tc"] = _tc
                 payload["ts"] = 1 if _tsrc == "drone" else 0
 
+                # R1: sequence number of the last GCS command nav_process processed. ~8 B
+                # riding a 3.3 Hz stream - so a lost command now self-heals the way the
+                # streams do, instead of dying as an unprotected one-shot. -1 = none yet.
+                payload["aq"] = int(shared_state.get('last_cmd_ack', -1))
+
                 # 'objects' is deliberately NOT sent any more.
                 #
                 # It was the single biggest field in the packet - ~200 B per tracked buoy,
