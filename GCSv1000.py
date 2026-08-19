@@ -516,15 +516,26 @@ class SerialWorker(QThread):
 
                                     # Glue on the head of a packet that was interrupted by
                                     # another node - its tail is this line.
+                                    was_glued = False
                                     if self._pending_frag:
                                         line = self._pending_frag + line
                                         self._pending_frag = ""
+                                        was_glued = True
 
                                     obj, leftover = _parse_or_recover(line)
-                                    # A runaway fragment must not grow without bound: if it
-                                    # is already bigger than any real packet, whatever it is
-                                    # it is not the head of one.
-                                    self._pending_frag = leftover if len(leftover) < 2048 else ""
+                                    # A head fragment gets exactly ONE chance to meet its
+                                    # tail: the very next line - the radio delivers bytes in
+                                    # order, so if the tail survived, that is where it is.
+                                    # Re-pending the leftover of an already-glued line kept
+                                    # stale heads alive indefinitely, retrying against every
+                                    # fresh packet at 3.3 Hz until one happened to complete
+                                    # into syntactically valid JSON with garbage numbers -
+                                    # measured at ~20% odds per attempt, and those are the
+                                    # kilometre-scale position jumps painted on the map.
+                                    if was_glued or len(leftover) >= 2048:
+                                        self._pending_frag = ""
+                                    else:
+                                        self._pending_frag = leftover
 
                                     if isinstance(obj, dict):
                                         self.packet.emit(self._expand(obj))  # UI'a gönder
@@ -2447,6 +2458,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top_lay = QtWidgets.QHBoxLayout(top_grp)
 
         self.MAP_PRESETS = {
+            "Gölcük": {"file": "golcuk_harita18.jpeg", "n": 40.7329, "s": 40.7215, "w": 29.7936, "e": 29.8296},
             "RoboBoat (Florida)": {"file": "roboboat.jpg", "n": 27.381, "s": 27.356, "w": -82.455, "e": -82.445},
             "Okul (Tuzla)": {"file": "okul.jpg", "n": 40.810072, "s": 40.808099, "w": 29.261345, "e": 29.265630}
         }
