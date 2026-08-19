@@ -66,6 +66,15 @@ def telem_worker(shared_state, command_queue, hf_data):
     # two different diseases with different cures - and three rounds of tuning this link
     # have been done by feel for exactly that reason. ~8 bytes buys the diagnosis.
     seq = 0
+    # R1 fast-ack: the aq value carried by the LAST transmitted packet. When nav processes
+    # a new command, waiting for the next 300 ms broadcast slot to echo it was the single
+    # biggest term in the per-command latency (~150 ms average, 300 worst) - the operator
+    # watched eight GPS points trickle in one by one. A changed ack now pulls the next
+    # broadcast forward to THIS tick (<=50 ms), which roughly halves the delivery rhythm.
+    # Nothing about the guarantee changes: same packet, same sequence, just sent sooner;
+    # the schedule re-anchors after it, so the steady rate stays 3.3 Hz plus at most one
+    # early packet per processed command.
+    last_ack_echoed = -1
 
     # --- Vehicle telemetry CSV (competition file 2) ---
     csv_f = None
@@ -205,6 +214,10 @@ def telem_worker(shared_state, command_queue, hf_data):
             # nav_process still sets 'send_telemetry' when a legacy report_status poll
             # arrives; it is deliberately ignored here so an old GCS polling away cannot
             # double the send rate. The clock below is the only trigger.
+            _ack_now = int(shared_state.get('last_cmd_ack', -1))
+            if _ack_now != last_ack_echoed:
+                next_send = start_time      # fast-ack: do not sit on a fresh confirmation
+
             if start_time >= next_send:
                 # Anchored to the previous deadline, not to now, so processing time does
                 # not accumulate into the period.
@@ -270,7 +283,8 @@ def telem_worker(shared_state, command_queue, hf_data):
                 # R1: sequence number of the last GCS command nav_process processed. ~8 B
                 # riding a 3.3 Hz stream - so a lost command now self-heals the way the
                 # streams do, instead of dying as an unprotected one-shot. -1 = none yet.
-                payload["aq"] = int(shared_state.get('last_cmd_ack', -1))
+                payload["aq"] = _ack_now
+                last_ack_echoed = _ack_now
 
                 # 'objects' is deliberately NOT sent any more.
                 #
