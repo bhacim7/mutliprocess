@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Runtime artefacts produced by the recorders/loggers, not source.
+final_costmap*.png
+color_log.csv
+captures/
+kayit_*.mp4
+telemetry_log.csv
